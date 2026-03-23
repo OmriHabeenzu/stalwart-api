@@ -466,7 +466,7 @@ if ($path === '/auth/me' && $method === 'GET') {
     $tokenUser = getUserFromToken();
     if (!$tokenUser) sendResponse('error', 'Unauthorized', null, 401);
     try {
-        $stmt = $pdo->prepare("SELECT id, name, email, role, is_active, last_login, created_at FROM users WHERE id = ? LIMIT 1");
+        $stmt = $pdo->prepare("SELECT id, name, email, role, is_active, can_manage_calls, last_login, created_at FROM users WHERE id = ? LIMIT 1");
         $stmt->execute([$tokenUser['id']]);
         $user = $stmt->fetch();
         if (!$user) sendResponse('error', 'User not found', null, 404);
@@ -732,7 +732,8 @@ if ($path === '/dashboard/activity' && $method === 'GET') {
 
 if ($path === '/users' && $method === 'GET') {
     try {
-        $stmt = $pdo->query("SELECT id, name, email, role, is_active as status, last_login, created_at FROM users ORDER BY created_at DESC");
+        $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS can_manage_calls TINYINT(1) DEFAULT 0");
+        $stmt = $pdo->query("SELECT id, name, email, role, is_active as status, can_manage_calls, last_login, created_at FROM users ORDER BY created_at DESC");
         $users = $stmt->fetchAll();
         sendResponse('success', 'Users retrieved', ['users' => $users]);
     } catch (PDOException $e) {
@@ -810,6 +811,10 @@ if (preg_match('/^\/users\/(\d+)$/', $path, $matches) && $method === 'PUT') {
         if (isset($data['status'])) {
             $updates[] = "is_active = ?";
             $params[] = $data['status'] === 'active' ? 1 : 0;
+        }
+        if (isset($data['can_manage_calls'])) {
+            $updates[] = "can_manage_calls = ?";
+            $params[] = $data['can_manage_calls'] ? 1 : 0;
         }
         
         if (empty($updates)) {
