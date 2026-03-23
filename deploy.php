@@ -13,7 +13,14 @@
  *      Events: Just the push event
  */
 
-define('DEPLOY_SECRET', 'stw_deploy_2026_x9k2m');
+// Load secret from .env (never committed to git)
+$_envLines = file_exists(__DIR__ . '/.env') ? file(__DIR__ . '/.env', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) : [];
+foreach ($_envLines as $_line) {
+    if (str_starts_with(trim($_line), '#')) continue;
+    [$_k, $_v] = array_pad(explode('=', $_line, 2), 2, '');
+    if (trim($_k) === 'DEPLOY_SECRET') { define('DEPLOY_SECRET', trim($_v)); break; }
+}
+if (!defined('DEPLOY_SECRET')) define('DEPLOY_SECRET', '');
 define('DEPLOY_BRANCH', 'refs/heads/main');
 define('REPO_DIR',      __DIR__);
 
