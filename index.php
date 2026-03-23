@@ -4360,7 +4360,7 @@ if ($path === '/admin/backup' && $method === 'POST') {
         $pdo->prepare("INSERT INTO backups (filename, file_path, size_bytes, google_drive_id, google_drive_link, type, status, notes) VALUES (?,?,?,?,?,'manual','success',?)")
             ->execute([$gzFilename, "backups/{$gzFilename}", $gzSize, $driveId, $driveLink, $notes]);
 
-        logActivity($pdo, $user['id'], $user['name'], 'backup_created', "DB backup created: {$gzFilename}");
+        logActivity($pdo, $user['id'], $user['email'] ?? 'Admin', 'backup_created', "DB backup created: {$gzFilename}");
 
         sendResponse('success', 'Backup created', ['filename' => $gzFilename, 'size_bytes' => $gzSize, 'drive_link' => $driveLink, 'drive_id' => $driveId, 'notes' => $notes]);
     } catch (Exception $e) {
