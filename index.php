@@ -1463,6 +1463,13 @@ if ($path === '/testimonials' && $method === 'POST') {
         $id = $pdo->lastInsertId();
         logActivity($pdo, null, $data['name'], 'testimonial_submitted', "New testimonial from {$data['name']} - pending approval");
 
+        // In-app notification for all admins
+        $company = !empty($data['company']) ? " ({$data['company']})" : '';
+        $admins = $pdo->query("SELECT id FROM users WHERE role = 'admin' AND is_active = 1")->fetchAll(PDO::FETCH_COLUMN);
+        foreach ($admins as $adminId) {
+            createNotification($pdo, $adminId, 'info', 'New Testimonial Submitted', "{$data['name']}{$company} submitted a testimonial — pending your approval.", '/dashboard/testimonials');
+        }
+
         // Notify admin
         $adminHtml = "
         <div style='font-family:Arial,sans-serif;max-width:600px;margin:0 auto;'>
