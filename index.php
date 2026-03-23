@@ -444,10 +444,18 @@ if ($path === '/auth/login' && $method === 'POST') {
         $stmt->execute([$email]);
         $user = $stmt->fetch();
 
-        if (!$user || !password_verify($password, $user['password'])) {
-            // Log failed login attempt
-            logActivity($pdo, null, $email, 'login_failed', "Failed login attempt for email: $email");
+        if (!$user) {
+            logActivity($pdo, null, $email, 'login_failed', "Login failed: no account found for $email");
             sendResponse('error', 'Invalid email or password', null, 401);
+        }
+        if (!password_verify($password, $user['password'])) {
+            $activeLabel = $user['is_active'] ? '' : ' (account is inactive)';
+            logActivity($pdo, $user['id'], $email, 'login_failed', "Login failed: wrong password for $email{$activeLabel}");
+            sendResponse('error', 'Invalid email or password', null, 401);
+        }
+        if (!$user['is_active']) {
+            logActivity($pdo, $user['id'], $email, 'login_failed', "Login failed: account is inactive for $email");
+            sendResponse('error', 'Your account has been deactivated. Please contact your administrator.', null, 403);
         }
 
         // Update last login + IP (with safe fallback if column doesn't exist yet)
