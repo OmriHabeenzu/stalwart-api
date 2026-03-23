@@ -4350,6 +4350,7 @@ if ($path === '/admin/backup' && $method === 'POST') {
             notes TEXT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        try { $pdo->query("ALTER TABLE backups MODIFY id INT NOT NULL AUTO_INCREMENT"); } catch (Exception $e) {}
 
         $pdo->prepare("INSERT INTO backups (filename, file_path, size_bytes, google_drive_id, google_drive_link, type, status, notes) VALUES (?,?,?,?,?,'manual','success',?)")
             ->execute([$gzFilename, "backups/{$gzFilename}", $gzSize, $driveId, $driveLink, $notes]);
