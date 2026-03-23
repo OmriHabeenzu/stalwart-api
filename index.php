@@ -410,7 +410,11 @@ function createNotificationForAllStaff($pdo, $type, $title, $message, $link = nu
     }
 }
 
-// === 6. ROUTING ===
+// === 6. SCHEMA MIGRATIONS (run once, safe to repeat) ===
+try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS can_manage_calls TINYINT(1) DEFAULT 0"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip VARCHAR(45) DEFAULT NULL"); } catch (Exception $e) {}
+
+// === 7. ROUTING ===
 $method = $_SERVER['REQUEST_METHOD'];
 $uri = $_SERVER['REQUEST_URI'];
 $path = parse_url($uri, PHP_URL_PATH);
@@ -743,7 +747,6 @@ if ($path === '/dashboard/activity' && $method === 'GET') {
 
 if ($path === '/users' && $method === 'GET') {
     try {
-        $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS can_manage_calls TINYINT(1) DEFAULT 0");
         $stmt = $pdo->query("SELECT id, name, email, role, is_active as status, can_manage_calls, last_login, created_at FROM users ORDER BY created_at DESC");
         $users = $stmt->fetchAll();
         sendResponse('success', 'Users retrieved', ['users' => $users]);
