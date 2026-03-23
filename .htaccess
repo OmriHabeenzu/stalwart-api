@@ -1,0 +1,21 @@
+Options -Indexes
+RewriteEngine On
+
+# Route all requests through index.php
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ index.php [L]
+
+# Block direct access to sensitive directories
+<DirectoryMatch "logs|migrations">
+    Require all denied
+</DirectoryMatch>
+
+# Block direct access to sensitive files
+<FilesMatch "\.(env|log|sql|sh|txt|bak)$">
+    Require all denied
+</FilesMatch>
+
+# Security headers for API responses
+Header always set X-Content-Type-Options "nosniff"
+Header always set X-Frame-Options "DENY"

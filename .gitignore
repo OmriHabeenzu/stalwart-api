@@ -1,0 +1,35 @@
+# Environment & secrets
+.env
+.env.*
+
+# Logs
+logs/
+*.log
+
+# Uploads (user-generated content)
+uploads/
+
+# Debug/temp files
+debug.php
+test.php
+hello.php
+*.bak
+*.tmp
+
+# Vendor
+vendor/
+
+# Sensitive config
+config/database.php
+
+# Backups & zips
+backups/
+uploads.zip
+
+# Claude internal files
+.claude/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
