@@ -384,6 +384,17 @@ function requireAdmin($pdo = null) {
     return $user;
 }
 
+function requireCallManager($pdo) {
+    $user = getUserFromToken();
+    if (!$user) sendResponse('error', 'Unauthorized', null, 401);
+    if ($user['role'] === 'admin') return $user;
+    $row = $pdo->prepare("SELECT can_manage_calls FROM users WHERE id = ? LIMIT 1");
+    $row->execute([$user['id']]);
+    $data = $row->fetch();
+    if (!$data || !$data['can_manage_calls']) sendResponse('error', 'Forbidden', null, 403);
+    return $user;
+}
+
 function createNotificationForAllStaff($pdo, $type, $title, $message, $link = null) {
     try {
         $stmt = $pdo->query("SELECT id FROM users WHERE role IN ('staff', 'admin')");
@@ -4631,9 +4642,9 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS call_schedule (
     UNIQUE KEY unique_day_user (user_id, weekday)
 )");
 
-// GET /call-schedule — admin: full weekly schedule + staff list
+// GET /call-schedule — admin or call manager: full weekly schedule + staff list
 if ($path === '/call-schedule' && $method === 'GET') {
-    $user = requireAdmin($pdo);
+    $user = requireCallManager($pdo);
     try {
         $schedule = $pdo->query("SELECT cs.weekday, cs.role, cs.user_id, u.name as user_name FROM call_schedule cs JOIN users u ON u.id = cs.user_id ORDER BY cs.weekday, cs.role, u.name")->fetchAll();
         $staff    = $pdo->query("SELECT id, name, role FROM users WHERE is_active = 1 ORDER BY name")->fetchAll();
@@ -4643,9 +4654,9 @@ if ($path === '/call-schedule' && $method === 'GET') {
     }
 }
 
-// POST /call-schedule — admin: save/replace weekly schedule
+// POST /call-schedule — admin or call manager: save/replace weekly schedule
 if ($path === '/call-schedule' && $method === 'POST') {
-    $user        = requireAdmin($pdo);
+    $user        = requireCallManager($pdo);
     $data        = getRequestData();
     $assignments = $data['assignments'] ?? [];
     try {
