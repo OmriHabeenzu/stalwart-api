@@ -48,6 +48,11 @@ if (file_exists($envFile)) {
 }
 require_once __DIR__ . '/utils/jwt.php';
 
+// VAPID keys for Web Push (override in .env)
+define('VAPID_PUBLIC_KEY',  $_ENV['VAPID_PUBLIC_KEY']  ?? 'BPEjZwuRl0g09cq4hPgwt8vwQMM9dCUZjUSz5uy0ChQxHafU4R_pjkX2wSEqEEXWnCLGEBp9sYjS0ZjpUHWqTH4');
+define('VAPID_PRIVATE_KEY', $_ENV['VAPID_PRIVATE_KEY'] ?? 'wd0oVmTeuX1zg98EVtXGr1d4nfkpwZBMC5M-YWNsjbs');
+define('VAPID_SUBJECT',     $_ENV['VAPID_SUBJECT']     ?? 'mailto:admin@stalwartzm.com');
+
 // === 4. DATABASE CONNECTION ===
 $host = $_ENV['DB_HOST'] ?? 'localhost';
 $db   = $_ENV['DB_NAME'] ?? 'stalwart';
@@ -354,6 +359,122 @@ function logActivity($pdo, $userId, $username, $action, $description) {
     }
 }
 
+// ── Web Push (pure PHP, no Composer) ──────────────────────────────────────
+function wpB64d($s) {
+    return base64_decode(str_pad(strtr($s, '-_', '+/'), strlen($s) + (4 - strlen($s) % 4) % 4, '='));
+}
+function wpB64e($s) { return rtrim(strtr(base64_encode($s), '+/', '-_'), '='); }
+
+function wpHkdf($salt, $ikm, $info, $length) {
+    $prk = hash_hmac('sha256', $ikm, $salt, true);
+    $t = ''; $okm = '';
+    for ($i = 1; strlen($okm) < $length; $i++) {
+        $t = hash_hmac('sha256', $t . $info . chr($i), $prk, true);
+        $okm .= $t;
+    }
+    return substr($okm, 0, $length);
+}
+
+function wpVapidJwt($endpoint) {
+    $origin = parse_url($endpoint, PHP_URL_SCHEME) . '://' . parse_url($endpoint, PHP_URL_HOST);
+    $h = wpB64e(json_encode(['typ' => 'JWT', 'alg' => 'ES256']));
+    $p = wpB64e(json_encode(['aud' => $origin, 'exp' => time() + 43200, 'sub' => VAPID_SUBJECT]));
+    $input = "$h.$p";
+
+    // Build PKCS8 DER: fixed P-256 header + 32-byte private scalar
+    $privScalar = wpB64d(VAPID_PRIVATE_KEY);
+    $der = hex2bin('308141020100301306072a8648ce3d020106082a8648ce3d030107042730250201010420') . $privScalar;
+    $pem = "-----BEGIN PRIVATE KEY-----\n" . chunk_split(base64_encode($der), 64, "\n") . "-----END PRIVATE KEY-----";
+    $key = openssl_pkey_get_private($pem);
+    openssl_sign($input, $sig, $key, OPENSSL_ALGO_SHA256);
+
+    // DER ECDSA signature → raw r|s (64 bytes)
+    $pos = 2;
+    if (ord($sig[1]) & 0x80) $pos += ord($sig[1]) & 0x7f;
+    $pos++; $rLen = ord($sig[$pos++]);
+    $r = ltrim(substr($sig, $pos, $rLen), "\x00"); $pos += $rLen;
+    $pos++; $sLen = ord($sig[$pos++]);
+    $s = ltrim(substr($sig, $pos, $sLen), "\x00");
+    $rawSig = str_pad($r, 32, "\x00", STR_PAD_LEFT) . str_pad($s, 32, "\x00", STR_PAD_LEFT);
+    return "$input." . wpB64e($rawSig);
+}
+
+function wpEncrypt($payload, $p256dhB64u, $authB64u) {
+    $uaPub      = wpB64d($p256dhB64u);   // 65 bytes: 0x04 || x || y
+    $authSecret = wpB64d($authB64u);      // 16 bytes
+    $salt       = random_bytes(16);
+
+    // Ephemeral ECDH key pair
+    $ephKey = openssl_pkey_new(['private_key_type' => OPENSSL_KEYTYPE_EC, 'curve_name' => 'prime256v1']);
+    $ec     = openssl_pkey_get_details($ephKey)['ec'];
+    $asPub  = "\x04" . str_pad($ec['x'], 32, "\x00", STR_PAD_LEFT)
+                     . str_pad($ec['y'], 32, "\x00", STR_PAD_LEFT);
+
+    // Load receiver's public key via SubjectPublicKeyInfo DER
+    $spki  = hex2bin('3059301306072a8648ce3d020106082a8648ce3d030107034200') . $uaPub;
+    $uaKey = openssl_pkey_get_public("-----BEGIN PUBLIC KEY-----\n" . chunk_split(base64_encode($spki), 64, "\n") . "-----END PUBLIC KEY-----");
+
+    // ECDH shared secret (32 bytes)
+    $ecdhSecret = openssl_pkey_derive($uaKey, $ephKey, 32);
+
+    // RFC 8291 key derivation
+    $ikm   = wpHkdf($authSecret, $ecdhSecret, "WebPush: info\x00" . $uaPub . $asPub, 32);
+    $cek   = wpHkdf($salt, $ikm, "Content-Encoding: aes128gcm\x00", 16);
+    $nonce = wpHkdf($salt, $ikm, "Content-Encoding: nonce\x00", 12);
+
+    // AES-128-GCM (single record; \x02 = end-of-padding delimiter)
+    $ciphertext = openssl_encrypt($payload . "\x02", 'aes-128-gcm', $cek, OPENSSL_RAW_DATA, $nonce, $tag);
+
+    // Record header: salt(16) + rs=4096(4 BE) + idlen=65(1) + asPub(65)
+    return $salt . pack('N', 4096) . chr(65) . $asPub . $ciphertext . $tag;
+}
+
+function sendWebPush($endpoint, $p256dh, $auth, $title, $body, $url = '/dashboard/notifications') {
+    try {
+        $jwt    = wpVapidJwt($endpoint);
+        $record = wpEncrypt(json_encode(['title' => $title, 'body' => $body, 'url' => $url]), $p256dh, $auth);
+        $ch = curl_init($endpoint);
+        curl_setopt_array($ch, [
+            CURLOPT_POST           => true,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 10,
+            CURLOPT_HTTPHEADER     => [
+                'Authorization: vapid t=' . $jwt . ',k=' . VAPID_PUBLIC_KEY,
+                'Content-Encoding: aes128gcm',
+                'Content-Type: application/octet-stream',
+                'Content-Length: ' . strlen($record),
+                'TTL: 86400',
+                'Urgency: normal',
+            ],
+            CURLOPT_POSTFIELDS => $record,
+        ]);
+        curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        @curl_close($ch);
+        if ($code === 410) { // subscription expired — remove it
+            global $pdo;
+            $pdo->prepare("DELETE FROM push_subscriptions WHERE endpoint = ?")->execute([$endpoint]);
+        }
+        return $code >= 200 && $code < 300;
+    } catch (\Throwable $e) {
+        error_log("WebPush error: " . $e->getMessage());
+        return false;
+    }
+}
+
+function sendPushToUser($pdo, $userId, $title, $body, $url = '/dashboard/notifications') {
+    try {
+        $stmt = $pdo->prepare("SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = ?");
+        $stmt->execute([$userId]);
+        foreach ($stmt->fetchAll() as $sub) {
+            sendWebPush($sub['endpoint'], $sub['p256dh'], $sub['auth'], $title, $body, $url);
+        }
+    } catch (\Throwable $e) {
+        error_log("sendPushToUser error: " . $e->getMessage());
+    }
+}
+// ── End Web Push ───────────────────────────────────────────────────────────
+
 function createNotification($pdo, $userId, $type, $title, $message, $link = null) {
     try {
         $stmt = $pdo->prepare("
@@ -361,6 +482,7 @@ function createNotification($pdo, $userId, $type, $title, $message, $link = null
             VALUES (?, ?, ?, ?, ?)
         ");
         $stmt->execute([$userId, $type, $title, $message, $link]);
+        sendPushToUser($pdo, $userId, $title, $message, $link ?? '/dashboard/notifications');
         return $pdo->lastInsertId();
     } catch (PDOException $e) {
         error_log("Notification creation error: " . $e->getMessage());
@@ -413,6 +535,19 @@ function createNotificationForAllStaff($pdo, $type, $title, $message, $link = nu
 // === 6. SCHEMA MIGRATIONS (run once, safe to repeat) ===
 try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS can_manage_calls TINYINT(1) DEFAULT 0"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip VARCHAR(45) DEFAULT NULL"); } catch (Exception $e) {}
+try {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        endpoint TEXT NOT NULL,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_endpoint (endpoint(500)),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )");
+} catch (Exception $e) {}
 
 // === 7. ROUTING ===
 $method = $_SERVER['REQUEST_METHOD'];
@@ -4896,6 +5031,35 @@ if ($path === '/auth/profile' && $method === 'GET') {
         sendResponse('success', 'Profile retrieved', ['profile' => $profile]);
     } catch (PDOException $e) {
         sendResponse('error', 'Failed to fetch profile', null, 500);
+    }
+}
+
+// ==========================================
+// PUSH NOTIFICATION ROUTES
+// ==========================================
+
+// GET /push/vapid-public-key  — public, returns VAPID public key
+if ($path === '/push/vapid-public-key' && $method === 'GET') {
+    sendResponse('success', 'VAPID public key', ['publicKey' => VAPID_PUBLIC_KEY]);
+}
+
+// POST /push/subscribe  — authenticated, saves push subscription
+if ($path === '/push/subscribe' && $method === 'POST') {
+    $user = getUserFromToken();
+    if (!$user) sendResponse('error', 'Unauthorized', null, 401);
+    $data = json_decode(file_get_contents('php://input'), true);
+    $sub  = $data['subscription'] ?? null;
+    if (!$sub || empty($sub['endpoint']) || empty($sub['keys']['p256dh']) || empty($sub['keys']['auth'])) {
+        sendResponse('error', 'Invalid subscription', null, 400);
+    }
+    try {
+        $stmt = $pdo->prepare("INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth)
+            VALUES (?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), p256dh = VALUES(p256dh), auth = VALUES(auth), updated_at = NOW()");
+        $stmt->execute([$user['id'], $sub['endpoint'], $sub['keys']['p256dh'], $sub['keys']['auth']]);
+        sendResponse('success', 'Subscribed');
+    } catch (PDOException $e) {
+        sendResponse('error', 'Failed to save subscription', null, 500);
     }
 }
 
