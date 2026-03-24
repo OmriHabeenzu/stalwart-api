@@ -535,6 +535,7 @@ function createNotificationForAllStaff($pdo, $type, $title, $message, $link = nu
 // === 6. SCHEMA MIGRATIONS (run once, safe to repeat) ===
 try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS can_manage_calls TINYINT(1) DEFAULT 0"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip VARCHAR(45) DEFAULT NULL"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS position VARCHAR(100) DEFAULT NULL"); } catch (Exception $e) {}
 try {
     $pdo->exec("CREATE TABLE IF NOT EXISTS push_subscriptions (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -617,6 +618,59 @@ if ($path === '/auth/login' && $method === 'POST') {
         ]);
     } catch (PDOException $e) {
         sendResponse('error', 'Database error', null, 500);
+    }
+}
+
+// POST /auth/register — staff self-registration, auto-login
+if ($path === '/auth/register' && $method === 'POST') {
+    $data     = getRequestData();
+    $name     = trim($data['name']     ?? '');
+    $email    = strtolower(trim($data['email'] ?? ''));
+    $password = $data['password']      ?? '';
+    $phone    = trim($data['phone']    ?? '');
+    $position = trim($data['position'] ?? '');
+
+    if (empty($name) || empty($email) || empty($password)) {
+        sendResponse('error', 'Name, email and password are required', null, 400);
+    }
+    if (!validateEmail($email)) {
+        sendResponse('error', 'Invalid email format', null, 400);
+    }
+    if (strlen($password) < 6) {
+        sendResponse('error', 'Password must be at least 6 characters', null, 400);
+    }
+
+    try {
+        // Check email not already in use
+        $check = $pdo->prepare("SELECT id FROM users WHERE email = ? LIMIT 1");
+        $check->execute([$email]);
+        if ($check->fetch()) {
+            sendResponse('error', 'An account with this email already exists', null, 409);
+        }
+
+        $hashed = password_hash($password, PASSWORD_DEFAULT);
+        $stmt = $pdo->prepare("INSERT INTO users (name, email, password, phone, position, role, is_active, created_at)
+            VALUES (?, ?, ?, ?, ?, 'staff', 1, NOW())");
+        $stmt->execute([$name, $email, $hashed, $phone, $position]);
+        $userId = (int)$pdo->lastInsertId();
+
+        logActivity($pdo, $userId, $name, 'register', "New staff account registered: $email");
+
+        // Notify admins
+        $admins = $pdo->query("SELECT id FROM users WHERE role = 'admin' AND is_active = 1")->fetchAll(PDO::FETCH_COLUMN);
+        foreach ($admins as $adminId) {
+            createNotification($pdo, $adminId, 'info', 'New Staff Registered', "$name ($email) has created an account.", '/dashboard/users');
+        }
+
+        // Auto-login: return token
+        $token = JWT::generateToken($userId, $email, 'staff');
+        $user  = $pdo->prepare("SELECT id, name, email, role, is_active, can_manage_calls, last_login, created_at FROM users WHERE id = ? LIMIT 1");
+        $user->execute([$userId]);
+        $userData = $user->fetch();
+
+        sendResponse('success', 'Account created successfully', ['token' => $token, 'user' => $userData]);
+    } catch (PDOException $e) {
+        sendResponse('error', 'Registration failed', null, 500);
     }
 }
 
