@@ -1149,16 +1149,17 @@ if ($path === '/tasks' && $method === 'POST') {
 
     try {
         $pdo->beginTransaction();
-        
+
         // Insert task
         $stmt = $pdo->prepare("
-            INSERT INTO tasks (title, description, priority, category, due_date, due_time, recurrence, created_by) 
+            INSERT INTO tasks (title, description, priority, category, due_date, due_time, recurrence, created_by)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ");
         $stmt->execute([$title, $description, $priority, $category, $dueDate, $dueTime, $recurrence, $createdBy]);
         $taskId = $pdo->lastInsertId();
-        
-        // Insert assignees
+
+        // Insert assignees + queue emails (send AFTER response to avoid SMTP timeout blocking)
+        $emailQueue = [];
         if (!empty($assignees) && is_array($assignees)) {
             $stmtAssign = $pdo->prepare("
                 INSERT INTO task_assignees (task_id, user_id, user_name)
@@ -1166,43 +1167,38 @@ if ($path === '/tasks' && $method === 'POST') {
             ");
             foreach ($assignees as $userId) {
                 $stmtAssign->execute([$taskId, $userId]);
-
-                // Send in-app notification to assigned user
                 $dueDateText = $dueDate ? " (Due: $dueDate" . ($dueTime ? " at $dueTime" : "") . ")" : "";
-                createNotification(
-                    $pdo,
-                    $userId,
-                    'task_assigned',
+                createNotification($pdo, $userId, 'task_assigned',
                     "New task assigned: $title",
                     "You have been assigned a new $priority priority task$dueDateText",
                     "/dashboard/tasks?task=$taskId"
                 );
-                // Send email notification
+                // Collect email data — send after DB commit and HTTP response
                 $assigneeRow = $pdo->prepare("SELECT email, name FROM users WHERE id = ?");
                 $assigneeRow->execute([$userId]);
                 $assignee = $assigneeRow->fetch();
                 if ($assignee && !empty($assignee['email'])) {
                     $dueLine = $dueDate ? "<p><strong>Due:</strong> $dueDate" . ($dueTime ? " at $dueTime" : "") . "</p>" : "";
-                    sendEmail($assignee['email'], $assignee['name'], "New Task Assigned: $title",
-                        "<p>Hello {$assignee['name']},</p>"
-                        . "<p>You have been assigned a new <strong>$priority priority</strong> task:</p>"
-                        . "<p><strong>$title</strong></p>"
-                        . ($description ? "<p>$description</p>" : "")
-                        . $dueLine
-                        . "<p>Log in to view and manage your tasks.</p>"
-                    );
+                    $emailQueue[] = [
+                        'to'      => $assignee['email'],
+                        'name'    => $assignee['name'],
+                        'subject' => "New Task Assigned: $title",
+                        'body'    => "<p>Hello {$assignee['name']},</p>"
+                                   . "<p>You have been assigned a new <strong>$priority priority</strong> task:</p>"
+                                   . "<p><strong>$title</strong></p>"
+                                   . ($description ? "<p>$description</p>" : "")
+                                   . $dueLine
+                                   . "<p>Log in to view and manage your tasks.</p>",
+                    ];
                 }
             }
         }
 
         // Create reminders if due date/time set
         if ($dueDate) {
-            // Morning reminder (8 AM on due date)
             $morningTime = $dueDate . ' 08:00:00';
             $pdo->prepare("INSERT INTO task_reminders (task_id, reminder_type, reminder_time) VALUES (?, 'morning', ?)")
                 ->execute([$taskId, $morningTime]);
-            
-            // 1 hour before if time is set
             if ($dueTime) {
                 $dateTime = new DateTime("$dueDate $dueTime");
                 $dateTime->modify('-1 hour');
@@ -1210,13 +1206,32 @@ if ($path === '/tasks' && $method === 'POST') {
                     ->execute([$taskId, $dateTime->format('Y-m-d H:i:s')]);
             }
         }
-        
+
         $pdo->commit();
 
         $actor = getUserFromToken();
-        logActivity($pdo, $actor['id'] ?? null, $actor['name'] ?? 'Staff', 'task_created', "Created task: $title (priority: $priority)");
+        logActivity($pdo, $actor['id'] ?? null, $actor['email'] ?? 'Staff', 'task_created', "Created task: $title (priority: $priority)");
 
-        sendResponse('success', 'Task created successfully! 🎉', ['id' => $taskId]);
+        // Send HTTP response immediately so the browser isn't blocked by SMTP
+        $responseJson = json_encode(['status' => 'success', 'message' => 'Task created successfully!', 'data' => ['id' => $taskId]]);
+        http_response_code(200);
+        header('Content-Type: application/json; charset=UTF-8');
+        header('Content-Length: ' . strlen($responseJson));
+        header('Connection: close');
+        echo $responseJson;
+        if (function_exists('fastcgi_finish_request')) {
+            fastcgi_finish_request();
+        } else {
+            @ob_end_flush(); @ob_flush(); flush();
+        }
+
+        // Now send queued emails in the background (client already received success)
+        ignore_user_abort(true);
+        foreach ($emailQueue as $em) {
+            sendEmail($em['to'], $em['name'], $em['subject'], $em['body']);
+        }
+        exit();
+
     } catch (PDOException $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error_log("Create task error: " . $e->getMessage());
