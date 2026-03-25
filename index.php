@@ -536,6 +536,10 @@ function createNotificationForAllStaff($pdo, $type, $title, $message, $link = nu
 try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS can_manage_calls TINYINT(1) DEFAULT 0"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip VARCHAR(45) DEFAULT NULL"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS position VARCHAR(100) DEFAULT NULL"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS category VARCHAR(100) DEFAULT 'general'"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS due_time TIME DEFAULT NULL"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS recurrence VARCHAR(20) DEFAULT 'none'"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS parent_task_id INT DEFAULT NULL"); } catch (Exception $e) {}
 try {
     $pdo->exec("CREATE TABLE IF NOT EXISTS push_subscriptions (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -1243,10 +1247,10 @@ if ($path === '/tasks' && $method === 'POST') {
         }
         exit();
 
-    } catch (PDOException $e) {
+    } catch (\Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error_log("Create task error: " . $e->getMessage());
-        sendResponse('error', 'Failed to create task', null, 500);
+        sendResponse('error', 'Failed to create task: ' . $e->getMessage(), null, 500);
     }
 }
 
