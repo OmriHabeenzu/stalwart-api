@@ -544,6 +544,10 @@ try { $pdo->exec("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS category VARCHAR(10
 try { $pdo->exec("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS due_time TIME DEFAULT NULL"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS recurrence VARCHAR(20) DEFAULT 'none'"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS parent_task_id INT DEFAULT NULL"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE task_assignees ADD PRIMARY KEY (id)"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE task_assignees MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE task_reminders ADD PRIMARY KEY (id)"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE task_reminders MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT"); } catch (Exception $e) {}
 try {
     $pdo->exec("CREATE TABLE IF NOT EXISTS push_subscriptions (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -3182,6 +3186,7 @@ if ($path === '/analytics/stats' && $method === 'GET') {
         $totalTasks = (int)$pdo->query("SELECT COUNT(*) FROM tasks")->fetchColumn();
         $completedTasks = (int)$pdo->query("SELECT COUNT(*) FROM tasks WHERE status = 'completed'")->fetchColumn();
         $pendingTasks = (int)$pdo->query("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")->fetchColumn();
+        $inProgressTasks = (int)$pdo->query("SELECT COUNT(*) FROM tasks WHERE status = 'in_progress'")->fetchColumn();
 
         // Loan repayments (if tables exist)
         $loanAccounts = 0;
@@ -3211,7 +3216,7 @@ if ($path === '/analytics/stats' && $method === 'GET') {
             'testimonials'         => ['total' => $totalTestimonials, 'approved' => $approvedTestimonials, 'pending' => $pendingTestimonials],
             'chats'                => ['total' => $totalChats, 'active' => $activeChats, 'messages' => $totalMessages],
             'users'                => ['total' => $totalUsers],
-            'tasks'                => ['total' => $totalTasks, 'completed' => $completedTasks, 'pending' => $pendingTasks],
+            'tasks'                => ['total' => $totalTasks, 'completed' => $completedTasks, 'pending' => $pendingTasks, 'in_progress' => $inProgressTasks],
             'loans'                => ['active_accounts' => $loanAccounts, 'total_payments' => $loanPayments, 'pending_payments' => $pendingPayments, 'confirmed_payments' => $confirmedPayments, 'total_revenue' => $totalRevenue],
             'logs'                 => ['total' => $totalLogs, 'last_7_days' => $recentActivity]
         ]);
