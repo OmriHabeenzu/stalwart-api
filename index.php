@@ -1,6 +1,7 @@
 <?php
 // ==========================================
 // STALWART API - COMPLETE REAL DATABASE VERSION
+// v2 - deployed via GitHub Actions
 // ==========================================
 
 require_once __DIR__ . '/vendor/autoload.php';
