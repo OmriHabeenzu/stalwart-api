@@ -548,6 +548,10 @@ try { $pdo->exec("ALTER TABLE task_assignees ADD PRIMARY KEY (id)"); } catch (Ex
 try { $pdo->exec("ALTER TABLE task_assignees MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE task_reminders ADD PRIMARY KEY (id)"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE task_reminders MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE task_assignees ADD COLUMN IF NOT EXISTS status ENUM('pending','completed') NOT NULL DEFAULT 'pending'"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE task_assignees ADD COLUMN IF NOT EXISTS completed_at DATETIME DEFAULT NULL"); } catch (Exception $e) {}
+// Backfill: assignees of already-completed tasks get marked complete
+try { $pdo->exec("UPDATE task_assignees ta JOIN tasks t ON t.id = ta.task_id SET ta.status = 'completed', ta.completed_at = t.updated_at WHERE t.status = 'completed' AND ta.status = 'pending'"); } catch (Exception $e) {}
 try {
     $pdo->exec("CREATE TABLE IF NOT EXISTS push_subscriptions (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -1106,11 +1110,15 @@ if (preg_match('/^\/users\/(\d+)$/', $path, $matches) && $method === 'DELETE') {
 if ($path === '/tasks' && $method === 'GET') {
     try {
         $sql = "
-            SELECT 
+            SELECT
                 t.*,
                 COUNT(DISTINCT ta.user_id) as assignee_count,
                 COUNT(DISTINCT tc.id) as comment_count,
-                GROUP_CONCAT(DISTINCT ta.user_name SEPARATOR ', ') as assignees
+                GROUP_CONCAT(DISTINCT ta.user_name ORDER BY ta.user_name SEPARATOR ', ') as assignees,
+                GROUP_CONCAT(
+                    CONCAT(ta.user_id, '|', ta.user_name, '|', COALESCE(ta.status,'pending'))
+                    ORDER BY ta.user_name SEPARATOR ';;'
+                ) as assignee_details
             FROM tasks t
             LEFT JOIN task_assignees ta ON t.id = ta.task_id
             LEFT JOIN task_comments tc ON t.id = tc.id
@@ -1450,6 +1458,52 @@ if ($path === '/tasks/bulk-assign' && $method === 'POST') {
     } catch (PDOException $e) {
         error_log("Bulk assign error: " . $e->getMessage());
         sendResponse('error', 'Failed to bulk assign tasks', null, 500);
+    }
+}
+
+// PATCH /tasks/:id/assignee-status — update one assignee's personal completion status
+if (preg_match('/^\/tasks\/(\d+)\/assignee-status$/', $path, $m) && $method === 'PATCH') {
+    $taskId = (int)$m[1];
+    $actor  = getUserFromToken();
+    if (!$actor) sendResponse('error', 'Unauthorized', null, 401);
+
+    $data         = getRequestData();
+    $targetUserId = (int)($data['user_id'] ?? 0);
+    $newStatus    = $data['status'] ?? '';
+
+    if (!in_array($newStatus, ['pending', 'completed'])) {
+        sendResponse('error', 'Invalid status', null, 400);
+    }
+    // Staff can only update their own row; admin can update anyone
+    if ($actor['role'] !== 'admin' && (int)$actor['id'] !== $targetUserId) {
+        sendResponse('error', 'Forbidden', null, 403);
+    }
+
+    try {
+        $completedAt = $newStatus === 'completed' ? date('Y-m-d H:i:s') : null;
+        $pdo->prepare("UPDATE task_assignees SET status = ?, completed_at = ? WHERE task_id = ? AND user_id = ?")
+            ->execute([$newStatus, $completedAt, $taskId, $targetUserId]);
+
+        // Auto-complete the overall task when every assignee is done
+        if ($newStatus === 'completed') {
+            $totalStmt = $pdo->prepare("SELECT COUNT(*) FROM task_assignees WHERE task_id = ?");
+            $totalStmt->execute([$taskId]);
+            $total = (int)$totalStmt->fetchColumn();
+
+            $doneStmt = $pdo->prepare("SELECT COUNT(*) FROM task_assignees WHERE task_id = ? AND status = 'completed'");
+            $doneStmt->execute([$taskId]);
+            $done = (int)$doneStmt->fetchColumn();
+
+            if ($total > 0 && $done >= $total) {
+                $pdo->prepare("UPDATE tasks SET status = 'completed', updated_at = NOW() WHERE id = ? AND status != 'completed'")
+                    ->execute([$taskId]);
+            }
+        }
+
+        sendResponse('success', 'Assignment status updated');
+    } catch (PDOException $e) {
+        error_log("Assignee status update error: " . $e->getMessage());
+        sendResponse('error', 'Failed to update status', null, 500);
     }
 }
 
@@ -3322,11 +3376,11 @@ if ($path === '/analytics/staff' && $method === 'GET') {
             $taskStmt = $pdo->prepare("
                 SELECT
                     COUNT(DISTINCT t.id) AS total_assigned,
-                    SUM(CASE WHEN t.status = 'completed' THEN 1 ELSE 0 END) AS total_completed,
-                    SUM(CASE WHEN t.status = 'pending' THEN 1 ELSE 0 END) AS pending,
-                    SUM(CASE WHEN t.status = 'in_progress' THEN 1 ELSE 0 END) AS in_progress,
-                    SUM(CASE WHEN t.status = 'completed'
-                        AND YEAR(t.updated_at) = ? AND MONTH(t.updated_at) = ? THEN 1 ELSE 0 END) AS completed_this_month
+                    SUM(CASE WHEN ta.status = 'completed' THEN 1 ELSE 0 END) AS total_completed,
+                    SUM(CASE WHEN ta.status != 'completed' AND t.status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                    SUM(CASE WHEN ta.status != 'completed' AND t.status = 'in_progress' THEN 1 ELSE 0 END) AS in_progress,
+                    SUM(CASE WHEN ta.status = 'completed'
+                        AND YEAR(ta.completed_at) = ? AND MONTH(ta.completed_at) = ? THEN 1 ELSE 0 END) AS completed_this_month
                 FROM tasks t
                 JOIN task_assignees ta ON ta.task_id = t.id
                 WHERE ta.user_id = ?
