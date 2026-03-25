@@ -537,7 +537,8 @@ function createNotificationForAllStaff($pdo, $type, $title, $message, $link = nu
 try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS can_manage_calls TINYINT(1) DEFAULT 0"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip VARCHAR(45) DEFAULT NULL"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS position VARCHAR(100) DEFAULT NULL"); } catch (Exception $e) {}
-try { $pdo->exec("ALTER TABLE tasks ADD PRIMARY KEY (id)"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE tasks DROP PRIMARY KEY"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE tasks MODIFY COLUMN id INT NOT NULL, ADD PRIMARY KEY (id)"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE tasks MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS category VARCHAR(100) DEFAULT 'general'"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS due_time TIME DEFAULT NULL"); } catch (Exception $e) {}
