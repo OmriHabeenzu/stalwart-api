@@ -549,6 +549,17 @@ try {
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )");
 } catch (Exception $e) {}
+try {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS task_reminders (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        task_id INT NOT NULL,
+        reminder_type VARCHAR(50) NOT NULL,
+        reminder_time DATETIME NOT NULL,
+        sent TINYINT(1) DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    )");
+} catch (Exception $e) {}
 
 // === 7. ROUTING ===
 $method = $_SERVER['REQUEST_METHOD'];
