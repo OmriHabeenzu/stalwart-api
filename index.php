@@ -4733,6 +4733,12 @@ try {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 } catch (Exception $e) { /* tables may already exist */ }
 
+// Ensure columns added after initial deploy exist
+try { $pdo->exec("ALTER TABLE call_reports ADD COLUMN IF NOT EXISTS staff_id INT NULL"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE call_reports ADD COLUMN IF NOT EXISTS answered_count INT DEFAULT 0"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE call_reports ADD COLUMN IF NOT EXISTS unanswered_count INT DEFAULT 0"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE call_reports ADD COLUMN IF NOT EXISTS total_count INT DEFAULT 0"); } catch (Exception $e) {}
+
 // GET /call-reports - list recent reports
 if ($path === '/call-reports' && $method === 'GET') {
     $user = requireAuth($pdo);
