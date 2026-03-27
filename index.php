@@ -4962,91 +4962,99 @@ if ($path === '/calendar/today' && $method === 'GET') {
 $pdo->exec("CREATE TABLE IF NOT EXISTS call_schedule (
     id INT AUTO_INCREMENT PRIMARY KEY,
     user_id INT NOT NULL,
-    weekday TINYINT NOT NULL COMMENT '1=Mon 2=Tue 3=Wed 4=Thu 5=Fri',
+    schedule_date DATE NOT NULL,
     role ENUM('caller','followup') NOT NULL,
-    UNIQUE KEY unique_day_user (user_id, weekday)
-)");
+    UNIQUE KEY unique_date_role (schedule_date, role)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
-// GET /call-schedule — admin or call manager: full weekly schedule + staff list
+// Migrate old weekday-based table to date-based
+try { $pdo->exec("ALTER TABLE call_schedule ADD COLUMN IF NOT EXISTS schedule_date DATE NULL"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE call_schedule DROP INDEX unique_day_user"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE call_schedule ADD UNIQUE KEY unique_date_role (schedule_date, role)"); } catch (Exception $e) {}
+
+// GET /call-schedule?month=YYYY-MM — admin or call manager
 if ($path === '/call-schedule' && $method === 'GET') {
-    $user = requireCallManager($pdo);
+    $user  = requireCallManager($pdo);
+    $month = preg_match('/^\d{4}-\d{2}$/', $_GET['month'] ?? '') ? $_GET['month'] : date('Y-m');
     try {
-        $schedule = $pdo->query("SELECT cs.weekday, cs.role, cs.user_id, u.name as user_name FROM call_schedule cs JOIN users u ON u.id = cs.user_id ORDER BY cs.weekday, cs.role, u.name")->fetchAll();
-        $staff    = $pdo->query("SELECT id, name, role FROM users WHERE is_active = 1 ORDER BY name")->fetchAll();
+        $stmt = $pdo->prepare("
+            SELECT cs.schedule_date, cs.role, cs.user_id, u.name AS user_name
+            FROM call_schedule cs JOIN users u ON u.id = cs.user_id
+            WHERE cs.schedule_date IS NOT NULL AND DATE_FORMAT(cs.schedule_date, '%Y-%m') = ?
+            ORDER BY cs.schedule_date, cs.role
+        ");
+        $stmt->execute([$month]);
+        $schedule = $stmt->fetchAll();
+        $staff    = $pdo->query("SELECT id, name FROM users WHERE is_active = 1 AND role = 'staff' ORDER BY name")->fetchAll();
         sendResponse('success', 'Schedule retrieved', ['schedule' => $schedule, 'staff' => $staff]);
     } catch (PDOException $e) {
         sendResponse('error', 'Failed to fetch schedule', null, 500);
     }
 }
 
-// POST /call-schedule — admin or call manager: save/replace weekly schedule
+// POST /call-schedule — admin or call manager: save monthly schedule
 if ($path === '/call-schedule' && $method === 'POST') {
     $user        = requireCallManager($pdo);
     $data        = getRequestData();
+    $month       = preg_match('/^\d{4}-\d{2}$/', $data['month'] ?? '') ? $data['month'] : date('Y-m');
     $assignments = $data['assignments'] ?? [];
     try {
-        $pdo->exec("DELETE FROM call_schedule");
-        $stmt = $pdo->prepare("INSERT IGNORE INTO call_schedule (user_id, weekday, role) VALUES (?, ?, ?)");
+        // Replace all entries for this month
+        $del = $pdo->prepare("DELETE FROM call_schedule WHERE schedule_date IS NOT NULL AND DATE_FORMAT(schedule_date, '%Y-%m') = ?");
+        $del->execute([$month]);
+
+        $stmt = $pdo->prepare("INSERT INTO call_schedule (user_id, schedule_date, role) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE user_id = VALUES(user_id)");
+        $notified = [];
         foreach ($assignments as $a) {
-            if (!isset($a['user_id'], $a['weekday'], $a['role'])) continue;
+            if (!isset($a['user_id'], $a['schedule_date'], $a['role'])) continue;
             if (!in_array($a['role'], ['caller', 'followup'])) continue;
-            $stmt->execute([(int)$a['user_id'], (int)$a['weekday'], $a['role']]);
-        }
-        logActivity($pdo, $user['id'], $user['name'] ?? 'Admin', 'schedule_update', 'Updated weekly call schedule');
+            if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $a['schedule_date'])) continue;
+            $stmt->execute([(int)$a['user_id'], $a['schedule_date'], $a['role']]);
 
-        // Notify each assigned staff member
-        $dayNames = [1=>'Monday',2=>'Tuesday',3=>'Wednesday',4=>'Thursday',5=>'Friday'];
-        $notified = []; // avoid duplicate notifications per user
-        foreach ($assignments as $a) {
-            if (!isset($a['user_id'], $a['weekday'], $a['role'])) continue;
-            $uid     = (int)$a['user_id'];
-            $dayName = $dayNames[$a['weekday']] ?? 'Day ' . $a['weekday'];
-            $roleLabel = $a['role'] === 'caller' ? 'making calls' : 'follow-up on unanswered calls';
-            $key = "{$uid}_{$a['weekday']}";
-            if (isset($notified[$key])) continue;
-            $notified[$key] = true;
-
-            createNotification($pdo, $uid, 'schedule',
-                "Call schedule: {$dayName}",
-                "You are assigned to {$roleLabel} on {$dayName} this week.",
-                "/dashboard/call-report"
-            );
-
-            // Email the staff member
-            $uRow = $pdo->prepare("SELECT email, name FROM users WHERE id = ?");
-            $uRow->execute([$uid]);
-            $uData = $uRow->fetch();
-            if ($uData && !empty($uData['email'])) {
-                sendEmail($uData['email'], $uData['name'],
-                    "Call Schedule Update — {$dayName}",
-                    "<p>Hello {$uData['name']},</p>"
-                    . "<p>You have been scheduled for <strong>{$roleLabel}</strong> on <strong>{$dayName}</strong> this week.</p>"
-                    . "<p>Log in to the system to view your full schedule and prepare your client list.</p>"
+            // Notify each assigned staff member once per day
+            $uid = (int)$a['user_id'];
+            $key = "{$uid}_{$a['schedule_date']}";
+            if (!isset($notified[$key])) {
+                $notified[$key] = true;
+                $dateLabel = date('D, d M Y', strtotime($a['schedule_date']));
+                $roleLabel = $a['role'] === 'caller' ? 'making calls' : 'follow-up on unanswered calls';
+                createNotification($pdo, $uid, 'schedule',
+                    "Call schedule: {$dateLabel}",
+                    "You are assigned to {$roleLabel} on {$dateLabel}.",
+                    "/dashboard/call-report"
                 );
             }
         }
+
+        logActivity($pdo, $user['id'], $user['email'], 'schedule_update', "Updated call schedule for {$month}");
         sendResponse('success', 'Schedule saved');
     } catch (PDOException $e) {
-        sendResponse('error', 'Failed to save schedule', null, 500);
+        sendResponse('error', 'Failed to save schedule: ' . $e->getMessage(), null, 500);
     }
 }
 
-// GET /call-schedule/today — any auth user: who's calling and who's on follow-up today
+// GET /call-schedule/today — any auth user: who's on duty today
 if ($path === '/call-schedule/today' && $method === 'GET') {
-    $user    = requireAuth($pdo);
-    $weekday = (int)date('N'); // 1=Mon … 7=Sun
-    if ($weekday > 5) {
+    $user  = requireAuth($pdo);
+    $today = date('Y-m-d');
+    $dow   = (int)date('N'); // 1=Mon 7=Sun
+    if ($dow > 5) {
         sendResponse('success', 'Weekend — no schedule', ['today' => null]);
     }
     try {
-        $stmt = $pdo->prepare("SELECT cs.role, cs.user_id, u.name as user_name FROM call_schedule cs JOIN users u ON u.id = cs.user_id WHERE cs.weekday = ? ORDER BY cs.role, u.name");
-        $stmt->execute([$weekday]);
-        $rows     = $stmt->fetchAll();
-        $callers  = array_values(array_filter($rows, fn($r) => $r['role'] === 'caller'));
+        $stmt = $pdo->prepare("
+            SELECT cs.role, cs.user_id, u.name AS user_name
+            FROM call_schedule cs JOIN users u ON u.id = cs.user_id
+            WHERE cs.schedule_date = ?
+            ORDER BY cs.role
+        ");
+        $stmt->execute([$today]);
+        $rows      = $stmt->fetchAll();
+        $callers   = array_values(array_filter($rows, fn($r) => $r['role'] === 'caller'));
         $followups = array_values(array_filter($rows, fn($r) => $r['role'] === 'followup'));
-        $myRole   = null;
+        $myRole    = null;
         foreach ($rows as $r) { if ($r['user_id'] == $user['id']) { $myRole = $r['role']; break; } }
-        sendResponse('success', 'Today\'s schedule', ['today' => ['weekday' => $weekday, 'my_role' => $myRole, 'callers' => $callers, 'followups' => $followups]]);
+        sendResponse('success', "Today's schedule", ['today' => ['date' => $today, 'my_role' => $myRole, 'callers' => $callers, 'followups' => $followups]]);
     } catch (PDOException $e) {
         sendResponse('error', 'Failed to get schedule', null, 500);
     }
