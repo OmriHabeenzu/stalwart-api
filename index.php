@@ -4773,12 +4773,25 @@ if ($path === '/call-reports' && $method === 'POST') {
     $unansweredCount = $totalCount - $answeredCount;
 
     try {
-        $stmt = $pdo->prepare("
-            INSERT INTO call_reports (report_date, staff_id, staff_name, total_count, answered_count, unanswered_count, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ");
-        $stmt->execute([$reportDate, $user['id'], $staffName, $totalCount, $answeredCount, $unansweredCount, $notes]);
-        $reportId = $pdo->lastInsertId();
+        // Upsert: update if this staff already has a report for this date
+        $existing = $pdo->prepare("SELECT id FROM call_reports WHERE staff_id = ? AND report_date = ?");
+        $existing->execute([$user['id'], $reportDate]);
+        $existingRow = $existing->fetch();
+
+        if ($existingRow) {
+            $reportId = $existingRow['id'];
+            $pdo->prepare("
+                UPDATE call_reports SET staff_name=?, total_count=?, answered_count=?, unanswered_count=?, notes=?, updated_at=NOW()
+                WHERE id=?
+            ")->execute([$staffName, $totalCount, $answeredCount, $unansweredCount, $notes, $reportId]);
+            $pdo->prepare("DELETE FROM call_report_entries WHERE report_id=?")->execute([$reportId]);
+        } else {
+            $pdo->prepare("
+                INSERT INTO call_reports (report_date, staff_id, staff_name, total_count, answered_count, unanswered_count, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ")->execute([$reportDate, $user['id'], $staffName, $totalCount, $answeredCount, $unansweredCount, $notes]);
+            $reportId = $pdo->lastInsertId();
+        }
 
         $entryStmt = $pdo->prepare("
             INSERT INTO call_report_entries (report_id, customer_name, customer_phone, status, notes, sort_order)
@@ -4796,7 +4809,7 @@ if ($path === '/call-reports' && $method === 'POST') {
             ]);
         }
 
-        logActivity($pdo, $user['id'], $user['email'], 'call_report_created', "Call report created for {$reportDate}");
+        logActivity($pdo, $user['id'], $user['email'], 'call_report_created', "Call report saved for {$reportDate}");
         sendResponse('success', 'Report saved', ['id' => $reportId]);
     } catch (PDOException $e) {
         error_log("Call report save error: " . $e->getMessage());
