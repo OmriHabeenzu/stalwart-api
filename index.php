@@ -4965,13 +4965,14 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS call_schedule (
     user_id INT NOT NULL,
     schedule_date DATE NOT NULL,
     role ENUM('caller','followup') NOT NULL,
-    UNIQUE KEY unique_date_role (schedule_date, role)
+    UNIQUE KEY unique_date_user (schedule_date, user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
-// Migrate old weekday-based table to date-based
+// Migrations
 try { $pdo->exec("ALTER TABLE call_schedule ADD COLUMN IF NOT EXISTS schedule_date DATE NULL"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE call_schedule DROP INDEX unique_day_user"); } catch (Exception $e) {}
-try { $pdo->exec("ALTER TABLE call_schedule ADD UNIQUE KEY unique_date_role (schedule_date, role)"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE call_schedule DROP INDEX unique_date_role"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE call_schedule ADD UNIQUE KEY unique_date_user (schedule_date, user_id)"); } catch (Exception $e) {}
 
 // GET /call-schedule?month=YYYY-MM — admin or call manager
 if ($path === '/call-schedule' && $method === 'GET') {
@@ -5004,7 +5005,7 @@ if ($path === '/call-schedule' && $method === 'POST') {
         $del = $pdo->prepare("DELETE FROM call_schedule WHERE schedule_date IS NOT NULL AND DATE_FORMAT(schedule_date, '%Y-%m') = ?");
         $del->execute([$month]);
 
-        $stmt = $pdo->prepare("INSERT INTO call_schedule (user_id, schedule_date, role) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE user_id = VALUES(user_id)");
+        $stmt = $pdo->prepare("INSERT INTO call_schedule (user_id, schedule_date, role) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE role = VALUES(role)");
         $notified = [];
         foreach ($assignments as $a) {
             if (!isset($a['user_id'], $a['schedule_date'], $a['role'])) continue;
