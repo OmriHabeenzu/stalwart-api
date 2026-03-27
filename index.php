@@ -4811,9 +4811,9 @@ if ($path === '/call-reports' && $method === 'POST') {
 
         logActivity($pdo, $user['id'], $user['email'], 'call_report_created', "Call report saved for {$reportDate}");
         sendResponse('success', 'Report saved', ['id' => $reportId]);
-    } catch (PDOException $e) {
+    } catch (\Throwable $e) {
         error_log("Call report save error: " . $e->getMessage());
-        sendResponse('error', 'Failed to save report', null, 500);
+        sendResponse('error', 'Failed to save report: ' . $e->getMessage(), null, 500);
     }
 }
 
