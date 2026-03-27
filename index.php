@@ -4738,6 +4738,12 @@ try { $pdo->exec("ALTER TABLE call_reports ADD COLUMN IF NOT EXISTS staff_id INT
 try { $pdo->exec("ALTER TABLE call_reports ADD COLUMN IF NOT EXISTS answered_count INT DEFAULT 0"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE call_reports ADD COLUMN IF NOT EXISTS unanswered_count INT DEFAULT 0"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE call_reports ADD COLUMN IF NOT EXISTS total_count INT DEFAULT 0"); } catch (Exception $e) {}
+// Fix id column missing AUTO_INCREMENT (if table was created before migrations)
+try {
+    $pdo->exec("ALTER TABLE call_reports MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT, ADD PRIMARY KEY (id)");
+} catch (Exception $e) {
+    try { $pdo->exec("ALTER TABLE call_reports MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT"); } catch (Exception $e2) {}
+}
 
 // GET /call-reports - list recent reports
 if ($path === '/call-reports' && $method === 'GET') {
