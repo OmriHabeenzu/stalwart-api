@@ -4738,6 +4738,8 @@ try { $pdo->exec("ALTER TABLE call_reports ADD COLUMN IF NOT EXISTS staff_id INT
 try { $pdo->exec("ALTER TABLE call_reports ADD COLUMN IF NOT EXISTS answered_count INT DEFAULT 0"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE call_reports ADD COLUMN IF NOT EXISTS unanswered_count INT DEFAULT 0"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE call_reports ADD COLUMN IF NOT EXISTS total_count INT DEFAULT 0"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE call_reports ADD COLUMN IF NOT EXISTS created_at DATETIME DEFAULT CURRENT_TIMESTAMP"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE call_reports ADD COLUMN IF NOT EXISTS updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"); } catch (Exception $e) {}
 // Fix id column missing AUTO_INCREMENT (if table was created before migrations)
 try {
     $pdo->exec("ALTER TABLE call_reports MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT, ADD PRIMARY KEY (id)");
@@ -4760,7 +4762,7 @@ if ($path === '/call-reports' && $method === 'GET') {
         $reports = $stmt->fetchAll(PDO::FETCH_ASSOC);
         sendResponse('success', 'Reports retrieved', ['reports' => $reports]);
     } catch (PDOException $e) {
-        sendResponse('error', 'Failed to fetch reports', null, 500);
+        sendResponse('error', 'Failed to fetch reports: ' . $e->getMessage(), null, 500);
     }
 }
 
