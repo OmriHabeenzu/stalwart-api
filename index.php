@@ -4752,13 +4752,12 @@ if ($path === '/call-reports' && $method === 'GET') {
     $user = requireAuth($pdo);
     try {
         $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 50;
-        $stmt = $pdo->prepare("
+        $stmt = $pdo->query("
             SELECT id, report_date, staff_name, total_count, answered_count, unanswered_count, notes, created_at
             FROM call_reports
             ORDER BY report_date DESC, created_at DESC
-            LIMIT ?
+            LIMIT {$limit}
         ");
-        $stmt->execute([$limit]);
         $reports = $stmt->fetchAll(PDO::FETCH_ASSOC);
         sendResponse('success', 'Reports retrieved', ['reports' => $reports]);
     } catch (PDOException $e) {
