@@ -4970,6 +4970,7 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS call_schedule (
 
 // Migrations
 try { $pdo->exec("ALTER TABLE call_schedule ADD COLUMN IF NOT EXISTS schedule_date DATE NULL"); } catch (Exception $e) {}
+try { $pdo->exec("ALTER TABLE call_schedule MODIFY COLUMN weekday TINYINT NULL"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE call_schedule DROP INDEX unique_day_user"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE call_schedule DROP INDEX unique_date_role"); } catch (Exception $e) {}
 try { $pdo->exec("ALTER TABLE call_schedule ADD UNIQUE KEY unique_date_user (schedule_date, user_id)"); } catch (Exception $e) {}
