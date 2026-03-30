@@ -4930,8 +4930,8 @@ if ($path === '/calendar/today' && $method === 'GET') {
             sendResponse('error', 'Could not authenticate with Google. Check service account JSON in Settings.', null, 500);
         }
         $date    = preg_match('/^\d{4}-\d{2}-\d{2}$/', $_GET['date'] ?? '') ? $_GET['date'] : date('Y-m-d');
-        $timeMin = urlencode($date . 'T00:00:00Z');
-        $timeMax = urlencode($date . 'T23:59:59Z');
+        $timeMin = urlencode($date . 'T00:00:00+02:00');
+        $timeMax = urlencode($date . 'T23:59:59+02:00');
         $calEnc  = rawurlencode($calendarId);
         $url     = "https://www.googleapis.com/calendar/v3/calendars/{$calEnc}/events?timeMin={$timeMin}&timeMax={$timeMax}&singleEvents=true&orderBy=startTime&maxResults=2500";
         $ch = curl_init($url);
