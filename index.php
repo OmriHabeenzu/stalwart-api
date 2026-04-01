@@ -4990,8 +4990,8 @@ if ($path === '/call-schedule' && $method === 'GET') {
         $schedule = $stmt->fetchAll();
         $staff    = $pdo->query("SELECT id, name FROM users WHERE is_active = 1 ORDER BY name")->fetchAll();
         sendResponse('success', 'Schedule retrieved', ['schedule' => $schedule, 'staff' => $staff]);
-    } catch (PDOException $e) {
-        sendResponse('error', 'Failed to fetch schedule', null, 500);
+    } catch (\Throwable $e) {
+        sendResponse('error', 'Failed to fetch schedule: ' . $e->getMessage(), null, 500);
     }
 }
 
