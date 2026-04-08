@@ -3388,7 +3388,7 @@ if ($path === '/analytics/staff' && $method === 'GET') {
             $taskStmt->execute([$year, $mon, $u['id']]);
             $taskData = $taskStmt->fetch();
 
-            // Call reports submitted by this user this month
+            // Call reports submitted by this user this month (match by staff_id or staff_name fallback)
             $callStmt = $pdo->prepare("
                 SELECT
                     COUNT(*)                           AS report_days,
@@ -3397,9 +3397,10 @@ if ($path === '/analytics/staff' && $method === 'GET') {
                     COALESCE(SUM(unanswered_count), 0) AS unanswered_calls,
                     ROUND(COALESCE(SUM(answered_count),0) / NULLIF(SUM(total_count),0) * 100, 1) AS answer_rate
                 FROM call_reports
-                WHERE staff_id = ? AND YEAR(report_date) = ? AND MONTH(report_date) = ?
+                WHERE (staff_id = ? OR (staff_id IS NULL AND staff_name = ?))
+                  AND YEAR(report_date) = ? AND MONTH(report_date) = ?
             ");
-            $callStmt->execute([$u['id'], $year, $mon]);
+            $callStmt->execute([$u['id'], $u['name'], $year, $mon]);
             $callData = $callStmt->fetch();
 
             $performance[] = [
