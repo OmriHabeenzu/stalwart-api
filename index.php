@@ -4508,10 +4508,10 @@ if ($path === '/admin/backups' && $method === 'GET') {
 // POST /admin/send-daily-reminders — send today's call schedule + due task reminders to all affected staff
 if ($path === '/admin/send-daily-reminders' && $method === 'POST') {
     $user = requireAdmin($pdo);
-    $weekday = (int)date('N'); // 1=Mon … 5=Fri
     $today   = date('Y-m-d');
+    $weekday = (int)date('N'); // 1=Mon … 5=Fri
     $dayNames = [1=>'Monday',2=>'Tuesday',3=>'Wednesday',4=>'Thursday',5=>'Friday'];
-    $dayName  = $dayNames[$weekday] ?? 'Today';
+    $dayName  = $dayNames[$weekday] ?? date('l');
     $sent = 0; $errors = [];
 
     try {
@@ -4520,9 +4520,9 @@ if ($path === '/admin/send-daily-reminders' && $method === 'POST') {
             $schedStmt = $pdo->prepare("
                 SELECT cs.role, cs.user_id, u.name, u.email
                 FROM call_schedule cs JOIN users u ON u.id = cs.user_id
-                WHERE cs.weekday = ?
+                WHERE cs.schedule_date = ?
             ");
-            $schedStmt->execute([$weekday]);
+            $schedStmt->execute([$today]);
             $scheduled = $schedStmt->fetchAll(PDO::FETCH_ASSOC);
 
             $callerIndex = 0;
