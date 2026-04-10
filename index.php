@@ -3434,24 +3434,173 @@ if ($path === '/analytics/staff' && $method === 'GET') {
 // GOOGLE ANALYTICS ROUTES
 // ==========================================
 
+// GET /analytics/google
 if ($path === '/analytics/google' && $method === 'GET') {
-    require_once __DIR__ . '/controllers/AnalyticsController.php';
-    $controller = new AnalyticsController();
-    $controller->getGoogleAnalytics();
+    requireAdmin($pdo);
+
+    $startDate = $_GET['start_date'] ?? date('Y-m-d', strtotime('-30 days'));
+    $endDate   = $_GET['end_date']   ?? date('Y-m-d');
+
+    try {
+        // Load settings
+        $rows = $pdo->query("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('ga_property_id','ga_credentials_path')")->fetchAll(PDO::FETCH_KEY_PAIR);
+        $propertyId      = $rows['ga_property_id'] ?? '';
+        $credentialsPath = $rows['ga_credentials_path'] ?? __DIR__ . '/config/ga-credentials.json';
+
+        if (empty($propertyId)) {
+            sendResponse('error', 'Google Analytics not configured. Please add GA Property ID in Settings → Integrations.', null, 400);
+            exit();
+        }
+        if (!file_exists($credentialsPath)) {
+            sendResponse('error', 'Credentials file not found. Please upload the service account JSON in Settings → Integrations.', null, 400);
+            exit();
+        }
+
+        $credentials = json_decode(file_get_contents($credentialsPath), true);
+        if (!$credentials || empty($credentials['client_email']) || empty($credentials['private_key'])) {
+            sendResponse('error', 'Invalid credentials file. Make sure you uploaded a valid service account JSON key.', null, 400);
+            exit();
+        }
+
+        // Build JWT for Google OAuth
+        $b64u = fn($d) => rtrim(strtr(base64_encode($d), '+/', '-_'), '=');
+        $header = $b64u(json_encode(['alg' => 'RS256', 'typ' => 'JWT']));
+        $now    = time();
+        $claim  = $b64u(json_encode([
+            'iss'   => $credentials['client_email'],
+            'scope' => 'https://www.googleapis.com/auth/analytics.readonly',
+            'aud'   => 'https://oauth2.googleapis.com/token',
+            'exp'   => $now + 3600,
+            'iat'   => $now,
+        ]));
+        $sigInput = $header . '.' . $claim;
+        if (!openssl_sign($sigInput, $sig, $credentials['private_key'], 'SHA256')) {
+            sendResponse('error', 'Failed to sign JWT — check private key in credentials file.', null, 500);
+            exit();
+        }
+        $jwt = $sigInput . '.' . $b64u($sig);
+
+        // Exchange JWT for access token
+        $ch = curl_init('https://oauth2.googleapis.com/token');
+        curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POSTFIELDS => http_build_query(['grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion' => $jwt]),
+            CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded']]);
+        $tokenResp = json_decode(curl_exec($ch), true);
+        curl_close($ch);
+
+        $accessToken = $tokenResp['access_token'] ?? null;
+        if (!$accessToken) {
+            $errDesc = $tokenResp['error_description'] ?? $tokenResp['error'] ?? 'unknown';
+            sendResponse('error', "Could not get access token: {$errDesc}", null, 500);
+            exit();
+        }
+
+        // Helper to call GA4 Data API
+        $gaReq = function($body) use ($propertyId, $accessToken) {
+            $ch = curl_init("https://analyticsdata.googleapis.com/v1beta/properties/{$propertyId}:runReport");
+            curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_POSTFIELDS => json_encode($body),
+                CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Authorization: Bearer ' . $accessToken]]);
+            $resp = curl_exec($ch);
+            $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            $data = json_decode($resp, true);
+            if ($code !== 200) throw new \Exception($data['error']['message'] ?? "GA API returned HTTP {$code}");
+            return $data;
+        };
+
+        $dr = [['startDate' => $startDate, 'endDate' => $endDate]];
+
+        $overview = $gaReq(['dateRanges' => $dr, 'metrics' => [
+            ['name'=>'activeUsers'],['name'=>'sessions'],['name'=>'screenPageViews'],
+            ['name'=>'bounceRate'],['name'=>'averageSessionDuration'],['name'=>'newUsers']
+        ]]);
+        $daily = $gaReq(['dateRanges' => $dr, 'dimensions' => [['name'=>'date']],
+            'metrics' => [['name'=>'screenPageViews'],['name'=>'activeUsers']],
+            'orderBys' => [['dimension' => ['dimensionName'=>'date']]]]);
+        $topPages = $gaReq(['dateRanges' => $dr, 'dimensions' => [['name'=>'pagePath']],
+            'metrics' => [['name'=>'screenPageViews']],
+            'orderBys' => [['metric' => ['metricName'=>'screenPageViews'], 'desc' => true]], 'limit' => 10]);
+        $sources = $gaReq(['dateRanges' => $dr, 'dimensions' => [['name'=>'sessionSource']],
+            'metrics' => [['name'=>'sessions']],
+            'orderBys' => [['metric' => ['metricName'=>'sessions'], 'desc' => true]], 'limit' => 10]);
+        $devices = $gaReq(['dateRanges' => $dr, 'dimensions' => [['name'=>'deviceCategory']],
+            'metrics' => [['name'=>'activeUsers']]]);
+        $countries = $gaReq(['dateRanges' => $dr, 'dimensions' => [['name'=>'country']],
+            'metrics' => [['name'=>'activeUsers']],
+            'orderBys' => [['metric' => ['metricName'=>'activeUsers'], 'desc' => true]], 'limit' => 10]);
+
+        // Format overview
+        $ov = [];
+        if (!empty($overview['rows'][0]['metricValues'])) {
+            $m = $overview['rows'][0]['metricValues'];
+            $ov = ['activeUsers' => (int)$m[0]['value'], 'sessions' => (int)$m[1]['value'],
+                   'pageViews' => (int)$m[2]['value'], 'bounceRate' => round((float)$m[3]['value'] * 100, 1),
+                   'avgSessionDuration' => round((float)$m[4]['value'], 1), 'newUsers' => (int)$m[5]['value']];
+        }
+
+        // Format daily
+        $dailyFmt = [];
+        foreach ($daily['rows'] ?? [] as $row) {
+            $d = $row['dimensionValues'][0]['value'];
+            $dailyFmt[] = ['date' => substr($d,0,4).'-'.substr($d,4,2).'-'.substr($d,6,2),
+                           'pageViews' => (int)$row['metricValues'][0]['value'],
+                           'users'     => (int)$row['metricValues'][1]['value']];
+        }
+
+        $fmt = fn($rows, $dimKey, $metKey) => array_map(fn($r) => [
+            $dimKey => $r['dimensionValues'][0]['value'], $metKey => (int)$r['metricValues'][0]['value']
+        ], $rows['rows'] ?? []);
+
+        sendResponse('success', 'OK', [
+            'overview'  => $ov,
+            'daily'     => $dailyFmt,
+            'topPages'  => $fmt($topPages, 'page', 'views'),
+            'sources'   => $fmt($sources, 'source', 'sessions'),
+            'devices'   => $fmt($devices, 'device', 'users'),
+            'countries' => $fmt($countries, 'country', 'users'),
+        ]);
+    } catch (\Throwable $e) {
+        sendResponse('error', 'Google Analytics error: ' . $e->getMessage(), null, 500);
+    }
     exit();
 }
 
+// POST /analytics/google/settings
 if ($path === '/analytics/google/settings' && $method === 'POST') {
-    require_once __DIR__ . '/controllers/AnalyticsController.php';
-    $controller = new AnalyticsController();
-    $controller->saveGoogleAnalyticsSettings();
+    requireAdmin($pdo);
+    $data = getRequestData();
+    $propertyId = trim($data['property_id'] ?? '');
+    if (!$propertyId) { sendResponse('error', 'Property ID is required', null, 400); exit(); }
+    try {
+        $pdo->prepare("INSERT INTO settings (setting_key, setting_value) VALUES ('ga_property_id',?) ON DUPLICATE KEY UPDATE setting_value=?")->execute([$propertyId, $propertyId]);
+        sendResponse('success', 'Google Analytics settings saved');
+    } catch (\Throwable $e) {
+        sendResponse('error', 'Failed to save: ' . $e->getMessage(), null, 500);
+    }
     exit();
 }
 
+// POST /analytics/google/credentials
 if ($path === '/analytics/google/credentials' && $method === 'POST') {
-    require_once __DIR__ . '/controllers/AnalyticsController.php';
-    $controller = new AnalyticsController();
-    $controller->uploadGoogleAnalyticsCredentials();
+    requireAdmin($pdo);
+    if (empty($_FILES['credentials'])) { sendResponse('error', 'No file uploaded', null, 400); exit(); }
+    $file = $_FILES['credentials'];
+    $content = file_get_contents($file['tmp_name']);
+    $json = json_decode($content, true);
+    if (!$json || empty($json['client_email']) || empty($json['private_key'])) {
+        sendResponse('error', 'Invalid service account JSON file', null, 400); exit();
+    }
+    $targetPath = __DIR__ . '/config/ga-credentials.json';
+    if (!move_uploaded_file($file['tmp_name'], $targetPath)) {
+        sendResponse('error', 'Failed to save credentials file — check server file permissions', null, 500); exit();
+    }
+    try {
+        $pdo->prepare("INSERT INTO settings (setting_key, setting_value) VALUES ('ga_credentials_path',?) ON DUPLICATE KEY UPDATE setting_value=?")->execute([$targetPath, $targetPath]);
+        sendResponse('success', 'Credentials uploaded successfully');
+    } catch (\Throwable $e) {
+        sendResponse('error', 'Saved file but failed to update settings: ' . $e->getMessage(), null, 500);
+    }
     exit();
 }
 
