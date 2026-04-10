@@ -107,12 +107,12 @@ class AnalyticsController {
         if (!$auth) return;
 
         // Get GA settings from database
-        $query = "SELECT setting_value FROM settings WHERE setting_key IN ('ga_property_id', 'ga_credentials_path')";
+        $query = "SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('ga_property_id', 'ga_credentials_path')";
         $stmt = $this->db->prepare($query);
         $stmt->execute();
         $settings = [];
         while ($row = $stmt->fetch()) {
-            $settings[$row['setting_key'] ?? ''] = $row['setting_value'] ?? '';
+            $settings[$row['setting_key']] = $row['setting_value'];
         }
 
         // Check if GA is configured
@@ -226,13 +226,17 @@ class AnalyticsController {
         return $this->formatGAResponse($reports);
     }
 
+    private function base64UrlEncode($data) {
+        return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+    }
+
     private function getGoogleAccessToken($credentials) {
         $tokenUrl = 'https://oauth2.googleapis.com/token';
 
-        // Create JWT
-        $header = base64_encode(json_encode(['alg' => 'RS256', 'typ' => 'JWT']));
+        // Create JWT with URL-safe base64
+        $header = $this->base64UrlEncode(json_encode(['alg' => 'RS256', 'typ' => 'JWT']));
         $now = time();
-        $claim = base64_encode(json_encode([
+        $claim = $this->base64UrlEncode(json_encode([
             'iss' => $credentials['client_email'],
             'scope' => 'https://www.googleapis.com/auth/analytics.readonly',
             'aud' => $tokenUrl,
@@ -243,7 +247,7 @@ class AnalyticsController {
         // Sign JWT
         $signatureInput = $header . '.' . $claim;
         openssl_sign($signatureInput, $signature, $credentials['private_key'], 'SHA256');
-        $jwt = $signatureInput . '.' . base64_encode($signature);
+        $jwt = $signatureInput . '.' . $this->base64UrlEncode($signature);
 
         // Exchange JWT for access token
         $ch = curl_init();
