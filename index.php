@@ -1887,9 +1887,9 @@ if ($path === '/chat/sessions' && $method === 'POST') {
         }
 
         sendResponse('success', 'Chat session created', ['id' => $sessionId]);
-    } catch (PDOException $e) {
+    } catch (\Throwable $e) {
         error_log("Chat session error: " . $e->getMessage());
-        sendResponse('error', 'Failed to create chat session', null, 500);
+        sendResponse('error', 'Failed to create chat session: ' . $e->getMessage(), null, 500);
     }
 }
 
