@@ -1,4 +1,5 @@
 <?php
+// Response utility
 class Response {
     public static function success($data = null, $message = null, $statusCode = 200) {
         http_response_code($statusCode);
