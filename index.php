@@ -638,6 +638,468 @@ if (preg_match('#^/testimonials/(\d+)$#',$path,$m) && $method === 'DELETE') {
     catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
 }
 
+// ==========================================
+// SETTINGS PUBLIC
+// ==========================================
+if ($path === '/settings/public' && $method === 'GET') {
+    try {
+        $rows = $pdo->query("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('siteName','siteEmail','sitePhone','siteAddress','main_logo_id','footer_logo_id','favicon_id','loan_repayment_enabled')")->fetchAll();
+        $settings = [];
+        foreach ($rows as $r) $settings[$r['setting_key']] = $r['setting_value'];
+        // Resolve logo URLs
+        $apiBase = (isset($_SERVER['HTTPS'])&&$_SERVER['HTTPS']==='on'?'https':'http').'://'.$_SERVER['HTTP_HOST'];
+        foreach (['main_logo_id','footer_logo_id','favicon_id'] as $key) {
+            if (!empty($settings[$key])) {
+                try {
+                    $stmt = $pdo->prepare("SELECT file_path FROM media WHERE id=?");
+                    $stmt->execute([$settings[$key]]);
+                    $media = $stmt->fetch();
+                    if ($media) $settings[str_replace('_id','',$key).'_url'] = $apiBase.'/'.$media['file_path'];
+                } catch(Exception $e) {}
+            }
+        }
+        sendResponse('success','Public settings',$settings);
+    } catch (\Throwable $e) { sendResponse('success','OK',[]); }
+}
+
+// ==========================================
+// CONTENT - PUBLIC
+// ==========================================
+if ($path === '/content/team' && $method === 'GET') {
+    try {
+        $team = $pdo->query("SELECT * FROM team_members WHERE is_active=1 ORDER BY sort_order ASC, name ASC")->fetchAll();
+        sendResponse('success','Team retrieved',['team'=>$team]);
+    } catch (\Throwable $e) { sendResponse('success','OK',['team'=>[]]); }
+}
+
+if ($path === '/content/team' && $method === 'POST') {
+    requireAdmin($pdo);
+    $data = getRequestData();
+    try {
+        $pdo->prepare("INSERT INTO team_members (name,position,bio,image_url,linkedin_url,sort_order,is_active) VALUES (?,?,?,?,?,?,1)")
+            ->execute([$data['name']??'',$data['position']??'',$data['bio']??'',$data['image_url']??'',$data['linkedin_url']??'',(int)($data['sort_order']??0)]);
+        sendResponse('success','Team member added',['id'=>$pdo->lastInsertId()],201);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/content/team/(\d+)$#',$path,$m) && $method === 'PUT') {
+    requireAdmin($pdo);
+    $data = getRequestData();
+    try {
+        $fields=[]; $vals=[];
+        foreach (['name','position','bio','image_url','linkedin_url','sort_order','is_active'] as $f) {
+            if (isset($data[$f])) { $fields[]="$f=?"; $vals[]=$data[$f]; }
+        }
+        if (empty($fields)) sendResponse('error','Nothing to update',null,400);
+        $vals[]=(int)$m[1];
+        $pdo->prepare("UPDATE team_members SET ".implode(',',$fields)." WHERE id=?")->execute($vals);
+        sendResponse('success','Updated');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if ($path === '/content/homepage' && $method === 'GET') {
+    try {
+        $rows = $pdo->query("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('homepage_hero_image_id','homepage_why_choose_image_id')")->fetchAll(PDO::FETCH_KEY_PAIR);
+        $images = ['hero_image'=>null,'why_choose_image'=>null];
+        $apiBase = (isset($_SERVER['HTTPS'])&&$_SERVER['HTTPS']==='on'?'https':'http').'://'.$_SERVER['HTTP_HOST'];
+        foreach (['homepage_hero_image_id'=>'hero_image','homepage_why_choose_image_id'=>'why_choose_image'] as $key=>$imgKey) {
+            if (!empty($rows[$key])) {
+                try {
+                    $stmt=$pdo->prepare("SELECT file_path FROM media WHERE id=?"); $stmt->execute([$rows[$key]]);
+                    $media=$stmt->fetch(); if ($media) $images[$imgKey]=$apiBase.'/'.$media['file_path'];
+                } catch(Exception $e){}
+            }
+        }
+        sendResponse('success','Homepage images',['images'=>$images]);
+    } catch (\Throwable $e) { sendResponse('success','OK',['images'=>['hero_image'=>null,'why_choose_image'=>null]]); }
+}
+
+if ($path === '/content/page-images' && $method === 'GET') {
+    try {
+        $rows = $pdo->query("SELECT * FROM page_images ORDER BY page_key, sort_order")->fetchAll();
+        sendResponse('success','Page images',['images'=>$rows]);
+    } catch (\Throwable $e) { sendResponse('success','OK',['images'=>[]]); }
+}
+
+if ($path === '/content/page-text' && $method === 'GET') {
+    $page = $_GET['page'] ?? '';
+    try {
+        $stmt = $pdo->prepare("SELECT * FROM page_content WHERE page_key=?"); $stmt->execute([$page]);
+        $rows = $stmt->fetchAll();
+        sendResponse('success','Page text',['content'=>$rows]);
+    } catch (\Throwable $e) { sendResponse('success','OK',['content'=>[]]); }
+}
+
+if ($path === '/content/page-text' && $method === 'PUT') {
+    requireAdmin($pdo);
+    $data = getRequestData();
+    try {
+        $pageKey = $data['page_key']??''; $sections = $data['sections']??[];
+        $stmt = $pdo->prepare("INSERT INTO page_content (page_key,section_key,content) VALUES (?,?,?) ON DUPLICATE KEY UPDATE content=VALUES(content)");
+        foreach ($sections as $sectionKey => $content) $stmt->execute([$pageKey,$sectionKey,$content]);
+        sendResponse('success','Content saved');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if ($path === '/content/page-text/schema' && $method === 'GET') {
+    requireAdmin($pdo);
+    try {
+        $rows = $pdo->query("SELECT DISTINCT page_key FROM page_content ORDER BY page_key")->fetchAll(PDO::FETCH_COLUMN);
+        sendResponse('success','Schema',['pages'=>$rows]);
+    } catch (\Throwable $e) { sendResponse('success','OK',['pages'=>[]]); }
+}
+
+// ==========================================
+// CAREERS
+// ==========================================
+if ($path === '/careers' && $method === 'GET') {
+    try {
+        $jobs = $pdo->query("SELECT * FROM job_listings WHERE is_active=1 ORDER BY created_at DESC")->fetchAll();
+        sendResponse('success','Jobs retrieved',['jobs'=>$jobs]);
+    } catch (\Throwable $e) { sendResponse('success','OK',['jobs'=>[]]); }
+}
+
+if ($path === '/careers' && $method === 'POST') {
+    requireAdmin($pdo);
+    $data = getRequestData();
+    try {
+        $pdo->prepare("INSERT INTO job_listings (title,department,location,type,description,requirements,salary_range,is_active) VALUES (?,?,?,?,?,?,?,1)")
+            ->execute([$data['title']??'',$data['department']??'',$data['location']??'',$data['type']??'full-time',$data['description']??'',$data['requirements']??'',$data['salary_range']??'']);
+        sendResponse('success','Job created',['id'=>$pdo->lastInsertId()],201);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/careers/(\d+)$#',$path,$m) && $method === 'PUT') {
+    requireAdmin($pdo);
+    $data = getRequestData();
+    try {
+        $fields=[]; $vals=[];
+        foreach (['title','department','location','type','description','requirements','salary_range','is_active'] as $f) {
+            if (isset($data[$f])) { $fields[]="$f=?"; $vals[]=$data[$f]; }
+        }
+        $vals[]=(int)$m[1];
+        $pdo->prepare("UPDATE job_listings SET ".implode(',',$fields)." WHERE id=?")->execute($vals);
+        sendResponse('success','Updated');
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
+if (preg_match('#^/careers/(\d+)$#',$path,$m) && $method === 'DELETE') {
+    requireAdmin($pdo);
+    try { $pdo->prepare("UPDATE job_listings SET is_active=0 WHERE id=?")->execute([$m[1]]); sendResponse('success','Deleted'); }
+    catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
+if ($path === '/careers/applications' && $method === 'GET') {
+    requireAdmin($pdo);
+    try {
+        $apps = $pdo->query("SELECT ja.*,jl.title as job_title FROM job_applications ja LEFT JOIN job_listings jl ON jl.id=ja.job_id ORDER BY ja.created_at DESC")->fetchAll();
+        sendResponse('success','Applications retrieved',['applications'=>$apps]);
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
+if (preg_match('#^/careers/(\d+)/apply$#',$path,$m) && $method === 'POST') {
+    $data = getRequestData();
+    try {
+        $pdo->prepare("INSERT INTO job_applications (job_id,name,email,phone,cover_letter,status) VALUES (?,?,?,?,?,'pending')")
+            ->execute([$m[1],$data['name']??'',$data['email']??'',$data['phone']??'',$data['cover_letter']??'']);
+        sendResponse('success','Application submitted',null,201);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if ($path === '/careers/general/apply' && $method === 'POST') {
+    $data = getRequestData();
+    try {
+        $pdo->prepare("INSERT INTO job_applications (job_id,name,email,phone,cover_letter,status) VALUES (NULL,?,?,?,?,'pending')")
+            ->execute([$data['name']??'',$data['email']??'',$data['phone']??'',$data['cover_letter']??'']);
+        sendResponse('success','Application submitted',null,201);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/careers/applications/(\d+)$#',$path,$m) && $method === 'PUT') {
+    requireAdmin($pdo);
+    $data = getRequestData();
+    try {
+        $pdo->prepare("UPDATE job_applications SET status=?,notes=? WHERE id=?")->execute([$data['status']??'pending',$data['notes']??'',(int)$m[1]]);
+        sendResponse('success','Updated');
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
+// ==========================================
+// LOAN REPAYMENT (public)
+// ==========================================
+if ($path === '/loans/lookup' && $method === 'GET') {
+    $ref = trim($_GET['ref']??''); $nid = trim($_GET['nid']??'');
+    if (empty($ref)||empty($nid)) sendResponse('error','Loan reference and NRC required',null,400);
+    try {
+        $stmt = $pdo->prepare("SELECT id,loan_reference,customer_name,loan_amount,total_repayable,outstanding_balance,loan_status,disbursement_date,maturity_date FROM loan_accounts WHERE loan_reference=? AND national_id_last4=? AND loan_status='active'");
+        $stmt->execute([$ref,$nid]);
+        $loan = $stmt->fetch();
+        if (!$loan) sendResponse('error','No active loan found. Please check your details.',null,404);
+        $nameParts = explode(' ',$loan['customer_name']);
+        $loan['customer_name'] = $nameParts[0].' '.substr(end($nameParts),0,1).'***';
+        $payments = $pdo->prepare("SELECT SUM(amount) as total FROM loan_payments WHERE loan_account_id=? AND status='completed'");
+        $payments->execute([$loan['id']]);
+        $paid = $payments->fetch()['total'] ?? 0;
+        unset($loan['id']);
+        sendResponse('success','Loan found',['loan'=>$loan,'total_paid'=>$paid]);
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
+if ($path === '/loans/payments' && $method === 'POST') {
+    $data = getRequestData();
+    $loanRef = trim($data['loan_reference']??''); $amount = (float)($data['amount']??0);
+    $paymentMethod = trim($data['payment_method']??''); $nid = trim($data['nrc_last4']??'');
+    if (empty($loanRef)||$amount<=0||empty($paymentMethod)||empty($nid)) sendResponse('error','All fields required',null,400);
+    try {
+        $stmt = $pdo->prepare("SELECT id,customer_name,outstanding_balance FROM loan_accounts WHERE loan_reference=? AND national_id_last4=? AND loan_status='active'");
+        $stmt->execute([$loanRef,$nid]); $loan=$stmt->fetch();
+        if (!$loan) sendResponse('error','Loan not found',null,404);
+        if ($amount>$loan['outstanding_balance']) sendResponse('error','Amount exceeds outstanding balance',null,400);
+        $ref = 'PAY-'.strtoupper(uniqid());
+        $pdo->prepare("INSERT INTO loan_payments (loan_account_id,payment_reference,amount,payment_method,status,customer_name) VALUES (?,?,?,?,'pending',?)")
+            ->execute([$loan['id'],$ref,$amount,$paymentMethod,$loan['customer_name']]);
+        sendResponse('success','Payment submitted',['reference'=>$ref],201);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/loans/payments/([A-Z0-9\-]+)$#',$path,$m) && $method === 'GET') {
+    try {
+        $stmt = $pdo->prepare("SELECT lp.*,la.loan_reference FROM loan_payments lp JOIN loan_accounts la ON lp.loan_account_id=la.id WHERE lp.payment_reference=?");
+        $stmt->execute([$m[1]]); $payment=$stmt->fetch();
+        if (!$payment) sendResponse('error','Not found',null,404);
+        sendResponse('success','Payment status',$payment);
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
+// Admin loan routes
+if ($path === '/loans/admin/accounts' && $method === 'GET') {
+    requireAdmin($pdo);
+    try {
+        $status = $_GET['status']??'';
+        $sql = "SELECT * FROM loan_accounts";
+        if ($status) { $stmt=$pdo->prepare($sql." WHERE loan_status=?"); $stmt->execute([$status]); }
+        else $stmt=$pdo->query($sql." ORDER BY created_at DESC");
+        sendResponse('success','Accounts retrieved',['accounts'=>$stmt->fetchAll()]);
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
+if ($path === '/loans/admin/accounts' && $method === 'POST') {
+    requireAdmin($pdo);
+    $data = getRequestData();
+    try {
+        $pdo->prepare("INSERT INTO loan_accounts (loan_reference,customer_name,customer_phone,customer_email,national_id_last4,loan_amount,total_repayable,amount_paid,outstanding_balance,monthly_installment,loan_status,disbursement_date,maturity_date) VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?)")
+            ->execute([$data['loan_reference'],$data['customer_name'],$data['customer_phone'],$data['customer_email']??'',$data['national_id_last4'],$data['loan_amount'],$data['total_repayable'],$data['total_repayable'],$data['monthly_installment'],'active',$data['disbursement_date'],$data['maturity_date']]);
+        sendResponse('success','Account created',['id'=>$pdo->lastInsertId()],201);
+    } catch (\Throwable $e) {
+        if ($e->getCode()==23000) sendResponse('error','A loan with that reference already exists',null,409);
+        sendResponse('error','Failed: '.$e->getMessage(),null,500);
+    }
+}
+
+if (preg_match('#^/loans/admin/payments/(\d+)/confirm$#',$path,$m) && $method === 'PUT') {
+    requireAdmin($pdo);
+    try {
+        $stmt=$pdo->prepare("SELECT * FROM loan_payments WHERE id=? AND status='pending'"); $stmt->execute([$m[1]]);
+        $payment=$stmt->fetch();
+        if (!$payment) sendResponse('error','Payment not found or already processed',null,404);
+        $pdo->prepare("UPDATE loan_payments SET status='completed',paid_at=NOW() WHERE id=?")->execute([$m[1]]);
+        $pdo->prepare("UPDATE loan_accounts SET amount_paid=amount_paid+?,outstanding_balance=outstanding_balance-? WHERE id=?")->execute([$payment['amount'],$payment['amount'],$payment['loan_account_id']]);
+        $balance=$pdo->prepare("SELECT outstanding_balance FROM loan_accounts WHERE id=?"); $balance->execute([$payment['loan_account_id']]); $bal=$balance->fetch();
+        if ($bal&&$bal['outstanding_balance']<=0) $pdo->prepare("UPDATE loan_accounts SET loan_status='paid_off',outstanding_balance=0 WHERE id=?")->execute([$payment['loan_account_id']]);
+        sendResponse('success','Payment confirmed');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+// ==========================================
+// CONTACT FORM
+// ==========================================
+if ($path === '/contact' && $method === 'POST') {
+    $data = getRequestData();
+    $name=trim($data['name']??''); $email=trim($data['email']??''); $message=trim($data['message']??'');
+    if (empty($name)||empty($email)||empty($message)) sendResponse('error','All fields required',null,400);
+    try {
+        $pdo->prepare("INSERT INTO contact_submissions (name,email,phone,subject,message) VALUES (?,?,?,?,?)")
+            ->execute([$name,$email,$data['phone']??'',$data['subject']??'General Enquiry',$message]);
+        sendResponse('success','Message sent. We will get back to you soon.');
+    } catch (\Throwable $e) { sendResponse('error','Failed to submit',null,500); }
+}
+
+// ==========================================
+// MEDIA (basic)
+// ==========================================
+if ($path === '/media' && $method === 'GET') {
+    requireAuth($pdo);
+    try {
+        $media = $pdo->query("SELECT id,file_name,file_path,file_type,file_size,created_at FROM media ORDER BY created_at DESC LIMIT 200")->fetchAll();
+        sendResponse('success','Media retrieved',['media'=>$media]);
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
+if (preg_match('#^/media/(\d+)$#',$path,$m) && $method === 'GET') {
+    try {
+        $stmt=$pdo->prepare("SELECT * FROM media WHERE id=?"); $stmt->execute([$m[1]]);
+        $media=$stmt->fetch();
+        if (!$media) sendResponse('error','Not found',null,404);
+        sendResponse('success','Media retrieved',$media);
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
+// ==========================================
+// ACTIVITY LOGS
+// ==========================================
+if ($path === '/logs' && $method === 'GET') {
+    requireAdmin($pdo);
+    try {
+        $limit = min((int)($_GET['limit']??50),200);
+        $logs = $pdo->query("SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT {$limit}")->fetchAll();
+        sendResponse('success','Logs retrieved',['logs'=>$logs,'total'=>count($logs)]);
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
+// ==========================================
+// USERS MANAGEMENT (admin)
+// ==========================================
+if ($path === '/users' && $method === 'POST') {
+    requireAdmin($pdo);
+    $data = getRequestData();
+    $name=trim($data['name']??''); $email=trim($data['email']??''); $password=$data['password']??''; $role=$data['role']??'staff';
+    if (empty($name)||empty($email)||empty($password)) sendResponse('error','Name, email and password required',null,400);
+    try {
+        $pdo->prepare("INSERT INTO users (name,email,password,role,is_active) VALUES (?,?,?,?,1)")
+            ->execute([$name,$email,password_hash($password,PASSWORD_DEFAULT),$role]);
+        sendResponse('success','User created',['id'=>$pdo->lastInsertId()],201);
+    } catch (\Throwable $e) {
+        if ($e->getCode()==23000) sendResponse('error','Email already exists',null,409);
+        sendResponse('error','Failed: '.$e->getMessage(),null,500);
+    }
+}
+
+if (preg_match('#^/users/(\d+)$#',$path,$m) && $method === 'DELETE') {
+    requireAdmin($pdo);
+    try {
+        $pdo->prepare("UPDATE users SET is_active=0 WHERE id=?")->execute([$m[1]]);
+        sendResponse('success','User deactivated');
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
+// ==========================================
+// ANALYTICS STAFF + CALLS
+// ==========================================
+if ($path === '/analytics/calls' && $method === 'GET') {
+    requireAdmin($pdo);
+    $month=$_GET['month']??date('Y-m'); [$year,$mon]=explode('-',$month);
+    try {
+        $summary=$pdo->prepare("SELECT COUNT(*) AS total_reports,COALESCE(SUM(total_count),0) AS total_calls,COALESCE(SUM(answered_count),0) AS answered_calls,COALESCE(SUM(unanswered_count),0) AS unanswered_calls FROM call_reports WHERE YEAR(report_date)=? AND MONTH(report_date)=?");
+        $summary->execute([$year,$mon]); $summaryData=$summary->fetch();
+        $byStaff=$pdo->prepare("SELECT staff_name,COUNT(*) AS report_days,COALESCE(SUM(total_count),0) AS total_calls,COALESCE(SUM(answered_count),0) AS answered_calls,ROUND(COALESCE(SUM(answered_count),0)/NULLIF(SUM(total_count),0)*100,1) AS answer_rate FROM call_reports WHERE YEAR(report_date)=? AND MONTH(report_date)=? GROUP BY staff_name ORDER BY total_calls DESC");
+        $byStaff->execute([$year,$mon]);
+        $byDay=$pdo->prepare("SELECT report_date,SUM(total_count) AS total_calls,SUM(answered_count) AS answered_calls FROM call_reports WHERE YEAR(report_date)=? AND MONTH(report_date)=? GROUP BY report_date ORDER BY report_date ASC");
+        $byDay->execute([$year,$mon]);
+        $months=$pdo->query("SELECT DISTINCT DATE_FORMAT(report_date,'%Y-%m') AS month FROM call_reports ORDER BY month DESC LIMIT 24")->fetchAll(PDO::FETCH_COLUMN);
+        sendResponse('success','Call analytics retrieved',['month'=>$month,'summary'=>$summaryData,'by_staff'=>$byStaff->fetchAll(),'by_day'=>$byDay->fetchAll(),'available_months'=>$months]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if ($path === '/analytics/staff' && $method === 'GET') {
+    requireAdmin($pdo);
+    $month=$_GET['month']??date('Y-m'); [$year,$mon]=explode('-',$month);
+    try {
+        $users=$pdo->query("SELECT id,name,email,role FROM users WHERE is_active=1 ORDER BY name")->fetchAll();
+        $performance=[];
+        foreach ($users as $u) {
+            $taskStmt=$pdo->prepare("SELECT COUNT(DISTINCT t.id) AS total_assigned,SUM(CASE WHEN ta.status='completed' THEN 1 ELSE 0 END) AS total_completed,SUM(CASE WHEN ta.status!='completed' AND t.status='pending' THEN 1 ELSE 0 END) AS pending,SUM(CASE WHEN ta.status!='completed' AND t.status='in_progress' THEN 1 ELSE 0 END) AS in_progress,SUM(CASE WHEN ta.status='completed' AND YEAR(ta.completed_at)=? AND MONTH(ta.completed_at)=? THEN 1 ELSE 0 END) AS completed_this_month FROM tasks t JOIN task_assignees ta ON ta.task_id=t.id WHERE ta.user_id=?");
+            $taskStmt->execute([$year,$mon,$u['id']]); $taskData=$taskStmt->fetch();
+            $callStmt=$pdo->prepare("SELECT COUNT(*) AS report_days,COALESCE(SUM(total_count),0) AS total_calls,COALESCE(SUM(answered_count),0) AS answered_calls,COALESCE(SUM(unanswered_count),0) AS unanswered_calls,ROUND(COALESCE(SUM(answered_count),0)/NULLIF(SUM(total_count),0)*100,1) AS answer_rate FROM call_reports WHERE (staff_id=? OR (staff_id IS NULL AND staff_name=?)) AND YEAR(report_date)=? AND MONTH(report_date)=?");
+            $callStmt->execute([$u['id'],$u['name'],$year,$mon]); $callData=$callStmt->fetch();
+            $performance[]=['id'=>$u['id'],'name'=>$u['name'],'email'=>$u['email'],'role'=>$u['role'],'tasks'=>$taskData,'calls'=>$callData];
+        }
+        $months=$pdo->query("SELECT DISTINCT DATE_FORMAT(report_date,'%Y-%m') AS month FROM call_reports ORDER BY month DESC LIMIT 24")->fetchAll(PDO::FETCH_COLUMN);
+        sendResponse('success','Staff performance retrieved',['month'=>$month,'staff'=>$performance,'available_months'=>$months]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+// ==========================================
+// GOOGLE ANALYTICS
+// ==========================================
+if ($path === '/analytics/google' && $method === 'GET') {
+    requireAdmin($pdo);
+    $startDate=$_GET['start_date']??date('Y-m-d',strtotime('-30 days'));
+    $endDate=$_GET['end_date']??date('Y-m-d');
+    try {
+        $rows=$pdo->query("SELECT setting_key,setting_value FROM settings WHERE setting_key IN ('ga_property_id','ga_credentials_path')")->fetchAll(PDO::FETCH_KEY_PAIR);
+        $propertyId=$rows['ga_property_id']??''; $credPath=$rows['ga_credentials_path']??__DIR__.'/config/ga-credentials.json';
+        if (empty($propertyId)) sendResponse('error','Google Analytics not configured.',null,400);
+        if (!file_exists($credPath)) sendResponse('error','Credentials file not found.',null,400);
+        $credentials=json_decode(file_get_contents($credPath),true);
+        if (!$credentials||empty($credentials['client_email'])||empty($credentials['private_key'])) sendResponse('error','Invalid credentials file.',null,400);
+        $b64u=fn($d)=>rtrim(strtr(base64_encode($d),'+/','-_'),'=');
+        $header=$b64u(json_encode(['alg'=>'RS256','typ'=>'JWT'])); $now=time();
+        $claim=$b64u(json_encode(['iss'=>$credentials['client_email'],'scope'=>'https://www.googleapis.com/auth/analytics.readonly','aud'=>'https://oauth2.googleapis.com/token','exp'=>$now+3600,'iat'=>$now]));
+        $sigInput="$header.$claim"; openssl_sign($sigInput,$sig,$credentials['private_key'],'SHA256');
+        $jwt="$sigInput.".$b64u($sig);
+        $ch=curl_init('https://oauth2.googleapis.com/token');
+        curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>http_build_query(['grant_type'=>'urn:ietf:params:oauth:grant-type:jwt-bearer','assertion'=>$jwt]),CURLOPT_HTTPHEADER=>['Content-Type: application/x-www-form-urlencoded']]);
+        $tokenResp=json_decode(curl_exec($ch),true); curl_close($ch);
+        $accessToken=$tokenResp['access_token']??null;
+        if (!$accessToken) sendResponse('error','Could not get access token: '.($tokenResp['error_description']??'unknown'),null,500);
+        $gaReq=function($body) use ($propertyId,$accessToken) {
+            $ch=curl_init("https://analyticsdata.googleapis.com/v1beta/properties/{$propertyId}:runReport");
+            curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>json_encode($body),CURLOPT_HTTPHEADER=>['Content-Type: application/json','Authorization: Bearer '.$accessToken]]);
+            $resp=curl_exec($ch); $code=curl_getinfo($ch,CURLINFO_HTTP_CODE); curl_close($ch);
+            $data=json_decode($resp,true);
+            if ($code!==200) throw new \Exception($data['error']['message']??"GA API returned HTTP {$code}");
+            return $data;
+        };
+        $dr=[['startDate'=>$startDate,'endDate'=>$endDate]];
+        $overview=$gaReq(['dateRanges'=>$dr,'metrics'=>[['name'=>'activeUsers'],['name'=>'sessions'],['name'=>'screenPageViews'],['name'=>'bounceRate'],['name'=>'averageSessionDuration'],['name'=>'newUsers']]]);
+        $daily=$gaReq(['dateRanges'=>$dr,'dimensions'=>[['name'=>'date']],'metrics'=>[['name'=>'screenPageViews'],['name'=>'activeUsers']],'orderBys'=>[['dimension'=>['dimensionName'=>'date']]]]);
+        $topPages=$gaReq(['dateRanges'=>$dr,'dimensions'=>[['name'=>'pagePath']],'metrics'=>[['name'=>'screenPageViews']],'orderBys'=>[['metric'=>['metricName'=>'screenPageViews'],'desc'=>true]],'limit'=>10]);
+        $sources=$gaReq(['dateRanges'=>$dr,'dimensions'=>[['name'=>'sessionSource']],'metrics'=>[['name'=>'sessions']],'orderBys'=>[['metric'=>['metricName'=>'sessions'],'desc'=>true]],'limit'=>10]);
+        $devices=$gaReq(['dateRanges'=>$dr,'dimensions'=>[['name'=>'deviceCategory']],'metrics'=>[['name'=>'activeUsers']]]);
+        $countries=$gaReq(['dateRanges'=>$dr,'dimensions'=>[['name'=>'country']],'metrics'=>[['name'=>'activeUsers']],'orderBys'=>[['metric'=>['metricName'=>'activeUsers'],'desc'=>true]],'limit'=>10]);
+        $ov=[];
+        if (!empty($overview['rows'][0]['metricValues'])) { $mv=$overview['rows'][0]['metricValues']; $ov=['activeUsers'=>(int)$mv[0]['value'],'sessions'=>(int)$mv[1]['value'],'pageViews'=>(int)$mv[2]['value'],'bounceRate'=>round((float)$mv[3]['value']*100,1),'avgSessionDuration'=>round((float)$mv[4]['value'],1),'newUsers'=>(int)$mv[5]['value']]; }
+        $dailyFmt=[];
+        foreach ($daily['rows']??[] as $row) { $d=$row['dimensionValues'][0]['value']; $dailyFmt[]=['date'=>substr($d,0,4).'-'.substr($d,4,2).'-'.substr($d,6,2),'pageViews'=>(int)$row['metricValues'][0]['value'],'users'=>(int)$row['metricValues'][1]['value']]; }
+        $fmt=fn($rows,$dk,$mk)=>array_map(fn($r)=>[$dk=>$r['dimensionValues'][0]['value'],$mk=>(int)$r['metricValues'][0]['value']],$rows['rows']??[]);
+        sendResponse('success','OK',['overview'=>$ov,'daily'=>$dailyFmt,'topPages'=>$fmt($topPages,'page','views'),'sources'=>$fmt($sources,'source','sessions'),'devices'=>$fmt($devices,'device','users'),'countries'=>$fmt($countries,'country','users')]);
+    } catch (\Throwable $e) { sendResponse('error','Google Analytics error: '.$e->getMessage(),null,500); }
+}
+
+if ($path === '/analytics/google/settings' && $method === 'POST') {
+    requireAdmin($pdo);
+    $data=getRequestData(); $propertyId=trim($data['property_id']??'');
+    if (!$propertyId) sendResponse('error','Property ID required',null,400);
+    try { $pdo->prepare("INSERT INTO settings (setting_key,setting_value) VALUES ('ga_property_id',?) ON DUPLICATE KEY UPDATE setting_value=?")->execute([$propertyId,$propertyId]); sendResponse('success','Saved'); }
+    catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if ($path === '/analytics/google/credentials' && $method === 'POST') {
+    requireAdmin($pdo);
+    if (empty($_FILES['credentials'])) sendResponse('error','No file uploaded',null,400);
+    $content=file_get_contents($_FILES['credentials']['tmp_name']);
+    $json=json_decode($content,true);
+    if (!$json||empty($json['client_email'])||empty($json['private_key'])) sendResponse('error','Invalid service account JSON',null,400);
+    $targetPath=__DIR__.'/config/ga-credentials.json';
+    if (!move_uploaded_file($_FILES['credentials']['tmp_name'],$targetPath)) sendResponse('error','Failed to save file',null,500);
+    try { $pdo->prepare("INSERT INTO settings (setting_key,setting_value) VALUES ('ga_credentials_path',?) ON DUPLICATE KEY UPDATE setting_value=?")->execute([$targetPath,$targetPath]); sendResponse('success','Credentials uploaded'); }
+    catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+// ==========================================
+// VILLAGE BANKING
+// ==========================================
+if ($path === '/village-banking/withdrawal' && $method === 'POST') {
+    $data=getRequestData();
+    $fullName=trim($data['full_name']??''); $nrc=trim($data['nrc_number']??''); $phone=trim($data['phone']??''); $groupName=trim($data['group_name']??'');
+    if (empty($fullName)||empty($nrc)||empty($phone)||empty($groupName)) sendResponse('error','Required fields missing',null,400);
+    try {
+        $pdo->prepare("INSERT INTO village_banking_requests (full_name,nrc_number,phone,email,group_name,group_location,leader_name,leader_phone,request_type,amount,reason,meeting_date,notes,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending')")
+            ->execute([$fullName,$nrc,$phone,$data['email']??'',$groupName,$data['group_location']??'',$data['leader_name']??'',$data['leader_phone']??'',$data['request_type']??'withdrawal',$data['amount']??'',$data['reason']??'',$data['meeting_date']??'',$data['notes']??'']);
+        sendResponse('success','Request submitted successfully.',null,201);
+    } catch (\Throwable $e) { sendResponse('error','Failed to submit request.',null,500); }
+}
+
 // 404
 sendResponse('error','Route not found',['path'=>$path,'method'=>$method],404);
 ?>

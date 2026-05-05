@@ -29,4 +29,3 @@ jobs:
             **/.git*/**
             **/node_modules/**
             .env
-            index.php
