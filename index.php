@@ -45,16 +45,26 @@ try {
     $pdo->exec("CREATE TABLE IF NOT EXISTS chat_sessions (id INT AUTO_INCREMENT PRIMARY KEY, customer_name VARCHAR(255) NOT NULL, customer_email VARCHAR(255), customer_phone VARCHAR(50), status VARCHAR(50) DEFAULT 'active', last_message TEXT, last_message_time DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
     $pdo->exec("CREATE TABLE IF NOT EXISTS chat_messages (id INT AUTO_INCREMENT PRIMARY KEY, session_id INT NOT NULL, message TEXT NOT NULL, sender_type VARCHAR(50) DEFAULT 'customer', sender_name VARCHAR(255), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     try { $pdo->exec("ALTER TABLE chat_sessions ADD PRIMARY KEY (id)"); } catch (\Throwable $e) {}
-    $pdo->exec("ALTER TABLE chat_sessions MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT");
+    try { $pdo->exec("ALTER TABLE chat_sessions MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE chat_messages ADD PRIMARY KEY (id)"); } catch (\Throwable $e) {}
-    $pdo->exec("ALTER TABLE chat_messages MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT");
+    try { $pdo->exec("ALTER TABLE chat_messages MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT"); } catch (\Throwable $e) {}
     $pdo->exec("CREATE TABLE IF NOT EXISTS media (id INT AUTO_INCREMENT PRIMARY KEY, file_name VARCHAR(255) NOT NULL, original_filename VARCHAR(255), file_path VARCHAR(500) NOT NULL, file_type VARCHAR(100), file_size INT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    try { $pdo->exec("ALTER TABLE media ADD COLUMN file_name VARCHAR(255) NOT NULL DEFAULT ''"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE media ADD COLUMN original_filename VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE media ADD COLUMN file_path VARCHAR(500) NOT NULL DEFAULT ''"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE media ADD COLUMN file_type VARCHAR(100) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE media ADD COLUMN file_size INT DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE media ADD PRIMARY KEY (id)"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE media MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE media MODIFY COLUMN filename VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE users ADD COLUMN phone VARCHAR(20) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE users ADD COLUMN department VARCHAR(100) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE users ADD COLUMN profile_image VARCHAR(500) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE users ADD COLUMN last_login DATETIME DEFAULT NULL"); } catch (\Throwable $e) {}
     $pdo->exec("CREATE TABLE IF NOT EXISTS notices (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255) NOT NULL, message TEXT NOT NULL, type VARCHAR(50) DEFAULT 'info', pinned TINYINT DEFAULT 0, created_by INT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN is_read TINYINT DEFAULT 0"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN phone VARCHAR(50) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE users ADD COLUMN can_manage_calls TINYINT DEFAULT 0"); } catch (\Throwable $e) {}
 } catch (\Throwable $e) {}
 
 // HELPERS
