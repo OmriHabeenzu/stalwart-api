@@ -23,7 +23,6 @@ jobs:
           server-dir: ${{ secrets.FTP_API_DIR }}
           dangerous-clean-slate: false
           timeout: 60000
-          data-timeout: 60000
           exclude: |
             **/.git*
             **/.git*/**
