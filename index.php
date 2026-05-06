@@ -1024,7 +1024,7 @@ if (preg_match('#^/media/(\d+)$#',$path,$m) && $method === 'GET') {
 }
 
 if ($path === '/media/upload' && $method === 'POST') {
-    requireAuth($pdo);
+    $user = requireAuth($pdo);
     if (empty($_FILES['file'])) sendResponse('error','No file uploaded',null,400);
     $file = $_FILES['file'];
     $allowed = ['image/jpeg','image/png','image/gif','image/webp','image/svg+xml'];
@@ -1037,8 +1037,16 @@ if ($path === '/media/upload' && $method === 'POST') {
     if (!move_uploaded_file($file['tmp_name'], $targetPath)) sendResponse('error','Failed to save file',null,500);
     $filePath = 'uploads/' . $filename;
     try {
-        $pdo->prepare("INSERT INTO media (file_name,original_filename,file_path,file_type,file_size) VALUES (?,?,?,?,?)")
-            ->execute([$filename,$file['name'],$filePath,$file['type'],$file['size']]);
+        $cols = array_column($pdo->query("SHOW COLUMNS FROM media")->fetchAll(), 'Field');
+        $insert = ['file_name'=>$filename,'original_filename'=>$file['name'],'file_path'=>$filePath,'file_type'=>$file['type'],'file_size'=>$file['size']];
+        if (in_array('filename', $cols)) $insert['filename'] = $filename;
+        if (in_array('uploaded_by', $cols)) $insert['uploaded_by'] = $user['id'];
+        if (in_array('title', $cols)) $insert['title'] = $file['name'];
+        if (in_array('mime_type', $cols)) $insert['mime_type'] = $file['type'];
+        if (in_array('size', $cols)) $insert['size'] = $file['size'];
+        $keys = implode(',', array_keys($insert));
+        $placeholders = implode(',', array_fill(0, count($insert), '?'));
+        $pdo->prepare("INSERT INTO media ($keys) VALUES ($placeholders)")->execute(array_values($insert));
         $scheme = (isset($_SERVER['HTTPS'])&&$_SERVER['HTTPS']==='on')?'https':'http';
         sendResponse('success','Uploaded',['id'=>$pdo->lastInsertId(),'file_path'=>$filePath,'url'=>$scheme.'://'.$_SERVER['HTTP_HOST'].'/'.$filePath],201);
     } catch (\Throwable $e) { @unlink($targetPath); sendResponse('error','Failed: '.$e->getMessage(),null,500); }
