@@ -1,5 +1,5 @@
 <?php
-// STALWART API
+// STALWART API v2
 require_once __DIR__ . '/vendor/autoload.php';
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\Exception as PHPMailerException;
