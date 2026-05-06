@@ -21,6 +21,7 @@ jobs:
           password: ${{ secrets.FTP_PASS }}
           local-dir: ./
           server-dir: ${{ secrets.FTP_API_DIR }}
+          state-name: .ftp-deploy-sync-state.json
           dangerous-clean-slate: false
           timeout: 60000
           exclude: |
