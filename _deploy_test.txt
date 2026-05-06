@@ -1,0 +1,1 @@
+stalwart-api deploy test - if you see this in api.stalwartzm.com folder, the path is correct.
