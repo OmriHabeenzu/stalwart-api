@@ -6,7 +6,7 @@ if (file_exists($envFile)) {
     foreach (file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
         if (str_starts_with(trim($line), '#')) continue;
         [$k, $v] = array_pad(explode('=', $line, 2), 2, '');
-        if (trim($k) === 'DEPLOY_SECRET') { $secret = trim($v); break; }
+        if (trim($k) === 'DEPLOY_SECRET') { $secret = trim($v, " \t\n\r\0\x0B\"'"); break; }
     }
 }
 
