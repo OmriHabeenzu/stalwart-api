@@ -397,6 +397,16 @@ if (preg_match('#^/call-reports/(\d+)$#',$path,$m) && $method === 'GET') {
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
+if ($path === '/call-reports/today-unanswered' && $method === 'GET') {
+    requireAuth($pdo);
+    try {
+        $date = $_GET['date'] ?? date('Y-m-d');
+        $stmt = $pdo->prepare("SELECT cre.customer_name, cre.customer_phone, cre.notes FROM call_report_entries cre JOIN call_reports cr ON cre.report_id = cr.id WHERE cr.report_date = ? AND cre.status = 'unanswered' ORDER BY cre.sort_order");
+        $stmt->execute([$date]);
+        sendResponse('success','Unanswered calls retrieved',['entries'=>$stmt->fetchAll()]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
 // ==========================================
 // GOOGLE CALENDAR
 // ==========================================
@@ -429,6 +439,42 @@ if ($path === '/calendar/events' && $method === 'GET') {
         $evData = json_decode(curl_exec($ch2),true); curl_close($ch2);
         sendResponse('success','Events retrieved',['events'=>$evData['items']??[]]);
     } catch (\Throwable $e) { sendResponse('success','Calendar error: '.$e->getMessage(),['events'=>[]]);  }
+}
+
+if ($path === '/calendar/today' && $method === 'GET') {
+    requireAuth($pdo);
+    try {
+        $rows = $pdo->query("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('google_calendar_id','google_service_account')")->fetchAll(PDO::FETCH_KEY_PAIR);
+        $calendarId = $rows['google_calendar_id'] ?? '';
+        $serviceAccountJson = $rows['google_service_account'] ?? '';
+        $hasSA = !empty($serviceAccountJson);
+        $hasCal = !empty($calendarId);
+        if (!$hasSA && !$hasCal) sendResponse('error','Calendar not configured',['missing'=>'both'],400);
+        if (!$hasSA) sendResponse('error','Service account not configured',['missing'=>'service_account'],400);
+        if (!$hasCal) sendResponse('error','Calendar ID not configured',['missing'=>'calendar_id'],400);
+        $sa = json_decode($serviceAccountJson, true);
+        if (!$sa) sendResponse('error','Invalid service account JSON',['missing'=>'service_account'],400);
+        $now = time();
+        $h = base64url_enc(json_encode(['alg'=>'RS256','typ'=>'JWT']));
+        $p = base64url_enc(json_encode(['iss'=>$sa['client_email'],'scope'=>'https://www.googleapis.com/auth/calendar.readonly','aud'=>'https://oauth2.googleapis.com/token','exp'=>$now+3600,'iat'=>$now]));
+        $input = "$h.$p";
+        openssl_sign($input,$sig,$sa['private_key'],'SHA256');
+        $jwt = $input.'.'.base64url_enc($sig);
+        $ch = curl_init('https://oauth2.googleapis.com/token');
+        curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>http_build_query(['grant_type'=>'urn:ietf:params:oauth:grant-type:jwt-bearer','assertion'=>$jwt]),CURLOPT_HTTPHEADER=>['Content-Type: application/x-www-form-urlencoded'],CURLOPT_TIMEOUT=>15]);
+        $tokenData = json_decode(curl_exec($ch),true); curl_close($ch);
+        $token = $tokenData['access_token'] ?? null;
+        if (!$token) sendResponse('error','Could not authenticate with Google Calendar',null,500);
+        $date = $_GET['date'] ?? date('Y-m-d');
+        $timeMin = urlencode($date.'T00:00:00+02:00');
+        $timeMax = urlencode($date.'T23:59:59+02:00');
+        $url = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events?timeMin={$timeMin}&timeMax={$timeMax}&singleEvents=true&orderBy=startTime&maxResults=500";
+        $ch2 = curl_init($url);
+        curl_setopt_array($ch2,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}"],CURLOPT_TIMEOUT=>30]);
+        $evData = json_decode(curl_exec($ch2),true); curl_close($ch2);
+        $events = array_map(fn($e) => ['name'=>$e['summary']??'','event_id'=>$e['id']??''], $evData['items']??[]);
+        sendResponse('success','Events retrieved',['events'=>$events]);
+    } catch (\Throwable $e) { sendResponse('error','Calendar error: '.$e->getMessage(),null,500); }
 }
 
 // ==========================================
