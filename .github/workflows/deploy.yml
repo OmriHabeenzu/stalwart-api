@@ -10,6 +10,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Trigger deploy webhook
+      - name: Trigger server deploy webhook
         run: |
-          curl -f "https://api.stalwartzm.com/deploy.php?token=stalwart-deploy-2026"
+          curl -f -s "https://api.stalwartzm.com/deploy.php?token=${{ secrets.DEPLOY_SECRET }}"
