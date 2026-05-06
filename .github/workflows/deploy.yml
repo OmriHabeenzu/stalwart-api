@@ -12,4 +12,4 @@ jobs:
     steps:
       - name: Trigger server deploy webhook
         run: |
-          curl -f -s "https://api.stalwartzm.com/deploy.php?token=${{ secrets.DEPLOY_SECRET }}"
+          curl -f -s "https://api.stalwartzm.com/deploy.php?token=stalwart2026"
