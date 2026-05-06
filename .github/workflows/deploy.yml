@@ -5,30 +5,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Deploy to CyberPanel via FTP
-        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
-        with:
-          server: ${{ secrets.FTP_HOST }}
-          username: ${{ secrets.FTP_USER }}
-          password: ${{ secrets.FTP_PASS }}
-          local-dir: ./
-          server-dir: ${{ secrets.FTP_API_DIR }}
-          state-name: .ftp-deploy-sync-state.json
-          dangerous-clean-slate: false
-          timeout: 60000
-          exclude: |
-            **/.git*
-            **/.git*/**
-            **/node_modules/**
-            .env
+      - name: Trigger deploy webhook
+        run: |
+          curl -f "https://api.stalwartzm.com/deploy.php?token=stalwart-deploy-2026"
