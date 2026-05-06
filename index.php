@@ -57,6 +57,12 @@ try {
     try { $pdo->exec("ALTER TABLE media ADD PRIMARY KEY (id)"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE media MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE media MODIFY COLUMN filename VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE media MODIFY COLUMN uploaded_by INT DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE media MODIFY COLUMN title VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE media MODIFY COLUMN description TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE media MODIFY COLUMN url VARCHAR(500) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE media MODIFY COLUMN mime_type VARCHAR(100) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE media MODIFY COLUMN size INT DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE users ADD COLUMN phone VARCHAR(20) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE users ADD COLUMN department VARCHAR(100) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE users ADD COLUMN profile_image VARCHAR(500) DEFAULT NULL"); } catch (\Throwable $e) {}
