@@ -1278,6 +1278,56 @@ if ($path === '/auth/check-reminders' && $method === 'POST') {
     sendResponse('success','OK');
 }
 
+// ==========================================
+// DIAGNOSTICS
+// ==========================================
+if ($path === '/diagnostics' && $method === 'GET') {
+    requireAdmin($pdo);
+    $report = [];
+
+    // DB tables + counts
+    $tables = ['users','call_reports','call_report_entries','call_schedule','media','notices','contact_submissions','testimonials','settings','tasks','chat_sessions','chat_messages','activity_logs','push_subscriptions','notifications'];
+    foreach ($tables as $t) {
+        try {
+            $count = (int)$pdo->query("SELECT COUNT(*) FROM `$t`")->fetchColumn();
+            $report['tables'][$t] = $count;
+        } catch (\Throwable $e) {
+            $report['tables'][$t] = 'MISSING: '.$e->getMessage();
+        }
+    }
+
+    // Users table columns
+    try {
+        $cols = $pdo->query("SHOW COLUMNS FROM users")->fetchAll(PDO::FETCH_COLUMN);
+        $report['users_columns'] = $cols;
+    } catch (\Throwable $e) { $report['users_columns'] = 'ERROR'; }
+
+    // Sample media records
+    try {
+        $report['media_sample'] = $pdo->query("SELECT id,file_name,file_path,file_type FROM media LIMIT 5")->fetchAll();
+    } catch (\Throwable $e) { $report['media_sample'] = []; }
+
+    // Uploads directory
+    $uploadDir = __DIR__ . '/uploads/';
+    $report['uploads_dir_exists'] = is_dir($uploadDir);
+    $report['uploads_dir_writable'] = is_writable($uploadDir);
+    $report['uploads_files'] = is_dir($uploadDir) ? count(glob($uploadDir.'*')) : 0;
+
+    // Key settings
+    try {
+        $rows = $pdo->query("SELECT setting_key, setting_value FROM settings")->fetchAll(PDO::FETCH_KEY_PAIR);
+        $report['settings_keys'] = array_keys($rows);
+        $report['has_google_sa'] = !empty($rows['google_service_account']);
+        $report['has_calendar_id'] = !empty($rows['google_calendar_id']);
+    } catch (\Throwable $e) { $report['settings'] = 'ERROR: '.$e->getMessage(); }
+
+    // PHP + DB version
+    $report['php_version'] = PHP_VERSION;
+    try { $report['mysql_version'] = $pdo->query("SELECT VERSION()")->fetchColumn(); } catch(\Throwable $e){}
+
+    sendResponse('success', 'Diagnostics', $report);
+}
+
 // 404
 sendResponse('error','Route not found',['path'=>$path,'method'=>$method],404);
 ?>
