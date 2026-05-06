@@ -46,6 +46,7 @@ try {
     $pdo->exec("CREATE TABLE IF NOT EXISTS chat_messages (id INT AUTO_INCREMENT PRIMARY KEY, session_id INT NOT NULL, message TEXT NOT NULL, sender_type VARCHAR(50) DEFAULT 'customer', sender_name VARCHAR(255), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     $pdo->exec("ALTER TABLE chat_sessions MODIFY id INT AUTO_INCREMENT");
     $pdo->exec("ALTER TABLE chat_messages MODIFY id INT AUTO_INCREMENT");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS media (id INT AUTO_INCREMENT PRIMARY KEY, file_name VARCHAR(255) NOT NULL, original_filename VARCHAR(255), file_path VARCHAR(500) NOT NULL, file_type VARCHAR(100), file_size INT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
 } catch (\Throwable $e) {}
 
 // HELPERS
@@ -949,6 +950,40 @@ if (preg_match('#^/media/(\d+)$#',$path,$m) && $method === 'GET') {
         $media=$stmt->fetch();
         if (!$media) sendResponse('error','Not found',null,404);
         sendResponse('success','Media retrieved',$media);
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
+if ($path === '/media/upload' && $method === 'POST') {
+    requireAuth($pdo);
+    if (empty($_FILES['file'])) sendResponse('error','No file uploaded',null,400);
+    $file = $_FILES['file'];
+    $allowed = ['image/jpeg','image/png','image/gif','image/webp','image/svg+xml'];
+    if (!in_array($file['type'], $allowed)) sendResponse('error','Invalid file type',null,400);
+    $uploadDir = __DIR__ . '/uploads/';
+    if (!is_dir($uploadDir)) mkdir($uploadDir, 0755, true);
+    $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+    $filename = uniqid('img_', true) . '.' . $ext;
+    $targetPath = $uploadDir . $filename;
+    if (!move_uploaded_file($file['tmp_name'], $targetPath)) sendResponse('error','Failed to save file',null,500);
+    $filePath = 'uploads/' . $filename;
+    try {
+        $pdo->prepare("INSERT INTO media (file_name,original_filename,file_path,file_type,file_size) VALUES (?,?,?,?,?)")
+            ->execute([$filename,$file['name'],$filePath,$file['type'],$file['size']]);
+        $scheme = (isset($_SERVER['HTTPS'])&&$_SERVER['HTTPS']==='on')?'https':'http';
+        sendResponse('success','Uploaded',['id'=>$pdo->lastInsertId(),'file_path'=>$filePath,'url'=>$scheme.'://'.$_SERVER['HTTP_HOST'].'/'.$filePath],201);
+    } catch (\Throwable $e) { @unlink($targetPath); sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/media/(\d+)$#',$path,$m) && $method === 'DELETE') {
+    requireAuth($pdo);
+    try {
+        $stmt=$pdo->prepare("SELECT * FROM media WHERE id=?"); $stmt->execute([$m[1]]);
+        $media=$stmt->fetch();
+        if (!$media) sendResponse('error','Not found',null,404);
+        $filePath = __DIR__.'/'.$media['file_path'];
+        if (file_exists($filePath)) unlink($filePath);
+        $pdo->prepare("DELETE FROM media WHERE id=?")->execute([$m[1]]);
+        sendResponse('success','Deleted');
     } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
 }
 
