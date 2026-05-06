@@ -40,6 +40,14 @@ try {
     http_response_code(500); echo json_encode(['status'=>'error','message'=>'Database connection failed']); exit(1);
 }
 
+// SCHEMA MIGRATIONS
+try {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS chat_sessions (id INT AUTO_INCREMENT PRIMARY KEY, customer_name VARCHAR(255) NOT NULL, customer_email VARCHAR(255), customer_phone VARCHAR(50), status VARCHAR(50) DEFAULT 'active', last_message TEXT, last_message_time DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS chat_messages (id INT AUTO_INCREMENT PRIMARY KEY, session_id INT NOT NULL, message TEXT NOT NULL, sender_type VARCHAR(50) DEFAULT 'customer', sender_name VARCHAR(255), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    $pdo->exec("ALTER TABLE chat_sessions MODIFY id INT AUTO_INCREMENT");
+    $pdo->exec("ALTER TABLE chat_messages MODIFY id INT AUTO_INCREMENT");
+} catch (\Throwable $e) {}
+
 // HELPERS
 function sendResponse($status, $message, $data = null, $httpCode = 200) {
     http_response_code($httpCode);
