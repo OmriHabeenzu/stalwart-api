@@ -49,6 +49,12 @@ try {
     try { $pdo->exec("ALTER TABLE chat_messages ADD PRIMARY KEY (id)"); } catch (\Throwable $e) {}
     $pdo->exec("ALTER TABLE chat_messages MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT");
     $pdo->exec("CREATE TABLE IF NOT EXISTS media (id INT AUTO_INCREMENT PRIMARY KEY, file_name VARCHAR(255) NOT NULL, original_filename VARCHAR(255), file_path VARCHAR(500) NOT NULL, file_type VARCHAR(100), file_size INT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(20) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(100) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_image VARCHAR(500) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login DATETIME DEFAULT NULL"); } catch (\Throwable $e) {}
+    $pdo->exec("CREATE TABLE IF NOT EXISTS notices (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255) NOT NULL, message TEXT NOT NULL, type VARCHAR(50) DEFAULT 'info', pinned TINYINT DEFAULT 0, created_by INT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN IF NOT EXISTS is_read TINYINT DEFAULT 0"); } catch (\Throwable $e) {}
 } catch (\Throwable $e) {}
 
 // HELPERS
@@ -1189,6 +1195,87 @@ if ($path === '/village-banking/withdrawal' && $method === 'POST') {
             ->execute([$fullName,$nrc,$phone,$data['email']??'',$groupName,$data['group_location']??'',$data['leader_name']??'',$data['leader_phone']??'',$data['request_type']??'withdrawal',$data['amount']??'',$data['reason']??'',$data['meeting_date']??'',$data['notes']??'']);
         sendResponse('success','Request submitted successfully.',null,201);
     } catch (\Throwable $e) { sendResponse('error','Failed to submit request.',null,500); }
+}
+
+// ==========================================
+// NOTICES
+// ==========================================
+if ($path === '/notices' && $method === 'GET') {
+    requireAuth($pdo);
+    try {
+        $notices = $pdo->query("SELECT * FROM notices ORDER BY pinned DESC, created_at DESC LIMIT 50")->fetchAll();
+        sendResponse('success','Notices retrieved',['notices'=>$notices]);
+    } catch (\Throwable $e) { sendResponse('success','OK',['notices'=>[]]); }
+}
+if ($path === '/notices' && $method === 'POST') {
+    $user = requireAdmin($pdo);
+    $data = getRequestData();
+    try {
+        $pdo->prepare("INSERT INTO notices (title,message,type,pinned,created_by) VALUES (?,?,?,?,?)")
+            ->execute([trim($data['title']??''),trim($data['message']??''),$data['type']??'info',(int)($data['pinned']??0),$user['id']]);
+        sendResponse('success','Notice posted',['id'=>$pdo->lastInsertId()],201);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+if (preg_match('#^/notices/(\d+)$#',$path,$m) && $method === 'DELETE') {
+    requireAdmin($pdo);
+    try {
+        $pdo->prepare("DELETE FROM notices WHERE id=?")->execute([$m[1]]);
+        sendResponse('success','Notice deleted');
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
+// ==========================================
+// ADMIN CONTACTS
+// ==========================================
+if ($path === '/admin/contacts' && $method === 'GET') {
+    requireAdmin($pdo);
+    try {
+        $limit = min((int)($_GET['limit']??50),200);
+        $filter = $_GET['filter']??'all';
+        $sql = "SELECT * FROM contact_submissions";
+        if ($filter === 'unread') $sql .= " WHERE is_read=0";
+        elseif ($filter === 'real') $sql .= " WHERE (phone IS NOT NULL AND phone != '') OR (subject != 'General Enquiry')";
+        $sql .= " ORDER BY created_at DESC LIMIT {$limit}";
+        $contacts = $pdo->query($sql)->fetchAll();
+        $total = (int)$pdo->query("SELECT COUNT(*) FROM contact_submissions")->fetchColumn();
+        sendResponse('success','Contacts retrieved',['contacts'=>$contacts,'total'=>$total]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+if (preg_match('#^/admin/contacts/(\d+)$#',$path,$m) && $method === 'DELETE') {
+    requireAdmin($pdo);
+    try {
+        $pdo->prepare("DELETE FROM contact_submissions WHERE id=?")->execute([$m[1]]);
+        sendResponse('success','Deleted');
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+if (preg_match('#^/admin/contacts/(\d+)/read$#',$path,$m) && $method === 'PUT') {
+    requireAdmin($pdo);
+    try {
+        $pdo->prepare("UPDATE contact_submissions SET is_read=1 WHERE id=?")->execute([$m[1]]);
+        sendResponse('success','Marked as read');
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
+// ==========================================
+// ACTIVITY LOGS (alias)
+// ==========================================
+if ($path === '/activity-logs' && $method === 'GET') {
+    requireAdmin($pdo);
+    try {
+        $limit = min((int)($_GET['limit']??50),200);
+        $offset = (int)($_GET['offset']??0);
+        $logs = $pdo->query("SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT {$limit} OFFSET {$offset}")->fetchAll();
+        $total = (int)$pdo->query("SELECT COUNT(*) FROM activity_logs")->fetchColumn();
+        sendResponse('success','Logs retrieved',['logs'=>$logs,'total'=>$total]);
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
+// ==========================================
+// AUTH UTILITIES
+// ==========================================
+if ($path === '/auth/check-reminders' && $method === 'POST') {
+    $user = requireAuth($pdo);
+    sendResponse('success','OK');
 }
 
 // 404
