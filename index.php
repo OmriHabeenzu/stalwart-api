@@ -1415,7 +1415,7 @@ if ($path === '/village-banking/withdrawal' && $method === 'POST') {
 if ($path === '/notices' && $method === 'GET') {
     requireAuth($pdo);
     try {
-        $notices = $pdo->query("SELECT n.*, u.name AS created_by_name FROM notices n LEFT JOIN users u ON u.id=n.created_by ORDER BY n.pinned DESC, n.created_at DESC LIMIT 50")->fetchAll();
+        $notices = $pdo->query("SELECT * FROM notices ORDER BY pinned DESC, created_at DESC LIMIT 50")->fetchAll();
         sendResponse('success','Notices retrieved',['notices'=>$notices]);
     } catch (\Throwable $e) { sendResponse('success','OK',['notices'=>[]]); }
 }
@@ -1423,8 +1423,12 @@ if ($path === '/notices' && $method === 'POST') {
     $user = requireAdmin($pdo);
     $data = getRequestData();
     try {
-        $pdo->prepare("INSERT INTO notices (title,message,type,pinned,created_by) VALUES (?,?,?,?,?)")
-            ->execute([trim($data['title']??''),trim($data['message']??''),$data['type']??'info',(int)($data['pinned']??0),$user['id']]);
+        // Fetch poster's name from DB (getUserFromToken only returns id/email/role)
+        $nameRow = $pdo->prepare("SELECT name FROM users WHERE id=?");
+        $nameRow->execute([$user['id']]);
+        $posterName = $nameRow->fetchColumn() ?: $user['email'];
+        $pdo->prepare("INSERT INTO notices (title,message,type,pinned,created_by_name) VALUES (?,?,?,?,?)")
+            ->execute([trim($data['title']??''),trim($data['message']??''),$data['type']??'info',(int)($data['pinned']??0),$posterName]);
         sendResponse('success','Notice posted',['id'=>$pdo->lastInsertId()],201);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
