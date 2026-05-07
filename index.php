@@ -105,6 +105,8 @@ try {
     try { $pdo->exec("ALTER TABLE team_members ADD COLUMN media_id INT DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE team_members ADD COLUMN education TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE team_members ADD COLUMN specialties TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
+    $pdo->exec("CREATE TABLE IF NOT EXISTS team_members (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, position VARCHAR(255), bio TEXT, image_url VARCHAR(500), linkedin_url VARCHAR(500), sort_order INT DEFAULT 0, is_active TINYINT DEFAULT 1, media_id INT DEFAULT NULL, education TEXT, specialties TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS testimonials (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, position VARCHAR(255), company VARCHAR(255), content TEXT NOT NULL, rating INT DEFAULT 5, approved TINYINT DEFAULT 0, image VARCHAR(500), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
 } catch (\Throwable $e) {}
 
 // HELPERS
@@ -484,9 +486,9 @@ if ($path === '/call-reports/today-unanswered' && $method === 'GET') {
 if ($path === '/calendar/events' && $method === 'GET') {
     requireAuth($pdo);
     try {
-        $rows = $pdo->query("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('google_calendar_id','google_service_account')")->fetchAll(PDO::FETCH_KEY_PAIR);
+        $rows = $pdo->query("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('google_calendar_id','google_service_account_json')")->fetchAll(PDO::FETCH_KEY_PAIR);
         $calendarId = $rows['google_calendar_id'] ?? '';
-        $serviceAccountJson = $rows['google_service_account'] ?? '';
+        $serviceAccountJson = $rows['google_service_account_json'] ?? '';
         if (empty($calendarId)||empty($serviceAccountJson)) sendResponse('success','No calendar configured',['events'=>[]]);
         $sa = json_decode($serviceAccountJson, true);
         if (!$sa) sendResponse('success','Invalid service account',['events'=>[]]);
@@ -515,9 +517,9 @@ if ($path === '/calendar/events' && $method === 'GET') {
 if ($path === '/calendar/today' && $method === 'GET') {
     requireAuth($pdo);
     try {
-        $rows = $pdo->query("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('google_calendar_id','google_service_account')")->fetchAll(PDO::FETCH_KEY_PAIR);
+        $rows = $pdo->query("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('google_calendar_id','google_service_account_json')")->fetchAll(PDO::FETCH_KEY_PAIR);
         $calendarId = $rows['google_calendar_id'] ?? '';
-        $serviceAccountJson = $rows['google_service_account'] ?? '';
+        $serviceAccountJson = $rows['google_service_account_json'] ?? '';
         $hasSA = !empty($serviceAccountJson);
         $hasCal = !empty($calendarId);
         if (!$hasSA && !$hasCal) sendResponse('error','Calendar not configured',['missing'=>'both'],400);
@@ -746,7 +748,7 @@ if ($path === '/admin/send-daily-reminders' && $method === 'POST') {
 // ==========================================
 if ($path === '/testimonials' && $method === 'GET') {
     try {
-        $approved = $pdo->query("SELECT id,name,position,company,content,rating,created_at FROM testimonials WHERE approved=1 ORDER BY created_at DESC LIMIT 20")->fetchAll();
+        $approved = $pdo->query("SELECT id,name,position,company,content,content AS testimonial,rating,image,created_at FROM testimonials WHERE approved=1 ORDER BY created_at DESC LIMIT 20")->fetchAll();
         sendResponse('success','Testimonials retrieved',['testimonials'=>$approved]);
     } catch (\Throwable $e) { sendResponse('success','OK',['testimonials'=>[]]); }
 }
@@ -754,14 +756,14 @@ if ($path === '/testimonials' && $method === 'GET') {
 if ($path === '/testimonials/all' && $method === 'GET') {
     requireAdmin($pdo);
     try {
-        $all = $pdo->query("SELECT * FROM testimonials ORDER BY created_at DESC")->fetchAll();
+        $all = $pdo->query("SELECT *,content AS testimonial FROM testimonials ORDER BY created_at DESC")->fetchAll();
         sendResponse('success','All testimonials',['testimonials'=>$all]);
     } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
 }
 
 if ($path === '/testimonials' && $method === 'POST') {
     $data=getRequestData();
-    $name=trim($data['name']??''); $content=trim($data['content']??'');
+    $name=trim($data['name']??''); $content=trim($data['content']??$data['testimonial']??'');
     if (empty($name)||empty($content)) sendResponse('error','Name and content required',null,400);
     try {
         $pdo->prepare("INSERT INTO testimonials (name,position,company,content,rating,approved) VALUES (?,?,?,?,?,0)")
