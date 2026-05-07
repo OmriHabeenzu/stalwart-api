@@ -406,13 +406,24 @@ if ($path === '/call-schedule' && $method === 'GET') {
 if ($path === '/call-schedule' && $method === 'POST') {
     requireCallManager($pdo);
     $data = getRequestData();
-    $scheduleData = $data['schedule'] ?? [];
     try {
         $pdo->exec("DELETE FROM call_schedule WHERE schedule_date IS NOT NULL AND schedule_date >= CURDATE()");
         $stmt = $pdo->prepare("INSERT INTO call_schedule (user_id, role, schedule_date) VALUES (?,?,?) ON DUPLICATE KEY UPDATE role=VALUES(role)");
-        foreach ($scheduleData as $date => $assignments) {
-            foreach ($assignments as $userId => $role) {
-                if (!empty($role)) $stmt->execute([$userId,$role,$date]);
+        // Handle array format: [{ user_id, schedule_date, role }] (from CallSchedulePage)
+        $assignments = $data['assignments'] ?? [];
+        if (is_array($assignments) && isset($assignments[0])) {
+            foreach ($assignments as $item) {
+                if (!empty($item['role']) && !empty($item['schedule_date'])) {
+                    $stmt->execute([(int)$item['user_id'], $item['role'], $item['schedule_date']]);
+                }
+            }
+        } else {
+            // Fallback: nested object format { date: { userId: role } }
+            $scheduleData = $data['schedule'] ?? [];
+            foreach ($scheduleData as $date => $dayMap) {
+                foreach ($dayMap as $userId => $role) {
+                    if (!empty($role)) $stmt->execute([$userId, $role, $date]);
+                }
             }
         }
         sendResponse('success','Schedule saved');
@@ -1404,7 +1415,7 @@ if ($path === '/village-banking/withdrawal' && $method === 'POST') {
 if ($path === '/notices' && $method === 'GET') {
     requireAuth($pdo);
     try {
-        $notices = $pdo->query("SELECT * FROM notices ORDER BY pinned DESC, created_at DESC LIMIT 50")->fetchAll();
+        $notices = $pdo->query("SELECT n.*, u.name AS created_by_name FROM notices n LEFT JOIN users u ON u.id=n.created_by ORDER BY n.pinned DESC, n.created_at DESC LIMIT 50")->fetchAll();
         sendResponse('success','Notices retrieved',['notices'=>$notices]);
     } catch (\Throwable $e) { sendResponse('success','OK',['notices'=>[]]); }
 }
