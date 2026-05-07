@@ -105,8 +105,18 @@ try {
     try { $pdo->exec("ALTER TABLE team_members ADD COLUMN media_id INT DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE team_members ADD COLUMN education TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE team_members ADD COLUMN specialties TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE team_members ADD COLUMN image_url VARCHAR(500) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE team_members ADD COLUMN linkedin_url VARCHAR(500) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE team_members ADD COLUMN sort_order INT DEFAULT 0"); } catch (\Throwable $e) {}
     $pdo->exec("CREATE TABLE IF NOT EXISTS team_members (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, position VARCHAR(255), bio TEXT, image_url VARCHAR(500), linkedin_url VARCHAR(500), sort_order INT DEFAULT 0, is_active TINYINT DEFAULT 1, media_id INT DEFAULT NULL, education TEXT, specialties TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
-    $pdo->exec("CREATE TABLE IF NOT EXISTS testimonials (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, position VARCHAR(255), company VARCHAR(255), content TEXT NOT NULL, rating INT DEFAULT 5, approved TINYINT DEFAULT 0, image VARCHAR(500), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    // testimonials: existing tables may use 'testimonial' column instead of 'content' — normalise both
+    $pdo->exec("CREATE TABLE IF NOT EXISTS testimonials (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, position VARCHAR(255), company VARCHAR(255), content TEXT, testimonial TEXT, rating INT DEFAULT 5, approved TINYINT DEFAULT 0, image VARCHAR(500), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    try { $pdo->exec("ALTER TABLE testimonials ADD COLUMN IF NOT EXISTS content TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE testimonials ADD COLUMN IF NOT EXISTS testimonial TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE testimonials ADD COLUMN IF NOT EXISTS image VARCHAR(500) DEFAULT NULL"); } catch (\Throwable $e) {}
+    // copy legacy 'testimonial' → 'content' and vice-versa so both columns carry data
+    try { $pdo->exec("UPDATE testimonials SET content=testimonial WHERE content IS NULL AND testimonial IS NOT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("UPDATE testimonials SET testimonial=content WHERE testimonial IS NULL AND content IS NOT NULL"); } catch (\Throwable $e) {}
     $pdo->exec("CREATE TABLE IF NOT EXISTS activity_logs (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, username VARCHAR(255), action VARCHAR(100), description TEXT, ip_address VARCHAR(45), user_agent TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     try { $pdo->exec("ALTER TABLE activity_logs ADD INDEX idx_action (action)"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE activity_logs ADD INDEX idx_created (created_at)"); } catch (\Throwable $e) {}
@@ -753,10 +763,11 @@ if ($path === '/testimonials' && $method === 'GET') {
     try {
         $authUser = getUserFromToken();
         $isAdmin = ($authUser && in_array($authUser['role'],['admin','super_admin','manager']));
+        $sel = "id,name,position,company,COALESCE(content,testimonial,'') AS content,COALESCE(content,testimonial,'') AS testimonial,rating,image,approved,created_at";
         if ($isAdmin) {
-            $rows = $pdo->query("SELECT *,content AS testimonial FROM testimonials ORDER BY created_at DESC")->fetchAll();
+            $rows = $pdo->query("SELECT {$sel} FROM testimonials ORDER BY created_at DESC")->fetchAll();
         } else {
-            $rows = $pdo->query("SELECT id,name,position,company,content,content AS testimonial,rating,image,created_at FROM testimonials WHERE approved=1 ORDER BY created_at DESC LIMIT 20")->fetchAll();
+            $rows = $pdo->query("SELECT {$sel} FROM testimonials WHERE approved=1 ORDER BY created_at DESC LIMIT 20")->fetchAll();
         }
         sendResponse('success','Testimonials retrieved',['testimonials'=>$rows]);
     } catch (\Throwable $e) { sendResponse('success','OK',['testimonials'=>[]]); }
@@ -765,7 +776,8 @@ if ($path === '/testimonials' && $method === 'GET') {
 if ($path === '/testimonials/all' && $method === 'GET') {
     requireAdmin($pdo);
     try {
-        $all = $pdo->query("SELECT *,content AS testimonial FROM testimonials ORDER BY created_at DESC")->fetchAll();
+        $sel = "id,name,position,company,COALESCE(content,testimonial,'') AS content,COALESCE(content,testimonial,'') AS testimonial,rating,image,approved,created_at";
+        $all = $pdo->query("SELECT {$sel} FROM testimonials ORDER BY created_at DESC")->fetchAll();
         sendResponse('success','All testimonials',['testimonials'=>$all]);
     } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
 }
@@ -775,8 +787,8 @@ if ($path === '/testimonials' && $method === 'POST') {
     $name=trim($data['name']??''); $content=trim($data['content']??$data['testimonial']??'');
     if (empty($name)||empty($content)) sendResponse('error','Name and content required',null,400);
     try {
-        $pdo->prepare("INSERT INTO testimonials (name,position,company,content,rating,approved) VALUES (?,?,?,?,?,0)")
-            ->execute([$name,$data['position']??'',$data['company']??'',$content,(int)($data['rating']??5)]);
+        $pdo->prepare("INSERT INTO testimonials (name,position,company,content,testimonial,rating,approved) VALUES (?,?,?,?,?,?,0)")
+            ->execute([$name,$data['position']??'',$data['company']??'',$content,$content,(int)($data['rating']??5)]);
         sendResponse('success','Testimonial submitted',null,201);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
@@ -841,14 +853,16 @@ if ($path === '/settings/public' && $method === 'GET') {
 // ==========================================
 if ($path === '/content/team' && $method === 'GET') {
     try {
-        $team = $pdo->query("SELECT t.*, m.file_path FROM team_members t LEFT JOIN media m ON m.id=t.media_id WHERE t.is_active=1 ORDER BY t.sort_order ASC, t.name ASC")->fetchAll();
+        $authUser = getUserFromToken();
+        $isAdmin = ($authUser && in_array($authUser['role'],['admin','super_admin','manager']));
+        // Admins see all members (including inactive) so they can manage them
+        $where = $isAdmin ? '' : 'WHERE t.is_active=1';
+        $team = $pdo->query("SELECT t.*, m.file_path FROM team_members t LEFT JOIN media m ON m.id=t.media_id {$where} ORDER BY t.sort_order ASC, t.name ASC")->fetchAll();
         $members = array_map(function($row) {
-            // Normalize media file_path to relative
             if (!empty($row['file_path']) && strpos($row['file_path'],'http')===0) {
                 $p = parse_url($row['file_path']);
                 $row['file_path'] = ltrim($p['path']??$row['file_path'],'/');
             }
-            // Frontend fallback: member.image used when media_id is not set
             $row['image'] = $row['image_url'] ?? null;
             return $row;
         }, $team);
