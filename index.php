@@ -25,7 +25,36 @@ if (file_exists($envFile)) {
         $_ENV[trim($k)] = trim($v);
     }
 }
-require_once __DIR__ . '/utils/jwt.php';
+// JWT — inlined to avoid require_once deploy issues; fixes base64url decode bug
+class JWT {
+    private static function key() {
+        $k = $_ENV['JWT_SECRET'] ?? getenv('JWT_SECRET');
+        return $k ?: 'sk_live_stalwart_7f8a9b2c4d5e6f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5';
+    }
+    private static function b64u_enc($d) { return rtrim(strtr(base64_encode($d), '+/', '-_'), '='); }
+    private static function b64u_dec($d) {
+        $d = strtr($d, '-_', '+/');
+        $pad = 4 - strlen($d) % 4; if ($pad < 4) $d .= str_repeat('=', $pad);
+        return base64_decode($d);
+    }
+    public static function encode($payload) {
+        $h = self::b64u_enc(json_encode(['typ'=>'JWT','alg'=>'HS256']));
+        $p = self::b64u_enc(json_encode($payload));
+        $s = self::b64u_enc(hash_hmac('sha256', "$h.$p", self::key(), true));
+        return "$h.$p.$s";
+    }
+    public static function decode($jwt) {
+        $parts = explode('.', $jwt);
+        if (count($parts) !== 3) return null;
+        [$h, $p, $sig] = $parts;
+        $expected = self::b64u_enc(hash_hmac('sha256', "$h.$p", self::key(), true));
+        if (!hash_equals($expected, $sig)) return null;
+        $payload = json_decode(self::b64u_dec($p), true);
+        if (!$payload) return null;
+        if (isset($payload['exp']) && $payload['exp'] < time()) return null;
+        return $payload;
+    }
+}
 
 define('VAPID_PUBLIC_KEY',  $_ENV['VAPID_PUBLIC_KEY']  ?? 'BPEjZwuRl0g09cq4hPgwt8vwQMM9dCUZjUSz5uy0ChQxHafU4R_pjkX2wSEqEEXWnCLGEBp9sYjS0ZjpUHWqTH4');
 define('VAPID_PRIVATE_KEY', $_ENV['VAPID_PRIVATE_KEY'] ?? 'wd0oVmTeuX1zg98EVtXGr1d4nfkpwZBMC5M-YWNsjbs');
@@ -84,10 +113,15 @@ function sendResponse($status, $message, $data = null, $httpCode = 200) {
 }
 function getRequestData() { return json_decode(file_get_contents('php://input'), true) ?? []; }
 function getUserFromToken() {
-    $h = getallheaders(); $auth = $h['Authorization'] ?? '';
+    $auth = '';
+    foreach (getallheaders() as $k => $v) {
+        if (strtolower($k) === 'authorization') { $auth = $v; break; }
+    }
+    if (empty($auth)) $auth = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
     if (empty($auth)) return null;
     preg_match('/Bearer\s+(.*)$/i', $auth, $m);
-    $token = $m[1] ?? $auth;
+    $token = trim($m[1] ?? '');
+    if (empty($token)) return null;
     $payload = JWT::decode($token);
     if (!$payload) return null;
     return ['id'=>$payload['user_id']??null,'email'=>$payload['email']??null,'role'=>$payload['role']??null];
@@ -1336,6 +1370,138 @@ if ($path === '/activity-logs' && $method === 'GET') {
 if ($path === '/auth/check-reminders' && $method === 'POST') {
     $user = requireAuth($pdo);
     sendResponse('success','OK');
+}
+
+// ==========================================
+// SITE HEALTH
+// ==========================================
+if ($path === '/health' && $method === 'GET') {
+    $start = microtime(true);
+    try { $pdo->query("SELECT 1"); $dbOk = true; } catch (\Exception $e) { $dbOk = false; }
+    sendResponse('success','OK',['db'=>$dbOk?'ok':'error','response_ms'=>round((microtime(true)-$start)*1000)]);
+}
+
+if ($path === '/admin/health/metrics' && $method === 'GET') {
+    requireAdmin($pdo);
+    $start = microtime(true);
+    $dbVersion = $pdo->query("SELECT VERSION()")->fetchColumn();
+    $dbName    = $pdo->query("SELECT DATABASE()")->fetchColumn();
+    $dbSize    = (int)$pdo->query("SELECT COALESCE(SUM(data_length+index_length),0) FROM information_schema.TABLES WHERE table_schema=DATABASE()")->fetchColumn();
+    $tableCount= (int)$pdo->query("SELECT COUNT(*) FROM information_schema.TABLES WHERE table_schema=DATABASE()")->fetchColumn();
+    $diskPath  = __DIR__;
+    $diskTotal = (int)@disk_total_space($diskPath);
+    $diskFree  = (int)@disk_free_space($diskPath);
+    $diskUsed  = $diskTotal - $diskFree;
+    $upPct = 100; $totalChecks = 0; $avgMs = 0;
+    try {
+        $total = (int)$pdo->query("SELECT COUNT(*) FROM uptime_logs WHERE checked_at >= DATE_SUB(NOW(),INTERVAL 30 DAY)")->fetchColumn();
+        $up    = (int)$pdo->query("SELECT COUNT(*) FROM uptime_logs WHERE status='up' AND checked_at >= DATE_SUB(NOW(),INTERVAL 30 DAY)")->fetchColumn();
+        if ($total > 0) $upPct = round(($up/$total)*100,2);
+        $totalChecks = $total;
+        $avgMs = (int)$pdo->query("SELECT COALESCE(AVG(response_time_ms),0) FROM uptime_logs WHERE checked_at >= DATE_SUB(NOW(),INTERVAL 1 DAY)")->fetchColumn();
+    } catch (\Exception $e) {}
+    sendResponse('success','Metrics',['server'=>['php_version'=>phpversion(),'os'=>PHP_OS_FAMILY,'hostname'=>gethostname(),'max_upload'=>ini_get('upload_max_filesize'),'max_post'=>ini_get('post_max_size'),'extensions'=>['PDO'=>extension_loaded('pdo'),'pdo_mysql'=>extension_loaded('pdo_mysql'),'openssl'=>extension_loaded('openssl'),'curl'=>extension_loaded('curl'),'gd'=>extension_loaded('gd'),'mbstring'=>extension_loaded('mbstring'),'json'=>extension_loaded('json'),'zip'=>extension_loaded('zip')]],'memory'=>['used_bytes'=>memory_get_usage(true),'peak_bytes'=>memory_get_peak_usage(true),'limit'=>ini_get('memory_limit')],'disk'=>['total_bytes'=>$diskTotal,'free_bytes'=>$diskFree,'used_bytes'=>$diskUsed,'used_percent'=>$diskTotal>0?round(($diskUsed/$diskTotal)*100,1):0],'database'=>['status'=>'ok','version'=>$dbVersion,'name'=>$dbName,'size_bytes'=>$dbSize,'table_count'=>$tableCount],'api_response_ms'=>round((microtime(true)-$start)*1000),'uptime'=>['percent_30d'=>$upPct,'total_checks'=>$totalChecks,'avg_response_ms'=>$avgMs]]);
+}
+
+if ($path === '/admin/uptime-logs' && $method === 'GET') {
+    requireAdmin($pdo);
+    try {
+        $pdo->exec("CREATE TABLE IF NOT EXISTS uptime_logs (id INT AUTO_INCREMENT PRIMARY KEY, status VARCHAR(20) DEFAULT 'up', response_time_ms INT, notes VARCHAR(500), checked_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+        $start = microtime(true);
+        try { $pdo->query("SELECT 1"); $status='up'; $notes=''; } catch (\Exception $e) { $status='down'; $notes=$e->getMessage(); }
+        $ms = round((microtime(true)-$start)*1000);
+        $pdo->prepare("INSERT INTO uptime_logs (status,response_time_ms,notes) VALUES (?,?,?)")->execute([$status,$ms,$notes]);
+        $pdo->exec("DELETE FROM uptime_logs WHERE checked_at < DATE_SUB(NOW(),INTERVAL 30 DAY)");
+        $logs = $pdo->query("SELECT * FROM uptime_logs ORDER BY checked_at DESC LIMIT 200")->fetchAll();
+        sendResponse('success','Logs',$data=['logs'=>$logs]);
+    } catch (\Throwable $e) { sendResponse('success','OK',['logs'=>[]]); }
+}
+
+if ($path === '/admin/backups' && $method === 'GET') {
+    requireAdmin($pdo);
+    $backupDir = __DIR__ . '/backups/';
+    if (!is_dir($backupDir)) { sendResponse('success','OK',['backups'=>[]]); exit; }
+    $files = glob($backupDir . '*.sql*') ?: [];
+    usort($files, fn($a,$b) => filemtime($b) - filemtime($a));
+    $backups = array_map(fn($f) => ['id'=>basename($f),'filename'=>basename($f),'size_bytes'=>filesize($f),'created_at'=>date('Y-m-d H:i:s',filemtime($f)),'google_drive_link'=>null], $files);
+    sendResponse('success','Backups',['backups'=>$backups]);
+}
+
+if ($path === '/admin/backup' && $method === 'POST') {
+    requireAdmin($pdo);
+    $backupDir = __DIR__ . '/backups/';
+    if (!is_dir($backupDir)) mkdir($backupDir, 0755, true);
+    $filename = 'stalwart_backup_' . date('Y-m-d_His') . '.sql';
+    $filepath = $backupDir . $filename;
+    try {
+        $tables = $pdo->query("SHOW TABLES")->fetchAll(PDO::FETCH_COLUMN);
+        $sql = "-- Stalwart DB Backup " . date('Y-m-d H:i:s') . "\nSET FOREIGN_KEY_CHECKS=0;\n\n";
+        foreach ($tables as $table) {
+            $create = $pdo->query("SHOW CREATE TABLE `$table`")->fetch();
+            $sql .= "DROP TABLE IF EXISTS `$table`;\n" . $create['Create Table'] . ";\n\n";
+            $rows = $pdo->query("SELECT * FROM `$table`")->fetchAll(PDO::FETCH_NUM);
+            if ($rows) {
+                $cols = array_column($pdo->query("SHOW COLUMNS FROM `$table`")->fetchAll(), 'Field');
+                foreach ($rows as $row) {
+                    $vals = array_map(fn($v) => $v===null?'NULL':"'".addslashes($v)."'", $row);
+                    $sql .= "INSERT INTO `$table` (`".implode('`,`',$cols)."`) VALUES (".implode(',',$vals).");\n";
+                }
+                $sql .= "\n";
+            }
+        }
+        $sql .= "SET FOREIGN_KEY_CHECKS=1;\n";
+        file_put_contents($filepath, $sql);
+        sendResponse('success','Backup created',['filename'=>$filename,'size_bytes'=>filesize($filepath),'notes'=>null]);
+    } catch (\Throwable $e) { @unlink($filepath); sendResponse('error','Backup failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/admin/backups/download/(.+)$#',$path,$bm) && $method === 'GET') {
+    requireAdmin($pdo);
+    $filename = basename($bm[1]);
+    $filepath = __DIR__ . '/backups/' . $filename;
+    if (!file_exists($filepath) || !preg_match('/\.sql/', $filename)) sendResponse('error','Not found',null,404);
+    header('Content-Type: application/octet-stream');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    header('Content-Length: ' . filesize($filepath));
+    readfile($filepath); exit;
+}
+
+if ($path === '/admin/error-logs' && $method === 'GET') {
+    requireAdmin($pdo);
+    $logFile = __DIR__ . '/logs/errors.log';
+    $exists = file_exists($logFile);
+    $size   = $exists ? filesize($logFile) : 0;
+    $entries = []; $summary = ['fatal'=>0,'warning'=>0,'notice'=>0,'deprecated'=>0,'info'=>0];
+    if ($exists && $size > 0) {
+        $lines = array_reverse(array_filter(explode("\n", file_get_contents($logFile))));
+        foreach (array_slice($lines, 0, 500) as $line) {
+            if (empty(trim($line))) continue;
+            $severity = 'info';
+            if (stripos($line,'fatal') !== false) $severity = 'fatal';
+            elseif (stripos($line,'warning') !== false) $severity = 'warning';
+            elseif (stripos($line,'notice') !== false) $severity = 'notice';
+            elseif (stripos($line,'deprecated') !== false) $severity = 'deprecated';
+            $summary[$severity]++;
+            preg_match('/\[(\d{2}-\w+-\d{4} \d{2}:\d{2}:\d{2})[^\]]*\]/', $line, $tm);
+            preg_match('/in (.+?) on line (\d+)/', $line, $fm);
+            $entries[] = [
+                'message'        => preg_replace('/\[\d{2}-\w+-\d{4}[^\]]*\]\s*(PHP\s+)?/', '', $line),
+                'file'           => $fm[1] ?? null,
+                'line'           => $fm[2] ?? null,
+                'timestamp'      => $tm[1] ?? null,
+                'severity'       => $severity,
+                'recommendation' => null,
+            ];
+        }
+    }
+    sendResponse('success','Error logs',['entries'=>$entries,'total'=>count($entries),'summary'=>$summary,'log_file_exists'=>$exists,'log_file_size'=>$size]);
+}
+
+if ($path === '/admin/error-logs/clear' && $method === 'POST') {
+    requireAdmin($pdo);
+    $logFile = __DIR__ . '/logs/errors.log';
+    if (file_exists($logFile)) file_put_contents($logFile, '');
+    sendResponse('success','Log cleared');
 }
 
 // ==========================================
