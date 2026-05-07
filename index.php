@@ -1850,23 +1850,25 @@ if ($path === '/deploy-frontend' && $method === 'POST') {
     if (!$frontendDir) {
         echo json_encode(['error'=>'Frontend dir not found','tried'=>__DIR__.'/../public_html']); exit;
     }
+    // PHP converts '.' and '-' in field names to '_' in $_FILES keys
+    // Map: php_key => [subdir, real_filename]
     $map = [
-        'index.html'         => '',
-        'sw.js'              => '',
-        'manifest.webmanifest' => '',
-        'index.js'           => 'assets/',
-        'index.css'          => 'assets/',
-        'workbox.js'         => 'assets/',
+        'index_html'           => ['', 'index.html'],
+        'sw_js'                => ['', 'sw.js'],
+        'manifest_webmanifest' => ['', 'manifest.webmanifest'],
+        'index_js'             => ['assets/', 'index.js'],
+        'index_css'            => ['assets/', 'index.css'],
+        'workbox_js'           => ['assets/', 'workbox-window.prod.es5.js'],
     ];
     $results = [];
     foreach ($_FILES as $key => $file) {
         if (!isset($map[$key])) { $results[$key] = 'SKIPPED'; continue; }
         if ($file['error'] !== UPLOAD_ERR_OK) { $results[$key] = 'UPLOAD_ERR '.$file['error']; continue; }
-        $subdir = $map[$key];
+        [$subdir, $realName] = $map[$key];
         $destDir = $frontendDir . '/' . $subdir;
         if ($subdir && !is_dir($destDir)) mkdir($destDir, 0755, true);
-        $dest = $destDir . $key;
-        $results[$key] = move_uploaded_file($file['tmp_name'], $dest)
+        $dest = $destDir . $realName;
+        $results[$realName] = move_uploaded_file($file['tmp_name'], $dest)
             ? 'OK (' . $file['size'] . ' bytes)'
             : 'FAILED to write (dest: '.$dest.')';
     }
