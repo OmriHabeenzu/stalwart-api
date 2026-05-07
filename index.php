@@ -102,6 +102,9 @@ try {
     try { $pdo->exec("ALTER TABLE users ADD COLUMN can_manage_calls TINYINT DEFAULT 0"); } catch (\Throwable $e) {}
     $pdo->exec("CREATE TABLE IF NOT EXISTS notifications (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT NOT NULL, type VARCHAR(50) DEFAULT 'info', title VARCHAR(255) NOT NULL, message TEXT, link VARCHAR(500), is_read TINYINT DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     try { $pdo->exec("ALTER TABLE notifications ADD INDEX idx_user_id (user_id)"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE team_members ADD COLUMN media_id INT DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE team_members ADD COLUMN education TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE team_members ADD COLUMN specialties TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
 } catch (\Throwable $e) {}
 
 // HELPERS
@@ -808,17 +811,27 @@ if ($path === '/settings/public' && $method === 'GET') {
 // ==========================================
 if ($path === '/content/team' && $method === 'GET') {
     try {
-        $team = $pdo->query("SELECT * FROM team_members WHERE is_active=1 ORDER BY sort_order ASC, name ASC")->fetchAll();
-        sendResponse('success','Team retrieved',['team'=>$team]);
-    } catch (\Throwable $e) { sendResponse('success','OK',['team'=>[]]); }
+        $team = $pdo->query("SELECT t.*, m.file_path FROM team_members t LEFT JOIN media m ON m.id=t.media_id WHERE t.is_active=1 ORDER BY t.sort_order ASC, t.name ASC")->fetchAll();
+        $members = array_map(function($row) {
+            // Normalize media file_path to relative
+            if (!empty($row['file_path']) && strpos($row['file_path'],'http')===0) {
+                $p = parse_url($row['file_path']);
+                $row['file_path'] = ltrim($p['path']??$row['file_path'],'/');
+            }
+            // Frontend fallback: member.image used when media_id is not set
+            $row['image'] = $row['image_url'] ?? null;
+            return $row;
+        }, $team);
+        sendResponse('success','Team retrieved',['members'=>$members]);
+    } catch (\Throwable $e) { sendResponse('success','OK',['members'=>[]]); }
 }
 
 if ($path === '/content/team' && $method === 'POST') {
     requireAdmin($pdo);
     $data = getRequestData();
     try {
-        $pdo->prepare("INSERT INTO team_members (name,position,bio,image_url,linkedin_url,sort_order,is_active) VALUES (?,?,?,?,?,?,1)")
-            ->execute([$data['name']??'',$data['position']??'',$data['bio']??'',$data['image_url']??'',$data['linkedin_url']??'',(int)($data['sort_order']??0)]);
+        $pdo->prepare("INSERT INTO team_members (name,position,bio,image_url,linkedin_url,sort_order,is_active,education,specialties,media_id) VALUES (?,?,?,?,?,?,1,?,?,?)")
+            ->execute([$data['name']??'',$data['position']??'',$data['bio']??'',$data['image_url']??'',$data['linkedin_url']??'',(int)($data['sort_order']??0),$data['education']??'',$data['specialties']??'',!empty($data['media_id'])?(int)$data['media_id']:null]);
         sendResponse('success','Team member added',['id'=>$pdo->lastInsertId()],201);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
@@ -828,9 +841,10 @@ if (preg_match('#^/content/team/(\d+)$#',$path,$m) && $method === 'PUT') {
     $data = getRequestData();
     try {
         $fields=[]; $vals=[];
-        foreach (['name','position','bio','image_url','linkedin_url','sort_order','is_active'] as $f) {
+        foreach (['name','position','bio','image_url','linkedin_url','sort_order','is_active','education','specialties'] as $f) {
             if (isset($data[$f])) { $fields[]="$f=?"; $vals[]=$data[$f]; }
         }
+        if (array_key_exists('media_id',$data)) { $fields[]="media_id=?"; $vals[]=!empty($data['media_id'])?(int)$data['media_id']:null; }
         if (empty($fields)) sendResponse('error','Nothing to update',null,400);
         $vals[]=(int)$m[1];
         $pdo->prepare("UPDATE team_members SET ".implode(',',$fields)." WHERE id=?")->execute($vals);
@@ -842,12 +856,16 @@ if ($path === '/content/homepage' && $method === 'GET') {
     try {
         $rows = $pdo->query("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('homepage_hero_image_id','homepage_why_choose_image_id')")->fetchAll(PDO::FETCH_KEY_PAIR);
         $images = ['hero_image'=>null,'why_choose_image'=>null];
-        $apiBase = (isset($_SERVER['HTTPS'])&&$_SERVER['HTTPS']==='on'?'https':'http').'://'.$_SERVER['HTTP_HOST'];
         foreach (['homepage_hero_image_id'=>'hero_image','homepage_why_choose_image_id'=>'why_choose_image'] as $key=>$imgKey) {
             if (!empty($rows[$key])) {
                 try {
                     $stmt=$pdo->prepare("SELECT file_path FROM media WHERE id=?"); $stmt->execute([$rows[$key]]);
-                    $media=$stmt->fetch(); if ($media) $images[$imgKey]=$apiBase.'/'.$media['file_path'];
+                    $media=$stmt->fetch();
+                    if ($media) {
+                        $fp = $media['file_path'];
+                        if (strpos($fp,'http')===0) { $p=parse_url($fp); $fp=ltrim($p['path']??$fp,'/'); }
+                        $images[$imgKey] = $fp;
+                    }
                 } catch(Exception $e){}
             }
         }
@@ -857,9 +875,36 @@ if ($path === '/content/homepage' && $method === 'GET') {
 
 if ($path === '/content/page-images' && $method === 'GET') {
     try {
-        $rows = $pdo->query("SELECT * FROM page_images ORDER BY page_key, sort_order")->fetchAll();
-        sendResponse('success','Page images',['images'=>$rows]);
+        // Read all page image settings (keys like page_about_intro_image_id, page_services_village_image_id, etc.)
+        $rows = $pdo->query("SELECT setting_key, setting_value FROM settings WHERE setting_key LIKE 'page_%_id' OR setting_key LIKE 'page_%_image_id'")->fetchAll(PDO::FETCH_KEY_PAIR);
+        $images = [];
+        foreach ($rows as $key => $mediaId) {
+            if (empty($mediaId)) continue;
+            try {
+                $stmt = $pdo->prepare("SELECT file_path FROM media WHERE id=?");
+                $stmt->execute([$mediaId]);
+                $media = $stmt->fetch();
+                if ($media) {
+                    $fp = $media['file_path'];
+                    if (strpos($fp,'http')===0) { $p=parse_url($fp); $fp=ltrim($p['path']??$fp,'/'); }
+                    $images[$key] = $fp;
+                }
+            } catch (\Exception $e) {}
+        }
+        sendResponse('success','Page images',['images'=>$images]);
     } catch (\Throwable $e) { sendResponse('success','OK',['images'=>[]]); }
+}
+
+if ($path === '/content/page-images' && $method === 'PUT') {
+    requireAdmin($pdo);
+    $data = getRequestData();
+    try {
+        $stmt = $pdo->prepare("INSERT INTO settings (setting_key,setting_value) VALUES (?,?) ON DUPLICATE KEY UPDATE setting_value=?");
+        foreach ($data as $key => $value) {
+            if (strpos($key,'page_') === 0) $stmt->execute([$key,$value,$value]);
+        }
+        sendResponse('success','Page images saved');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
 if ($path === '/content/page-text' && $method === 'GET') {
