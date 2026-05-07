@@ -777,7 +777,7 @@ if ($path === '/testimonials' && $method === 'GET') {
     try {
         $authUser = getUserFromToken();
         $isAdmin = ($authUser && in_array($authUser['role'],['admin','super_admin','manager']));
-        $sel = "id,name,position,company,COALESCE(content,testimonial,'') AS content,COALESCE(content,testimonial,'') AS testimonial,rating,image,is_approved AS approved,created_at";
+        $sel = "id,name,position,company,COALESCE(content,testimonial,'') AS content,COALESCE(content,testimonial,'') AS testimonial,rating,image,is_approved,is_featured,created_at,updated_at";
         if ($isAdmin) {
             $rows = $pdo->query("SELECT {$sel} FROM testimonials ORDER BY created_at DESC")->fetchAll();
         } else {
@@ -790,7 +790,7 @@ if ($path === '/testimonials' && $method === 'GET') {
 if ($path === '/testimonials/all' && $method === 'GET') {
     requireAdmin($pdo);
     try {
-        $sel = "id,name,position,company,COALESCE(content,testimonial,'') AS content,COALESCE(content,testimonial,'') AS testimonial,rating,image,is_approved AS approved,created_at";
+        $sel = "id,name,position,company,COALESCE(content,testimonial,'') AS content,COALESCE(content,testimonial,'') AS testimonial,rating,image,is_approved,is_featured,created_at,updated_at";
         $all = $pdo->query("SELECT {$sel} FROM testimonials ORDER BY created_at DESC")->fetchAll();
         sendResponse('success','All testimonials',['testimonials'=>$all]);
     } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
