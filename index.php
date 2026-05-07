@@ -638,6 +638,22 @@ if (preg_match('#^/chat/(\d+)/messages$#',$path,$m) && $method === 'POST') {
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
+if (preg_match('#^/chat/(\d+)/staff-message$#',$path,$m) && $method === 'POST') {
+    $user = requireAuth($pdo);
+    $data = getRequestData();
+    $message = trim($data['message'] ?? '');
+    if (empty($message)) sendResponse('error','Message required',null,400);
+    try {
+        $nameStmt = $pdo->prepare("SELECT name FROM users WHERE id=?");
+        $nameStmt->execute([$user['id']]);
+        $senderName = $nameStmt->fetchColumn() ?: $user['email'];
+        $pdo->prepare("INSERT INTO chat_messages (session_id,message,sender_type,sender_name) VALUES (?,?,?,?)")
+            ->execute([$m[1],$message,'staff',$senderName]);
+        $pdo->prepare("UPDATE chat_sessions SET last_message=?,last_message_time=NOW(),updated_at=NOW() WHERE id=?")->execute([$message,$m[1]]);
+        sendResponse('success','Message sent',['id'=>$pdo->lastInsertId()]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
 if (preg_match('#^/chat/(\d+)/close$#',$path,$m) && $method === 'PUT') {
     try {
         $pdo->prepare("UPDATE chat_sessions SET status='closed',updated_at=NOW() WHERE id=?")->execute([$m[1]]);
@@ -1022,6 +1038,14 @@ if ($path === '/media' && $method === 'GET') {
     requireAuth($pdo);
     try {
         $media = $pdo->query("SELECT id,file_name,file_path,file_type,file_size,created_at FROM media ORDER BY created_at DESC LIMIT 200")->fetchAll();
+        // Normalize: strip domain prefix if file_path was stored as a full URL
+        foreach ($media as &$m) {
+            if (isset($m['file_path']) && strpos($m['file_path'], 'http') === 0) {
+                $parsed = parse_url($m['file_path']);
+                $m['file_path'] = ltrim($parsed['path'] ?? $m['file_path'], '/');
+            }
+        }
+        unset($m);
         sendResponse('success','Media retrieved',['media'=>$media]);
     } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
 }
