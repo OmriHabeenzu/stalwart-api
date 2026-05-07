@@ -1841,6 +1841,40 @@ if ($path === '/deploy/pull' && $method === 'POST') {
     sendResponse('success', 'Pulled', $results);
 }
 
+// FRONTEND ASSET DEPLOY (upload built files to public_html)
+// ==========================================
+if ($path === '/deploy-frontend' && $method === 'POST') {
+    if (($_GET['token'] ?? '') !== 'stalwart2026') { echo json_encode(['error'=>'Unauthorized']); exit; }
+    // API is at /home/stalwartzm.com/api.stalwartzm.com/ — frontend is at ../public_html/
+    $frontendDir = realpath(__DIR__ . '/../public_html');
+    if (!$frontendDir) {
+        echo json_encode(['error'=>'Frontend dir not found','tried'=>__DIR__.'/../public_html']); exit;
+    }
+    $map = [
+        'index.html'         => '',
+        'sw.js'              => '',
+        'manifest.webmanifest' => '',
+        'index.js'           => 'assets/',
+        'index.css'          => 'assets/',
+        'workbox.js'         => 'assets/',
+    ];
+    $results = [];
+    foreach ($_FILES as $key => $file) {
+        if (!isset($map[$key])) { $results[$key] = 'SKIPPED'; continue; }
+        if ($file['error'] !== UPLOAD_ERR_OK) { $results[$key] = 'UPLOAD_ERR '.$file['error']; continue; }
+        $subdir = $map[$key];
+        $destDir = $frontendDir . '/' . $subdir;
+        if ($subdir && !is_dir($destDir)) mkdir($destDir, 0755, true);
+        $dest = $destDir . $key;
+        $results[$key] = move_uploaded_file($file['tmp_name'], $dest)
+            ? 'OK (' . $file['size'] . ' bytes)'
+            : 'FAILED to write (dest: '.$dest.')';
+    }
+    if (!is_dir(__DIR__.'/logs')) mkdir(__DIR__.'/logs', 0755, true);
+    file_put_contents(__DIR__.'/logs/deploy-frontend.log', date('Y-m-d H:i:s')."\n".json_encode($results)."\n---\n", FILE_APPEND);
+    echo json_encode(['success'=>true,'files'=>$results,'time'=>date('Y-m-d H:i:s')]); exit;
+}
+
 // 404
 sendResponse('error','Route not found',['path'=>$path,'method'=>$method],404);
 ?>
