@@ -857,13 +857,17 @@ if ($path === '/content/team' && $method === 'GET') {
         $isAdmin = ($authUser && in_array($authUser['role'],['admin','super_admin','manager']));
         // Admins see all members (including inactive) so they can manage them
         $where = $isAdmin ? '' : 'WHERE t.is_active=1';
-        $team = $pdo->query("SELECT t.*, m.file_path FROM team_members t LEFT JOIN media m ON m.id=t.media_id {$where} ORDER BY t.sort_order ASC, t.name ASC")->fetchAll();
+        // order_position is the original column name; sort_order is our migration alias
+        $team = $pdo->query("SELECT t.*, m.file_path FROM team_members t LEFT JOIN media m ON m.id=t.media_id {$where} ORDER BY COALESCE(t.order_position, t.sort_order, 0) ASC, t.name ASC")->fetchAll();
         $members = array_map(function($row) {
             if (!empty($row['file_path']) && strpos($row['file_path'],'http')===0) {
                 $p = parse_url($row['file_path']);
                 $row['file_path'] = ltrim($p['path']??$row['file_path'],'/');
             }
-            $row['image'] = $row['image_url'] ?? null;
+            // Preserve existing 'image' column; only fall back to image_url if image is empty
+            if (empty($row['image'])) {
+                $row['image'] = $row['image_url'] ?? null;
+            }
             return $row;
         }, $team);
         sendResponse('success','Team retrieved',['members'=>$members]);
