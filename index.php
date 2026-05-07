@@ -123,6 +123,15 @@ try {
     $pdo->exec("CREATE TABLE IF NOT EXISTS activity_logs (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, username VARCHAR(255), action VARCHAR(100), description TEXT, ip_address VARCHAR(45), user_agent TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     try { $pdo->exec("ALTER TABLE activity_logs ADD INDEX idx_action (action)"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE activity_logs ADD INDEX idx_created (created_at)"); } catch (\Throwable $e) {}
+    $pdo->exec("CREATE TABLE IF NOT EXISTS task_assignees (id INT AUTO_INCREMENT PRIMARY KEY, task_id INT NOT NULL, user_id INT NOT NULL, status ENUM('pending','in_progress','completed') DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uniq_task_user (task_id,user_id))");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS task_comments (id INT AUTO_INCREMENT PRIMARY KEY, task_id INT NOT NULL, user_id INT NOT NULL, comment TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS task_attachments (id INT AUTO_INCREMENT PRIMARY KEY, task_id INT NOT NULL, uploaded_by INT NOT NULL, file_name VARCHAR(255) NOT NULL, file_path VARCHAR(500) NOT NULL, file_size INT, mime_type VARCHAR(100), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    try { $pdo->exec("ALTER TABLE tasks ADD COLUMN category VARCHAR(50) DEFAULT 'general'"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE tasks ADD COLUMN due_time TIME DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE tasks ADD COLUMN recurrence VARCHAR(20) DEFAULT 'none'"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE tasks ADD COLUMN color VARCHAR(20) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE tasks ADD COLUMN completed_at DATETIME DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE tasks ADD COLUMN parent_task_id INT DEFAULT NULL"); } catch (\Throwable $e) {}
 } catch (\Throwable $e) {}
 
 // HELPERS
@@ -615,16 +624,18 @@ if ($path === '/analytics/stats' && $method === 'GET') {
 }
 
 // ==========================================
-// TASKS (basic)
+// TASKS
 // ==========================================
+
 if ($path === '/tasks' && $method === 'GET') {
     $user = requireAuth($pdo);
     try {
-        if ($user['role']==='admin') {
-            $tasks = $pdo->query("SELECT t.*,GROUP_CONCAT(u.name SEPARATOR ', ') as assignee_names FROM tasks t LEFT JOIN task_assignees ta ON ta.task_id=t.id LEFT JOIN users u ON u.id=ta.user_id GROUP BY t.id ORDER BY t.created_at DESC")->fetchAll();
+        $sel = "t.*, GROUP_CONCAT(DISTINCT CONCAT(ta.user_id,'|',REPLACE(COALESCE(u.name,''),'|',''),'|',COALESCE(ta.status,'pending')) ORDER BY u.name SEPARATOR ';;') as assignee_details, GROUP_CONCAT(DISTINCT u.name ORDER BY u.name SEPARATOR ', ') as assignees, (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id=t.id) as comment_count";
+        if ($user['role'] === 'admin') {
+            $tasks = $pdo->query("SELECT $sel FROM tasks t LEFT JOIN task_assignees ta ON ta.task_id=t.id LEFT JOIN users u ON u.id=ta.user_id GROUP BY t.id ORDER BY FIELD(t.status,'in_progress','pending','completed'), t.due_date ASC, t.created_at DESC")->fetchAll();
         } else {
-            $stmt = $pdo->prepare("SELECT t.*,GROUP_CONCAT(u.name SEPARATOR ', ') as assignee_names FROM tasks t JOIN task_assignees ta ON ta.task_id=t.id LEFT JOIN users u2 ON u2.id=ta.user_id LEFT JOIN users u ON u.id=ta.user_id WHERE ta.user_id=? GROUP BY t.id ORDER BY t.created_at DESC");
-            $stmt->execute([$user['id']]); $tasks = $stmt->fetchAll();
+            $stmt = $pdo->prepare("SELECT $sel FROM tasks t LEFT JOIN task_assignees ta ON ta.task_id=t.id LEFT JOIN users u ON u.id=ta.user_id WHERE EXISTS (SELECT 1 FROM task_assignees ta2 WHERE ta2.task_id=t.id AND ta2.user_id=?) OR t.created_by=? GROUP BY t.id ORDER BY FIELD(t.status,'in_progress','pending','completed'), t.due_date ASC, t.created_at DESC");
+            $stmt->execute([$user['id'],$user['id']]); $tasks = $stmt->fetchAll();
         }
         sendResponse('success','Tasks retrieved',['tasks'=>$tasks]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
@@ -636,31 +647,153 @@ if ($path === '/tasks' && $method === 'POST') {
     $title = trim($data['title']??'');
     if (empty($title)) sendResponse('error','Title required',null,400);
     try {
-        $pdo->prepare("INSERT INTO tasks (title,description,status,priority,due_date,created_by) VALUES (?,?,?,?,?,?)")
-            ->execute([$title,$data['description']??'','pending',$data['priority']??'medium',$data['due_date']??null,$user['id']]);
+        $dueDate = $data['due_date'] ?? $data['dueDate'] ?? null;
+        $dueTime = $data['due_time'] ?? $data['dueTime'] ?? null;
+        $status  = $data['status'] ?? 'pending';
+        $pdo->prepare("INSERT INTO tasks (title,description,status,priority,category,due_date,due_time,recurrence,color,created_by) VALUES (?,?,?,?,?,?,?,?,?,?)")
+            ->execute([$title,$data['description']??'',$status,$data['priority']??'medium',$data['category']??'general',$dueDate,$dueTime,$data['recurrence']??'none',$data['color']??null,$user['id']]);
         $taskId = $pdo->lastInsertId();
-        if (!empty($data['assignee_ids'])) {
-            $stmt = $pdo->prepare("INSERT INTO task_assignees (task_id,user_id) VALUES (?,?)");
-            foreach ($data['assignee_ids'] as $uid) $stmt->execute([$taskId,$uid]);
+        $assignees = $data['assignees'] ?? $data['assignee_ids'] ?? [];
+        if (!empty($assignees)) {
+            $stmt = $pdo->prepare("INSERT IGNORE INTO task_assignees (task_id,user_id,status) VALUES (?,?,'pending')");
+            foreach ($assignees as $uid) { $uid=(int)$uid; if ($uid>0) $stmt->execute([$taskId,$uid]); }
         }
         sendResponse('success','Task created',['id'=>$taskId],201);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if ($path === '/tasks/bulk-assign' && $method === 'POST') {
+    requireAdmin($pdo);
+    $data = getRequestData();
+    $taskIds = $data['task_ids'] ?? [];
+    $userId  = (int)($data['user_id'] ?? 0);
+    if (empty($taskIds) || !$userId) sendResponse('error','task_ids and user_id required',null,400);
+    try {
+        $stmt = $pdo->prepare("INSERT IGNORE INTO task_assignees (task_id,user_id,status) VALUES (?,?,'pending')");
+        foreach ($taskIds as $tid) $stmt->execute([(int)$tid,$userId]);
+        sendResponse('success','Bulk assigned');
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
 if (preg_match('#^/tasks/(\d+)$#',$path,$m) && $method === 'PUT') {
     $user = requireAuth($pdo);
     $data = getRequestData();
+    $taskId = (int)$m[1];
     try {
         $fields=[]; $vals=[];
-        if (isset($data['status']))      { $fields[]='status=?';      $vals[]=$data['status']; }
-        if (isset($data['title']))       { $fields[]='title=?';       $vals[]=$data['title']; }
-        if (isset($data['description'])) { $fields[]='description=?'; $vals[]=$data['description']; }
-        if (isset($data['priority']))    { $fields[]='priority=?';    $vals[]=$data['priority']; }
-        if (isset($data['due_date']))    { $fields[]='due_date=?';    $vals[]=$data['due_date']; }
-        if (empty($fields)) sendResponse('error','Nothing to update',null,400);
-        $vals[]=(int)$m[1];
-        $pdo->prepare("UPDATE tasks SET ".implode(',',$fields).",updated_at=NOW() WHERE id=?")->execute($vals);
+        if (isset($data['status']))       { $fields[]='status=?';       $vals[]=$data['status']; }
+        if (isset($data['title']))        { $fields[]='title=?';        $vals[]=$data['title']; }
+        if (isset($data['description']))  { $fields[]='description=?';  $vals[]=$data['description']; }
+        if (isset($data['priority']))     { $fields[]='priority=?';     $vals[]=$data['priority']; }
+        if (isset($data['category']))     { $fields[]='category=?';     $vals[]=$data['category']; }
+        if (isset($data['recurrence']))   { $fields[]='recurrence=?';   $vals[]=$data['recurrence']; }
+        if (isset($data['color']))        { $fields[]='color=?';        $vals[]=$data['color']; }
+        if (array_key_exists('due_date',$data)||array_key_exists('dueDate',$data)) { $fields[]='due_date=?'; $vals[]=$data['due_date']??$data['dueDate']??null; }
+        if (array_key_exists('due_time',$data)||array_key_exists('dueTime',$data)) { $fields[]='due_time=?'; $vals[]=$data['due_time']??$data['dueTime']??null; }
+        if (isset($data['status']) && $data['status']==='completed') { $fields[]='completed_at=NOW()'; }
+        elseif (isset($data['status']) && $data['status']!=='completed') { $fields[]='completed_at=NULL'; }
+        if (!empty($fields)) { $vals[]=$taskId; $pdo->prepare("UPDATE tasks SET ".implode(',',$fields).",updated_at=NOW() WHERE id=?")->execute($vals); }
+        if (isset($data['assignees'])) {
+            $pdo->prepare("DELETE FROM task_assignees WHERE task_id=?")->execute([$taskId]);
+            if (!empty($data['assignees'])) {
+                $stmt = $pdo->prepare("INSERT IGNORE INTO task_assignees (task_id,user_id,status) VALUES (?,?,'pending')");
+                foreach ($data['assignees'] as $uid) { $uid=(int)$uid; if ($uid>0) $stmt->execute([$taskId,$uid]); }
+            }
+        }
         sendResponse('success','Task updated');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/tasks/(\d+)$#',$path,$m) && $method === 'DELETE') {
+    requireAdmin($pdo);
+    $taskId = (int)$m[1];
+    try {
+        $pdo->prepare("DELETE FROM task_assignees WHERE task_id=?")->execute([$taskId]);
+        $pdo->prepare("DELETE FROM task_comments WHERE task_id=?")->execute([$taskId]);
+        $pdo->prepare("DELETE FROM task_attachments WHERE task_id=?")->execute([$taskId]);
+        $pdo->prepare("DELETE FROM tasks WHERE id=?")->execute([$taskId]);
+        sendResponse('success','Task deleted');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/tasks/(\d+)/assignee-status$#',$path,$m) && $method === 'PATCH') {
+    $user = requireAuth($pdo);
+    $data = getRequestData();
+    $taskId = (int)$m[1];
+    $userId = (int)($data['user_id'] ?? $user['id']);
+    $status = $data['status'] ?? 'pending';
+    if ($user['role']!=='admin' && $userId!==(int)$user['id']) sendResponse('error','Forbidden',null,403);
+    try {
+        $pdo->prepare("UPDATE task_assignees SET status=? WHERE task_id=? AND user_id=?")->execute([$status,$taskId,$userId]);
+        sendResponse('success','Status updated');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/tasks/(\d+)/comments$#',$path,$m) && $method === 'GET') {
+    requireAuth($pdo);
+    $taskId = (int)$m[1];
+    try {
+        $stmt = $pdo->prepare("SELECT tc.*,u.name as user_name FROM task_comments tc LEFT JOIN users u ON u.id=tc.user_id WHERE tc.task_id=? ORDER BY tc.created_at ASC");
+        $stmt->execute([$taskId]);
+        sendResponse('success','Comments retrieved',['comments'=>$stmt->fetchAll()]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/tasks/(\d+)/comments$#',$path,$m) && $method === 'POST') {
+    $user = requireAuth($pdo);
+    $data = getRequestData();
+    $taskId = (int)$m[1];
+    $comment = trim($data['comment'] ?? '');
+    if (empty($comment)) sendResponse('error','Comment required',null,400);
+    try {
+        $pdo->prepare("INSERT INTO task_comments (task_id,user_id,comment) VALUES (?,?,?)")->execute([$taskId,$user['id'],$comment]);
+        sendResponse('success','Comment added',['id'=>$pdo->lastInsertId()],201);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/tasks/(\d+)/attachments$#',$path,$m) && $method === 'GET') {
+    requireAuth($pdo);
+    $taskId = (int)$m[1];
+    try {
+        $stmt = $pdo->prepare("SELECT ta.*,u.name as uploaded_by_name FROM task_attachments ta LEFT JOIN users u ON u.id=ta.uploaded_by WHERE ta.task_id=? ORDER BY ta.created_at DESC");
+        $stmt->execute([$taskId]);
+        $atts = $stmt->fetchAll();
+        $base = (isset($_SERVER['HTTPS'])&&$_SERVER['HTTPS']==='on'?'https':'http').'://'.$_SERVER['HTTP_HOST'];
+        foreach ($atts as &$a) { $a['url'] = $base.'/'.ltrim($a['file_path'],'/'); }
+        sendResponse('success','Attachments retrieved',['attachments'=>$atts]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/tasks/(\d+)/attachments$#',$path,$m) && $method === 'POST') {
+    $user = requireAuth($pdo);
+    $taskId = (int)$m[1];
+    if (empty($_FILES['file'])) sendResponse('error','No file uploaded',null,400);
+    $file = $_FILES['file'];
+    if ($file['error']!==UPLOAD_ERR_OK) sendResponse('error','Upload error',null,400);
+    $ext = strtolower(pathinfo($file['name'],PATHINFO_EXTENSION));
+    $allowed = ['pdf','doc','docx','xls','xlsx','csv','txt','png','jpg','jpeg','gif','zip'];
+    if (!in_array($ext,$allowed)) sendResponse('error','File type not allowed',null,400);
+    $dir = __DIR__.'/uploads/tasks/';
+    if (!is_dir($dir)) mkdir($dir,0755,true);
+    $fname = time().'_'.preg_replace('/[^a-zA-Z0-9._-]/','_',$file['name']);
+    if (!move_uploaded_file($file['tmp_name'],$dir.$fname)) sendResponse('error','Failed to save file',null,500);
+    try {
+        $pdo->prepare("INSERT INTO task_attachments (task_id,uploaded_by,file_name,file_path,file_size,mime_type) VALUES (?,?,?,?,?,?)")
+            ->execute([$taskId,$user['id'],$file['name'],'uploads/tasks/'.$fname,$file['size'],$file['type']]);
+        sendResponse('success','File uploaded',['id'=>$pdo->lastInsertId()],201);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/tasks/(\d+)/attachments/(\d+)$#',$path,$m) && $method === 'DELETE') {
+    requireAuth($pdo);
+    $taskId=(int)$m[1]; $attId=(int)$m[2];
+    try {
+        $stmt = $pdo->prepare("SELECT file_path FROM task_attachments WHERE id=? AND task_id=?");
+        $stmt->execute([$attId,$taskId]); $att=$stmt->fetch();
+        if (!$att) sendResponse('error','Not found',null,404);
+        @unlink(__DIR__.'/'.$att['file_path']);
+        $pdo->prepare("DELETE FROM task_attachments WHERE id=?")->execute([$attId]);
+        sendResponse('success','Attachment deleted');
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
