@@ -320,8 +320,14 @@ if ($path === '/settings' && $method === 'POST') {
 if ($path === '/call-schedule' && $method === 'GET') {
     requireCallManager($pdo);
     try {
-        $rows = $pdo->query("SELECT cs.*, u.name as user_name, u.email as user_email FROM call_schedule cs JOIN users u ON u.id=cs.user_id WHERE cs.schedule_date IS NOT NULL ORDER BY cs.schedule_date, u.name")->fetchAll();
-        sendResponse('success','Schedule retrieved',['schedule'=>$rows]);
+        $month = $_GET['month'] ?? date('Y-m');
+        $start = $month . '-01';
+        $end   = date('Y-m-t', strtotime($start));
+        $rows  = $pdo->prepare("SELECT cs.*, u.name as user_name, u.email as user_email FROM call_schedule cs JOIN users u ON u.id=cs.user_id WHERE cs.schedule_date BETWEEN ? AND ? ORDER BY cs.schedule_date, u.name");
+        $rows->execute([$start, $end]);
+        $schedule = $rows->fetchAll();
+        $staff = $pdo->query("SELECT id, name, email FROM users WHERE is_active=1 ORDER BY name")->fetchAll();
+        sendResponse('success','Schedule retrieved',['schedule'=>$schedule,'staff'=>$staff]);
     } catch (\Throwable $e) { sendResponse('error','Failed to load schedule: '.$e->getMessage(),null,500); }
 }
 
