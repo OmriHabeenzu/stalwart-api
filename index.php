@@ -1639,6 +1639,24 @@ if ($path === '/diagnostics' && $method === 'GET') {
     sendResponse('success', 'Diagnostics', $report);
 }
 
+// ==========================================
+// BOOTSTRAP PULL (deploy extra files from GitHub)
+// ==========================================
+if ($path === '/deploy/pull' && $method === 'POST') {
+    if (($_GET['token'] ?? '') !== 'stalwart2026') sendResponse('error','Forbidden',null,403);
+    $data = getRequestData();
+    $allowed = ['diagnostic.php', 'deploy.php'];
+    $files = array_filter((array)($data['files'] ?? []), fn($f) => in_array($f, $allowed, true));
+    $results = [];
+    foreach ($files as $file) {
+        $content = @file_get_contents("https://raw.githubusercontent.com/OmriHabeenzu/stalwart-api/main/{$file}?t=".time());
+        if ($content === false) { $results[$file] = 'FAILED to fetch'; continue; }
+        file_put_contents(__DIR__ . '/' . $file, $content);
+        $results[$file] = 'OK (' . strlen($content) . ' bytes)';
+    }
+    sendResponse('success', 'Pulled', $results);
+}
+
 // 404
 sendResponse('error','Route not found',['path'=>$path,'method'=>$method],404);
 ?>
