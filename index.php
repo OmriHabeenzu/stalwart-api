@@ -303,7 +303,7 @@ if ($path === '/settings' && $method === 'GET') {
     } catch (\Throwable $e) { sendResponse('success','OK',['settings'=>[]]); }
 }
 
-if ($path === '/settings' && $method === 'POST') {
+if ($path === '/settings' && ($method === 'POST' || $method === 'PUT')) {
     requireAdmin($pdo);
     $data = getRequestData();
     try {
