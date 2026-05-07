@@ -71,6 +71,8 @@ try {
     try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN is_read TINYINT DEFAULT 0"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN phone VARCHAR(50) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE users ADD COLUMN can_manage_calls TINYINT DEFAULT 0"); } catch (\Throwable $e) {}
+    $pdo->exec("CREATE TABLE IF NOT EXISTS notifications (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT NOT NULL, type VARCHAR(50) DEFAULT 'info', title VARCHAR(255) NOT NULL, message TEXT, link VARCHAR(500), is_read TINYINT DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    try { $pdo->exec("ALTER TABLE notifications ADD INDEX idx_user_id (user_id)"); } catch (\Throwable $e) {}
 } catch (\Throwable $e) {}
 
 // HELPERS
@@ -253,8 +255,12 @@ if ($path === '/notifications' && $method === 'GET') {
     try {
         $stmt = $pdo->prepare("SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50");
         $stmt->execute([$user['id']]);
-        sendResponse('success','Notifications retrieved',['notifications'=>$stmt->fetchAll()]);
-    } catch (\Throwable $e) { sendResponse('success','OK',['notifications'=>[]]); }
+        $notifications = $stmt->fetchAll();
+        $unreadStmt = $pdo->prepare("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0");
+        $unreadStmt->execute([$user['id']]);
+        $unread = (int)$unreadStmt->fetchColumn();
+        sendResponse('success','Notifications retrieved',['notifications'=>$notifications,'unread_count'=>$unread]);
+    } catch (\Throwable $e) { sendResponse('success','OK',['notifications'=>[],'unread_count'=>0]); }
 }
 
 if (preg_match('#^/notifications/(\d+)/read$#',$path,$m) && $method === 'PUT') {
