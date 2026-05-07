@@ -111,9 +111,9 @@ try {
     $pdo->exec("CREATE TABLE IF NOT EXISTS team_members (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, position VARCHAR(255), bio TEXT, image_url VARCHAR(500), linkedin_url VARCHAR(500), sort_order INT DEFAULT 0, is_active TINYINT DEFAULT 1, media_id INT DEFAULT NULL, education TEXT, specialties TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     // testimonials: existing tables may use 'testimonial' column instead of 'content' — normalise both
     $pdo->exec("CREATE TABLE IF NOT EXISTS testimonials (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, position VARCHAR(255), company VARCHAR(255), content TEXT, testimonial TEXT, rating INT DEFAULT 5, approved TINYINT DEFAULT 0, image VARCHAR(500), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
-    try { $pdo->exec("ALTER TABLE testimonials ADD COLUMN IF NOT EXISTS content TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
-    try { $pdo->exec("ALTER TABLE testimonials ADD COLUMN IF NOT EXISTS testimonial TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
-    try { $pdo->exec("ALTER TABLE testimonials ADD COLUMN IF NOT EXISTS image VARCHAR(500) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE testimonials ADD COLUMN content TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE testimonials ADD COLUMN testimonial TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE testimonials ADD COLUMN image VARCHAR(500) DEFAULT NULL"); } catch (\Throwable $e) {}
     // copy legacy 'testimonial' → 'content' and vice-versa so both columns carry data
     try { $pdo->exec("UPDATE testimonials SET content=testimonial WHERE content IS NULL AND testimonial IS NOT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("UPDATE testimonials SET testimonial=content WHERE testimonial IS NULL AND content IS NOT NULL"); } catch (\Throwable $e) {}
@@ -200,6 +200,20 @@ function base64url_enc($d) { return rtrim(strtr(base64_encode($d),'+/','-_'),'='
 $path   = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $path   = '/' . trim(str_replace('/stalwart-api', '', $path), '/');
 $method = $_SERVER['REQUEST_METHOD'];
+
+// Serve static uploads directly (works around OLS not always honouring .htaccess !-f)
+if ($method === 'GET' && preg_match('#^/uploads/#', $path)) {
+    $file = __DIR__ . $path;
+    if (file_exists($file) && is_file($file)) {
+        $mime = mime_content_type($file) ?: 'application/octet-stream';
+        header('Content-Type: ' . $mime);
+        header('Cache-Control: public, max-age=86400');
+        header('Content-Length: ' . filesize($file));
+        readfile($file);
+        exit;
+    }
+    http_response_code(404); exit;
+}
 
 // ==========================================
 // AUTH
