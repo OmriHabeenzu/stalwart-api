@@ -110,7 +110,7 @@ try {
     try { $pdo->exec("ALTER TABLE team_members ADD COLUMN sort_order INT DEFAULT 0"); } catch (\Throwable $e) {}
     $pdo->exec("CREATE TABLE IF NOT EXISTS team_members (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, position VARCHAR(255), bio TEXT, image_url VARCHAR(500), linkedin_url VARCHAR(500), sort_order INT DEFAULT 0, is_active TINYINT DEFAULT 1, media_id INT DEFAULT NULL, education TEXT, specialties TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     // testimonials: existing tables may use 'testimonial' column instead of 'content' — normalise both
-    $pdo->exec("CREATE TABLE IF NOT EXISTS testimonials (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, position VARCHAR(255), company VARCHAR(255), content TEXT, testimonial TEXT, rating INT DEFAULT 5, approved TINYINT DEFAULT 0, image VARCHAR(500), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS testimonials (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, position VARCHAR(255), company VARCHAR(255), content TEXT, testimonial TEXT, rating INT DEFAULT 5, is_approved TINYINT DEFAULT 0, is_featured TINYINT DEFAULT 0, image VARCHAR(500), created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
     try { $pdo->exec("ALTER TABLE testimonials ADD COLUMN content TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE testimonials ADD COLUMN testimonial TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE testimonials ADD COLUMN image VARCHAR(500) DEFAULT NULL"); } catch (\Throwable $e) {}
@@ -592,7 +592,7 @@ if ($path === '/analytics/stats' && $method === 'GET') {
         $tasks = ['total'=>0,'completed'=>0,'pending'=>0];
         $loans = ['active_accounts'=>0,'total_payments'=>0,'pending_payments'=>0,'total_revenue'=>0];
         try { $apps['total']=(int)$pdo->query("SELECT COUNT(*) FROM job_applications")->fetchColumn(); $apps['pending']=(int)$pdo->query("SELECT COUNT(*) FROM job_applications WHERE status='pending'")->fetchColumn(); $apps['this_month']=(int)$pdo->query("SELECT COUNT(*) FROM job_applications WHERE MONTH(created_at)=MONTH(NOW()) AND YEAR(created_at)=YEAR(NOW())")->fetchColumn(); } catch(Exception $e){}
-        try { $tests['total']=(int)$pdo->query("SELECT COUNT(*) FROM testimonials")->fetchColumn(); $tests['approved']=(int)$pdo->query("SELECT COUNT(*) FROM testimonials WHERE approved=1")->fetchColumn(); $tests['pending']=$tests['total']-$tests['approved']; } catch(Exception $e){}
+        try { $tests['total']=(int)$pdo->query("SELECT COUNT(*) FROM testimonials")->fetchColumn(); $tests['approved']=(int)$pdo->query("SELECT COUNT(*) FROM testimonials WHERE is_approved=1")->fetchColumn(); $tests['pending']=$tests['total']-$tests['approved']; } catch(Exception $e){}
         try { $chats['total']=(int)$pdo->query("SELECT COUNT(*) FROM chat_sessions")->fetchColumn(); $chats['active']=(int)$pdo->query("SELECT COUNT(*) FROM chat_sessions WHERE status='active'")->fetchColumn(); $chats['messages']=(int)$pdo->query("SELECT COUNT(*) FROM chat_messages")->fetchColumn(); } catch(Exception $e){}
         try { $tasks['total']=(int)$pdo->query("SELECT COUNT(*) FROM tasks")->fetchColumn(); $tasks['completed']=(int)$pdo->query("SELECT COUNT(*) FROM tasks WHERE status='completed'")->fetchColumn(); $tasks['pending']=(int)$pdo->query("SELECT COUNT(*) FROM tasks WHERE status='pending'")->fetchColumn(); } catch(Exception $e){}
         try { $loans['active_accounts']=(int)$pdo->query("SELECT COUNT(*) FROM loan_accounts WHERE loan_status='active'")->fetchColumn(); $loans['total_payments']=(int)$pdo->query("SELECT COUNT(*) FROM loan_payments")->fetchColumn(); $loans['pending_payments']=(int)$pdo->query("SELECT COUNT(*) FROM loan_payments WHERE status='pending'")->fetchColumn(); $loans['total_revenue']=(float)$pdo->query("SELECT COALESCE(SUM(amount),0) FROM loan_payments WHERE status='completed'")->fetchColumn(); } catch(Exception $e){}
@@ -777,11 +777,11 @@ if ($path === '/testimonials' && $method === 'GET') {
     try {
         $authUser = getUserFromToken();
         $isAdmin = ($authUser && in_array($authUser['role'],['admin','super_admin','manager']));
-        $sel = "id,name,position,company,COALESCE(content,testimonial,'') AS content,COALESCE(content,testimonial,'') AS testimonial,rating,image,approved,created_at";
+        $sel = "id,name,position,company,COALESCE(content,testimonial,'') AS content,COALESCE(content,testimonial,'') AS testimonial,rating,image,is_approved AS approved,created_at";
         if ($isAdmin) {
             $rows = $pdo->query("SELECT {$sel} FROM testimonials ORDER BY created_at DESC")->fetchAll();
         } else {
-            $rows = $pdo->query("SELECT {$sel} FROM testimonials WHERE approved=1 ORDER BY created_at DESC LIMIT 20")->fetchAll();
+            $rows = $pdo->query("SELECT {$sel} FROM testimonials WHERE is_approved=1 ORDER BY created_at DESC LIMIT 20")->fetchAll();
         }
         sendResponse('success','Testimonials retrieved',['testimonials'=>$rows]);
     } catch (\Throwable $e) { sendResponse('success','OK',['testimonials'=>[]]); }
@@ -790,7 +790,7 @@ if ($path === '/testimonials' && $method === 'GET') {
 if ($path === '/testimonials/all' && $method === 'GET') {
     requireAdmin($pdo);
     try {
-        $sel = "id,name,position,company,COALESCE(content,testimonial,'') AS content,COALESCE(content,testimonial,'') AS testimonial,rating,image,approved,created_at";
+        $sel = "id,name,position,company,COALESCE(content,testimonial,'') AS content,COALESCE(content,testimonial,'') AS testimonial,rating,image,is_approved AS approved,created_at";
         $all = $pdo->query("SELECT {$sel} FROM testimonials ORDER BY created_at DESC")->fetchAll();
         sendResponse('success','All testimonials',['testimonials'=>$all]);
     } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
@@ -801,7 +801,7 @@ if ($path === '/testimonials' && $method === 'POST') {
     $name=trim($data['name']??''); $content=trim($data['content']??$data['testimonial']??'');
     if (empty($name)||empty($content)) sendResponse('error','Name and content required',null,400);
     try {
-        $pdo->prepare("INSERT INTO testimonials (name,position,company,content,testimonial,rating,approved) VALUES (?,?,?,?,?,?,0)")
+        $pdo->prepare("INSERT INTO testimonials (name,position,company,content,testimonial,rating,is_approved) VALUES (?,?,?,?,?,?,0)")
             ->execute([$name,$data['position']??'',$data['company']??'',$content,$content,(int)($data['rating']??5)]);
         sendResponse('success','Testimonial submitted',null,201);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
@@ -809,7 +809,7 @@ if ($path === '/testimonials' && $method === 'POST') {
 
 if (preg_match('#^/testimonials/(\d+)/approve$#',$path,$m) && $method === 'PUT') {
     requireAdmin($pdo);
-    try { $pdo->prepare("UPDATE testimonials SET approved=1 WHERE id=?")->execute([$m[1]]); sendResponse('success','Approved'); }
+    try { $pdo->prepare("UPDATE testimonials SET is_approved=1 WHERE id=?")->execute([$m[1]]); sendResponse('success','Approved'); }
     catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
 }
 
@@ -819,10 +819,10 @@ if (preg_match('#^/testimonials/(\d+)$#',$path,$m) && $method === 'PUT') {
     try {
         $status = $data['status'] ?? null;
         if ($status === 'approved') {
-            $pdo->prepare("UPDATE testimonials SET approved=1 WHERE id=?")->execute([$m[1]]);
+            $pdo->prepare("UPDATE testimonials SET is_approved=1 WHERE id=?")->execute([$m[1]]);
             sendResponse('success','Approved');
         } elseif ($status === 'rejected') {
-            $pdo->prepare("UPDATE testimonials SET approved=0 WHERE id=?")->execute([$m[1]]);
+            $pdo->prepare("UPDATE testimonials SET is_approved=0 WHERE id=?")->execute([$m[1]]);
             sendResponse('success','Rejected');
         }
         sendResponse('error','Unknown status',null,400);
