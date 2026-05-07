@@ -872,8 +872,8 @@ if ($path === '/settings/public' && $method === 'GET') {
                 } catch(Exception $e) {}
             }
         }
-        sendResponse('success','Public settings',$settings);
-    } catch (\Throwable $e) { sendResponse('success','OK',[]); }
+        sendResponse('success','Public settings',['settings'=>$settings]);
+    } catch (\Throwable $e) { sendResponse('success','OK',['settings'=>[]]); }
 }
 
 // ==========================================
