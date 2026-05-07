@@ -107,6 +107,9 @@ try {
     try { $pdo->exec("ALTER TABLE team_members ADD COLUMN specialties TEXT DEFAULT NULL"); } catch (\Throwable $e) {}
     $pdo->exec("CREATE TABLE IF NOT EXISTS team_members (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, position VARCHAR(255), bio TEXT, image_url VARCHAR(500), linkedin_url VARCHAR(500), sort_order INT DEFAULT 0, is_active TINYINT DEFAULT 1, media_id INT DEFAULT NULL, education TEXT, specialties TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     $pdo->exec("CREATE TABLE IF NOT EXISTS testimonials (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, position VARCHAR(255), company VARCHAR(255), content TEXT NOT NULL, rating INT DEFAULT 5, approved TINYINT DEFAULT 0, image VARCHAR(500), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS activity_logs (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, username VARCHAR(255), action VARCHAR(100), description TEXT, ip_address VARCHAR(45), user_agent TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    try { $pdo->exec("ALTER TABLE activity_logs ADD INDEX idx_action (action)"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE activity_logs ADD INDEX idx_created (created_at)"); } catch (\Throwable $e) {}
 } catch (\Throwable $e) {}
 
 // HELPERS
@@ -216,7 +219,7 @@ if ($path === '/auth/me' && $method === 'GET') {
         $stmt->execute([$user['id']]);
         $u = $stmt->fetch();
         if (!$u) sendResponse('error','User not found',null,404);
-        sendResponse('success','User retrieved',$u);
+        sendResponse('success','User retrieved',['user'=>$u]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
@@ -748,8 +751,14 @@ if ($path === '/admin/send-daily-reminders' && $method === 'POST') {
 // ==========================================
 if ($path === '/testimonials' && $method === 'GET') {
     try {
-        $approved = $pdo->query("SELECT id,name,position,company,content,content AS testimonial,rating,image,created_at FROM testimonials WHERE approved=1 ORDER BY created_at DESC LIMIT 20")->fetchAll();
-        sendResponse('success','Testimonials retrieved',['testimonials'=>$approved]);
+        $authUser = getUserFromToken();
+        $isAdmin = ($authUser && in_array($authUser['role'],['admin','super_admin','manager']));
+        if ($isAdmin) {
+            $rows = $pdo->query("SELECT *,content AS testimonial FROM testimonials ORDER BY created_at DESC")->fetchAll();
+        } else {
+            $rows = $pdo->query("SELECT id,name,position,company,content,content AS testimonial,rating,image,created_at FROM testimonials WHERE approved=1 ORDER BY created_at DESC LIMIT 20")->fetchAll();
+        }
+        sendResponse('success','Testimonials retrieved',['testimonials'=>$rows]);
     } catch (\Throwable $e) { sendResponse('success','OK',['testimonials'=>[]]); }
 }
 
@@ -778,6 +787,22 @@ if (preg_match('#^/testimonials/(\d+)/approve$#',$path,$m) && $method === 'PUT')
     catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
 }
 
+if (preg_match('#^/testimonials/(\d+)$#',$path,$m) && $method === 'PUT') {
+    requireAdmin($pdo);
+    $data = getRequestData();
+    try {
+        $status = $data['status'] ?? null;
+        if ($status === 'approved') {
+            $pdo->prepare("UPDATE testimonials SET approved=1 WHERE id=?")->execute([$m[1]]);
+            sendResponse('success','Approved');
+        } elseif ($status === 'rejected') {
+            $pdo->prepare("UPDATE testimonials SET approved=0 WHERE id=?")->execute([$m[1]]);
+            sendResponse('success','Rejected');
+        }
+        sendResponse('error','Unknown status',null,400);
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
 if (preg_match('#^/testimonials/(\d+)$#',$path,$m) && $method === 'DELETE') {
     requireAdmin($pdo);
     try { $pdo->prepare("DELETE FROM testimonials WHERE id=?")->execute([$m[1]]); sendResponse('success','Deleted'); }
@@ -793,14 +818,17 @@ if ($path === '/settings/public' && $method === 'GET') {
         $settings = [];
         foreach ($rows as $r) $settings[$r['setting_key']] = $r['setting_value'];
         // Resolve logo URLs
-        $apiBase = (isset($_SERVER['HTTPS'])&&$_SERVER['HTTPS']==='on'?'https':'http').'://'.$_SERVER['HTTP_HOST'];
         foreach (['main_logo_id','footer_logo_id','favicon_id'] as $key) {
             if (!empty($settings[$key])) {
                 try {
                     $stmt = $pdo->prepare("SELECT file_path FROM media WHERE id=?");
                     $stmt->execute([$settings[$key]]);
                     $media = $stmt->fetch();
-                    if ($media) $settings[str_replace('_id','',$key).'_url'] = $apiBase.'/'.$media['file_path'];
+                    if ($media) {
+                        $fp = $media['file_path'];
+                        if (strpos($fp,'http')===0) { $p=parse_url($fp); $fp=ltrim($p['path']??$fp,'/'); }
+                        $settings[$key] = $fp; // replace numeric ID with relative path
+                    }
                 } catch(Exception $e) {}
             }
         }
@@ -1403,12 +1431,22 @@ if (preg_match('#^/admin/contacts/(\d+)/read$#',$path,$m) && $method === 'PUT') 
 if ($path === '/activity-logs' && $method === 'GET') {
     requireAdmin($pdo);
     try {
-        $limit = min((int)($_GET['limit']??50),200);
+        $limit = min((int)($_GET['limit']??100),200);
         $offset = (int)($_GET['offset']??0);
-        $logs = $pdo->query("SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT {$limit} OFFSET {$offset}")->fetchAll();
-        $total = (int)$pdo->query("SELECT COUNT(*) FROM activity_logs")->fetchColumn();
-        sendResponse('success','Logs retrieved',['logs'=>$logs,'total'=>$total]);
-    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+        $where = []; $params = [];
+        if (!empty($_GET['action'])) { $where[] = 'action=?'; $params[] = $_GET['action']; }
+        if (!empty($_GET['date_from'])) { $where[] = 'DATE(created_at)>=?'; $params[] = $_GET['date_from']; }
+        if (!empty($_GET['date_to'])) { $where[] = 'DATE(created_at)<=?'; $params[] = $_GET['date_to']; }
+        $wSql = $where ? 'WHERE '.implode(' AND ',$where) : '';
+        $stmt = $pdo->prepare("SELECT * FROM activity_logs {$wSql} ORDER BY created_at DESC LIMIT {$limit} OFFSET {$offset}");
+        $stmt->execute($params);
+        $logs = $stmt->fetchAll();
+        $countStmt = $pdo->prepare("SELECT COUNT(*) FROM activity_logs {$wSql}");
+        $countStmt->execute($params);
+        $total = (int)$countStmt->fetchColumn();
+        $actions = $pdo->query("SELECT DISTINCT action FROM activity_logs ORDER BY action")->fetchAll(PDO::FETCH_COLUMN);
+        sendResponse('success','Logs retrieved',['logs'=>$logs,'total'=>$total,'actions'=>$actions]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
 // ==========================================
