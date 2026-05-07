@@ -97,6 +97,9 @@ try {
     try { $pdo->exec("ALTER TABLE users ADD COLUMN profile_image VARCHAR(500) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE users ADD COLUMN last_login DATETIME DEFAULT NULL"); } catch (\Throwable $e) {}
     $pdo->exec("CREATE TABLE IF NOT EXISTS notices (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255) NOT NULL, message TEXT NOT NULL, type VARCHAR(50) DEFAULT 'info', pinned TINYINT DEFAULT 0, created_by INT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    try { $pdo->exec("ALTER TABLE notices MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT, ADD PRIMARY KEY (id)"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE notices ADD COLUMN created_by_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE notices ADD COLUMN is_active TINYINT DEFAULT 1"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN is_read TINYINT DEFAULT 0"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN phone VARCHAR(50) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE users ADD COLUMN can_manage_calls TINYINT DEFAULT 0"); } catch (\Throwable $e) {}
@@ -1427,8 +1430,9 @@ if ($path === '/notices' && $method === 'POST') {
         $nameRow = $pdo->prepare("SELECT name FROM users WHERE id=?");
         $nameRow->execute([$user['id']]);
         $posterName = $nameRow->fetchColumn() ?: $user['email'];
-        $pdo->prepare("INSERT INTO notices (title,message,type,pinned,created_by_name) VALUES (?,?,?,?,?)")
-            ->execute([trim($data['title']??''),trim($data['message']??''),$data['type']??'info',(int)($data['pinned']??0),$posterName]);
+        $nextId = (int)$pdo->query("SELECT COALESCE(MAX(id),0)+1 FROM notices")->fetchColumn();
+        $pdo->prepare("INSERT INTO notices (id,title,message,type,pinned,created_by_name) VALUES (?,?,?,?,?,?)")
+            ->execute([$nextId,trim($data['title']??''),trim($data['message']??''),$data['type']??'info',(int)($data['pinned']??0),$posterName]);
         sendResponse('success','Notice posted',['id'=>$pdo->lastInsertId()],201);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
