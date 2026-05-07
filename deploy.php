@@ -11,7 +11,7 @@ $files   = ['index.php', '.htaccess'];
 $results = [];
 
 foreach ($files as $file) {
-    $url     = "https://raw.githubusercontent.com/{$repo}/{$branch}/{$file}";
+    $url     = "https://raw.githubusercontent.com/{$repo}/{$branch}/{$file}?t=" . time();
     $content = @file_get_contents($url);
     if ($content === false) { $results[$file] = 'FAILED to fetch'; continue; }
     if (file_put_contents(__DIR__ . '/' . $file, $content) === false) { $results[$file] = 'FAILED to write'; continue; }
