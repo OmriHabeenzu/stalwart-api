@@ -443,16 +443,20 @@ if ($path === '/call-schedule' && $method === 'POST') {
 }
 
 if ($path === '/call-schedule/today' && $method === 'GET') {
-    requireAuth($pdo);
+    $user = requireAuth($pdo);
     try {
         $today = date('Y-m-d');
         $stmt = $pdo->prepare("SELECT cs.role, cs.user_id, u.name as user_name FROM call_schedule cs JOIN users u ON u.id=cs.user_id WHERE cs.schedule_date=? ORDER BY cs.role, u.name");
         $stmt->execute([$today]);
         $rows = $stmt->fetchAll();
-        $callers = array_values(array_filter($rows, fn($r) => $r['role']==='caller'));
+        $callers   = array_values(array_filter($rows, fn($r) => $r['role']==='caller'));
         $followups = array_values(array_filter($rows, fn($r) => $r['role']==='followup'));
-        sendResponse('success','Today schedule',['callers'=>$callers,'followups'=>$followups,'date'=>$today]);
-    } catch (\Throwable $e) { sendResponse('success','OK',['callers'=>[],'followups'=>[],'date'=>date('Y-m-d')]); }
+        $myRole = null;
+        foreach ($callers   as $c) { if ((int)$c['user_id']===(int)$user['id']) { $myRole='caller';   break; } }
+        foreach ($followups as $f) { if ((int)$f['user_id']===(int)$user['id']) { $myRole='followup'; break; } }
+        // Wrap in 'today' key — frontend reads res.data.data.today
+        sendResponse('success','Today schedule',['today'=>['callers'=>$callers,'followups'=>$followups,'my_role'=>$myRole,'date'=>$today]]);
+    } catch (\Throwable $e) { sendResponse('success','OK',['today'=>['callers'=>[],'followups'=>[],'my_role'=>null,'date'=>date('Y-m-d')]]); }
 }
 
 // ==========================================
