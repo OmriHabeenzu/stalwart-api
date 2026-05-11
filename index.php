@@ -100,7 +100,7 @@ try {
     try { $pdo->exec("ALTER TABLE notices MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT, ADD PRIMARY KEY (id)"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE notices ADD COLUMN created_by_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE notices ADD COLUMN is_active TINYINT DEFAULT 1"); } catch (\Throwable $e) {}
-    $pdo->exec("CREATE TABLE IF NOT EXISTS contact_submissions (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL, phone VARCHAR(50) DEFAULT NULL, subject VARCHAR(255) DEFAULT NULL, message TEXT NOT NULL, is_read TINYINT DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS contact_submissions (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL, phone VARCHAR(50) DEFAULT NULL, subject VARCHAR(255) DEFAULT NULL, message TEXT NOT NULL, ip_address VARCHAR(100) DEFAULT NULL, user_agent VARCHAR(500) DEFAULT NULL, is_spam TINYINT DEFAULT 0, spam_reason VARCHAR(255) DEFAULT NULL, is_read TINYINT DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN is_read TINYINT DEFAULT 0"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN phone VARCHAR(50) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN subject VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
@@ -1321,8 +1321,10 @@ if ($path === '/contact' && $method === 'POST') {
     $name=trim($data['name']??''); $email=trim($data['email']??''); $message=trim($data['message']??'');
     if (empty($name)||empty($email)||empty($message)) sendResponse('error','All fields required',null,400);
     try {
-        $pdo->prepare("INSERT INTO contact_submissions (name,email,phone,subject,message) VALUES (?,?,?,?,?)")
-            ->execute([$name,$email,$data['phone']??'',$data['subject']??'General Enquiry',$message]);
+        $ip = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['REMOTE_ADDR'] ?? '';
+        $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+        $pdo->prepare("INSERT INTO contact_submissions (name,email,phone,subject,message,ip_address,user_agent,is_spam) VALUES (?,?,?,?,?,?,?,0)")
+            ->execute([$name,$email,$data['phone']??'',$data['subject']??'General Enquiry',$message,$ip,$ua]);
         sendResponse('success','Message sent. We will get back to you soon.');
     } catch (\Throwable $e) { sendResponse('error','Failed to submit: '.$e->getMessage(),null,500); }
 }
