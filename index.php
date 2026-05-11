@@ -222,7 +222,7 @@ if ($method === 'GET' && preg_match('#^/uploads/#', $path)) {
     if (file_exists($file) && is_file($file)) {
         $mime = mime_content_type($file) ?: 'application/octet-stream';
         header('Content-Type: ' . $mime);
-        header('Cache-Control: public, max-age=86400');
+        header('Cache-Control: public, max-age=31536000, immutable');
         header('Content-Length: ' . filesize($file));
         readfile($file);
         exit;
@@ -1367,13 +1367,35 @@ if ($path === '/media/upload' && $method === 'POST') {
     $uploadDir = __DIR__ . '/uploads/';
     if (!is_dir($uploadDir)) mkdir($uploadDir, 0755, true);
     $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
-    $filename = uniqid('img_', true) . '.' . $ext;
+    // Convert PNG/GIF to JPEG for smaller size (except SVG/WebP which stay as-is)
+    $convertToJpeg = in_array($file['type'], ['image/png','image/gif']);
+    $outExt = ($convertToJpeg || $file['type']==='image/jpeg') ? 'jpg' : $ext;
+    $filename = uniqid('img_', true) . '.' . $outExt;
     $targetPath = $uploadDir . $filename;
     if (!move_uploaded_file($file['tmp_name'], $targetPath)) sendResponse('error','Failed to save file',null,500);
+    // Resize + compress with GD if available
+    if (function_exists('imagecreatefromstring') && in_array($file['type'], ['image/jpeg','image/png','image/gif'])) {
+        $src = imagecreatefromstring(file_get_contents($targetPath));
+        if ($src) {
+            $ow = imagesx($src); $oh = imagesy($src);
+            $maxW = 1920; $maxH = 1920;
+            if ($ow > $maxW || $oh > $maxH) {
+                $ratio = min($maxW/$ow, $maxH/$oh);
+                $nw = (int)round($ow*$ratio); $nh = (int)round($oh*$ratio);
+                $dst = imagecreatetruecolor($nw, $nh);
+                imagecopyresampled($dst,$src,0,0,0,0,$nw,$nh,$ow,$oh);
+                imagedestroy($src); $src = $dst;
+            }
+            imagejpeg($src, $targetPath, 82);
+            imagedestroy($src);
+            clearstatcache(true, $targetPath);
+        }
+    }
     $filePath = 'uploads/' . $filename;
     try {
         $cols = array_column($pdo->query("SHOW COLUMNS FROM media")->fetchAll(), 'Field');
-        $insert = ['file_name'=>$filename,'original_filename'=>$file['name'],'file_path'=>$filePath,'file_type'=>$file['type'],'file_size'=>$file['size']];
+        $actualSize = file_exists($targetPath) ? filesize($targetPath) : $file['size'];
+        $insert = ['file_name'=>$filename,'original_filename'=>$file['name'],'file_path'=>$filePath,'file_type'=>'image/jpeg','file_size'=>$actualSize];
         if (in_array('filename', $cols)) $insert['filename'] = $filename;
         if (in_array('uploaded_by', $cols)) $insert['uploaded_by'] = $user['id'];
         if (in_array('title', $cols)) $insert['title'] = $file['name'];
