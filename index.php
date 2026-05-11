@@ -100,8 +100,10 @@ try {
     try { $pdo->exec("ALTER TABLE notices MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT, ADD PRIMARY KEY (id)"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE notices ADD COLUMN created_by_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE notices ADD COLUMN is_active TINYINT DEFAULT 1"); } catch (\Throwable $e) {}
+    $pdo->exec("CREATE TABLE IF NOT EXISTS contact_submissions (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL, phone VARCHAR(50) DEFAULT NULL, subject VARCHAR(255) DEFAULT NULL, message TEXT NOT NULL, is_read TINYINT DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN is_read TINYINT DEFAULT 0"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN phone VARCHAR(50) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN subject VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE users ADD COLUMN can_manage_calls TINYINT DEFAULT 0"); } catch (\Throwable $e) {}
     $pdo->exec("CREATE TABLE IF NOT EXISTS notifications (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT NOT NULL, type VARCHAR(50) DEFAULT 'info', title VARCHAR(255) NOT NULL, message TEXT, link VARCHAR(500), is_read TINYINT DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     try { $pdo->exec("ALTER TABLE notifications ADD INDEX idx_user_id (user_id)"); } catch (\Throwable $e) {}
@@ -1322,7 +1324,7 @@ if ($path === '/contact' && $method === 'POST') {
         $pdo->prepare("INSERT INTO contact_submissions (name,email,phone,subject,message) VALUES (?,?,?,?,?)")
             ->execute([$name,$email,$data['phone']??'',$data['subject']??'General Enquiry',$message]);
         sendResponse('success','Message sent. We will get back to you soon.');
-    } catch (\Throwable $e) { sendResponse('error','Failed to submit',null,500); }
+    } catch (\Throwable $e) { sendResponse('error','Failed to submit: '.$e->getMessage(),null,500); }
 }
 
 // ==========================================
