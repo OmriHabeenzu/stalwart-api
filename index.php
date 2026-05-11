@@ -101,6 +101,7 @@ try {
     try { $pdo->exec("ALTER TABLE notices ADD COLUMN created_by_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE notices ADD COLUMN is_active TINYINT DEFAULT 1"); } catch (\Throwable $e) {}
     $pdo->exec("CREATE TABLE IF NOT EXISTS contact_submissions (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL, phone VARCHAR(50) DEFAULT NULL, subject VARCHAR(255) DEFAULT NULL, message TEXT NOT NULL, ip_address VARCHAR(100) DEFAULT NULL, user_agent VARCHAR(500) DEFAULT NULL, is_spam TINYINT DEFAULT 0, spam_reason VARCHAR(255) DEFAULT NULL, is_read TINYINT DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    try { $pdo->exec("ALTER TABLE contact_submissions MODIFY id INT NOT NULL AUTO_INCREMENT"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN is_read TINYINT DEFAULT 0"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN phone VARCHAR(50) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE contact_submissions ADD COLUMN subject VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
