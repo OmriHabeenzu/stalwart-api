@@ -900,24 +900,26 @@ if ($path === '/profile' && $method === 'PUT') {
 // ==========================================
 if ($path === '/admin/send-daily-reminders' && $method === 'POST') {
     requireAdmin($pdo);
-    $today=$date=date('Y-m-d'); $weekday=(int)date('N');
+    $today=date('Y-m-d'); $weekday=(int)date('N');
     $dayNames=[1=>'Monday',2=>'Tuesday',3=>'Wednesday',4=>'Thursday',5=>'Friday'];
     $dayName=$dayNames[$weekday]??date('l');
-    $sent=0;
+    $emailsSent=0; $scheduleEntries=0;
     try {
         if ($weekday>=1&&$weekday<=5) {
             $stmt=$pdo->prepare("SELECT cs.role,cs.user_id,u.name,u.email FROM call_schedule cs JOIN users u ON u.id=cs.user_id WHERE cs.schedule_date=?");
             $stmt->execute([$today]); $scheduled=$stmt->fetchAll();
+            $scheduleEntries=count($scheduled);
             $callerIndex=0; $totalCallers=count(array_filter($scheduled,fn($r)=>$r['role']==='caller'));
             foreach ($scheduled as $r) {
                 $roleLabel=$r['role']==='caller'?'making calls':'follow-up on unanswered calls';
                 $callerNote='';
                 if ($r['role']==='caller'&&$totalCallers>=2) { $half=$callerIndex===0?'first half':'second half'; $callerNote=" (you are responsible for the {$half} of today's client list)"; $callerIndex++; }
-                createNotification($pdo,(int)$r['user_id'],'reminder',"Reminder: You are on {$dayName} call duty","You are assigned to {$roleLabel} today{$callerNote}.","/dashboard/call-report");
-                if (!empty($r['email'])) { sendEmail($r['email'],$r['name'],"📞 Call Duty Reminder — {$dayName}","<p>Hello {$r['name']},</p><p>You are scheduled for <strong>{$roleLabel}</strong> today{$callerNote}.</p>"); $sent++; }
+                createNotification($pdo,(int)$r['user_id'],'reminder',"You are on {$dayName} call duty","You are assigned to {$roleLabel} today{$callerNote}.","/dashboard/call-report");
+                if (!empty($r['email'])) { sendEmail($r['email'],$r['name'],"📞 Call Duty Reminder — {$dayName}","<p>Hello {$r['name']},</p><p>You are scheduled for <strong>{$roleLabel}</strong> today{$callerNote}.</p>"); $emailsSent++; }
             }
         }
-        sendResponse('success',"Reminders sent",['sent'=>$sent]);
+        $dueTasks=(int)$pdo->query("SELECT COUNT(*) FROM tasks WHERE due_date='{$today}' AND status!='completed'")->fetchColumn();
+        sendResponse('success',"Reminders sent to {$scheduleEntries} staff member(s)",['emails_sent'=>$emailsSent,'schedule_entries'=>$scheduleEntries,'due_tasks'=>$dueTasks]);
     } catch (\Throwable $e) { sendResponse('error','Failed to send reminders: '.$e->getMessage(),null,500); }
 }
 
@@ -1642,6 +1644,35 @@ if ($path === '/activity-logs' && $method === 'GET') {
 // ==========================================
 if ($path === '/auth/check-reminders' && $method === 'POST') {
     $user = requireAuth($pdo);
+    try {
+        $today = date('Y-m-d'); $weekday = (int)date('N');
+        // Call duty reminder — only weekdays, only if not already sent today
+        if ($weekday >= 1 && $weekday <= 5) {
+            $stmt = $pdo->prepare("SELECT cs.role FROM call_schedule cs WHERE cs.user_id=? AND cs.schedule_date=?");
+            $stmt->execute([$user['id'], $today]);
+            $mySchedule = $stmt->fetch();
+            if ($mySchedule) {
+                $already = $pdo->prepare("SELECT id FROM notifications WHERE user_id=? AND type='reminder' AND link='/dashboard/call-report' AND DATE(created_at)=?");
+                $already->execute([$user['id'], $today]);
+                if (!$already->fetch()) {
+                    $dayName = date('l');
+                    $roleLabel = $mySchedule['role']==='caller' ? 'making calls' : 'follow-up on unanswered calls';
+                    createNotification($pdo,(int)$user['id'],'reminder',"You're on call duty today","You are scheduled for {$roleLabel} today ({$dayName}).","/dashboard/call-report");
+                }
+            }
+        }
+        // Due tasks reminder — only if not already sent today
+        $alreadyTask = $pdo->prepare("SELECT id FROM notifications WHERE user_id=? AND type='task' AND DATE(created_at)=? AND title LIKE '%due today%'");
+        $alreadyTask->execute([$user['id'], $today]);
+        if (!$alreadyTask->fetch()) {
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM tasks t JOIN task_assignees ta ON ta.task_id=t.id WHERE ta.user_id=? AND t.due_date=? AND t.status!='completed'");
+            $stmt->execute([$user['id'], $today]);
+            $dueTasks = (int)$stmt->fetchColumn();
+            if ($dueTasks > 0) {
+                createNotification($pdo,(int)$user['id'],'task',"{$dueTasks} task(s) due today","You have {$dueTasks} task(s) due today. Check your task list.","/dashboard/tasks");
+            }
+        }
+    } catch (\Throwable $e) {}
     sendResponse('success','OK');
 }
 
