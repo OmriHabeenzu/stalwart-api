@@ -1165,6 +1165,7 @@ if ($path === '/content/page-text/schema' && $method === 'GET') {
 // ==========================================
 if ($path === '/careers' && $method === 'GET') {
     try {
+        $pdo->exec("CREATE TABLE IF NOT EXISTS job_listings (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255) NOT NULL, department VARCHAR(100) DEFAULT NULL, location VARCHAR(100) DEFAULT NULL, type VARCHAR(50) DEFAULT 'full-time', description TEXT, requirements TEXT, salary_range VARCHAR(100) DEFAULT NULL, is_active TINYINT DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
         $jobs = $pdo->query("SELECT * FROM job_listings WHERE is_active=1 ORDER BY created_at DESC")->fetchAll();
         sendResponse('success','Jobs retrieved',['jobs'=>$jobs]);
     } catch (\Throwable $e) { sendResponse('success','OK',['jobs'=>[]]); }
@@ -1203,9 +1204,11 @@ if (preg_match('#^/careers/(\d+)$#',$path,$m) && $method === 'DELETE') {
 if ($path === '/careers/applications' && $method === 'GET') {
     requireAdmin($pdo);
     try {
+        $pdo->exec("CREATE TABLE IF NOT EXISTS job_listings (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255) NOT NULL, department VARCHAR(100) DEFAULT NULL, location VARCHAR(100) DEFAULT NULL, type VARCHAR(50) DEFAULT 'full-time', description TEXT, requirements TEXT, salary_range VARCHAR(100) DEFAULT NULL, is_active TINYINT DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+        $pdo->exec("CREATE TABLE IF NOT EXISTS job_applications (id INT AUTO_INCREMENT PRIMARY KEY, job_id INT DEFAULT NULL, name VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL, phone VARCHAR(50) DEFAULT NULL, cover_letter TEXT, status VARCHAR(50) DEFAULT 'pending', notes TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
         $apps = $pdo->query("SELECT ja.*,jl.title as job_title FROM job_applications ja LEFT JOIN job_listings jl ON jl.id=ja.job_id ORDER BY ja.created_at DESC")->fetchAll();
         sendResponse('success','Applications retrieved',['applications'=>$apps]);
-    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
 if (preg_match('#^/careers/(\d+)/apply$#',$path,$m) && $method === 'POST') {
