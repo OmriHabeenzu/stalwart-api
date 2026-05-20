@@ -140,6 +140,8 @@ try {
     try { $pdo->exec("ALTER TABLE task_attachments ADD COLUMN mime_type VARCHAR(100) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE task_attachments MODIFY COLUMN uploaded_by_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE task_attachments ADD COLUMN uploaded_by_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
+    $pdo->exec("CREATE TABLE IF NOT EXISTS job_listings (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255) NOT NULL, department VARCHAR(100) DEFAULT NULL, location VARCHAR(100) DEFAULT NULL, type VARCHAR(50) DEFAULT 'full-time', description TEXT, requirements TEXT, salary_range VARCHAR(100) DEFAULT NULL, is_active TINYINT DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS job_applications (id INT AUTO_INCREMENT PRIMARY KEY, job_id INT DEFAULT NULL, name VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL, phone VARCHAR(50) DEFAULT NULL, cover_letter TEXT, status VARCHAR(50) DEFAULT 'pending', notes TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
 } catch (\Throwable $e) {}
 
 // HELPERS
