@@ -1163,20 +1163,44 @@ if ($path === '/content/page-text/schema' && $method === 'GET') {
 // ==========================================
 // CAREERS
 // ==========================================
+// CAREERS — shared inline schema helper
+function ensureCareersTables($pdo) {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS job_listings (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255) NOT NULL, department VARCHAR(100) DEFAULT NULL, location VARCHAR(100) DEFAULT NULL, type VARCHAR(50) DEFAULT 'Full-time', job_type VARCHAR(50) DEFAULT 'Full-time', description TEXT, requirements TEXT, responsibilities TEXT, salary_range VARCHAR(100) DEFAULT NULL, deadline DATE DEFAULT NULL, is_active TINYINT DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS job_applications (id INT AUTO_INCREMENT PRIMARY KEY, job_id INT DEFAULT NULL, name VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL, phone VARCHAR(50) DEFAULT NULL, cover_letter TEXT, qualification VARCHAR(50) DEFAULT NULL, qualification_other VARCHAR(255) DEFAULT NULL, cv_path VARCHAR(500) DEFAULT NULL, cv_filename VARCHAR(255) DEFAULT NULL, academic_doc_path VARCHAR(500) DEFAULT NULL, academic_doc_filename VARCHAR(255) DEFAULT NULL, status VARCHAR(50) DEFAULT 'pending', notes TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    foreach (['job_type VARCHAR(50) DEFAULT \'Full-time\'','deadline DATE DEFAULT NULL','responsibilities TEXT DEFAULT NULL'] as $col) {
+        try { $pdo->exec("ALTER TABLE job_listings ADD COLUMN IF NOT EXISTS $col"); } catch (\Throwable $e) {}
+    }
+    foreach (['qualification VARCHAR(50) DEFAULT NULL','qualification_other VARCHAR(255) DEFAULT NULL','cv_path VARCHAR(500) DEFAULT NULL','cv_filename VARCHAR(255) DEFAULT NULL','academic_doc_path VARCHAR(500) DEFAULT NULL','academic_doc_filename VARCHAR(255) DEFAULT NULL'] as $col) {
+        try { $pdo->exec("ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS $col"); } catch (\Throwable $e) {}
+    }
+}
+
 if ($path === '/careers' && $method === 'GET') {
     try {
-        $pdo->exec("CREATE TABLE IF NOT EXISTS job_listings (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255) NOT NULL, department VARCHAR(100) DEFAULT NULL, location VARCHAR(100) DEFAULT NULL, type VARCHAR(50) DEFAULT 'full-time', description TEXT, requirements TEXT, salary_range VARCHAR(100) DEFAULT NULL, is_active TINYINT DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
-        $jobs = $pdo->query("SELECT * FROM job_listings WHERE is_active=1 ORDER BY created_at DESC")->fetchAll();
+        ensureCareersTables($pdo);
+        $jobs = $pdo->query("SELECT *, COALESCE(NULLIF(job_type,''),type) as job_type FROM job_listings WHERE is_active=1 ORDER BY created_at DESC")->fetchAll();
         sendResponse('success','Jobs retrieved',['jobs'=>$jobs]);
     } catch (\Throwable $e) { sendResponse('success','OK',['jobs'=>[]]); }
+}
+
+if ($path === '/careers/admin/jobs' && $method === 'GET') {
+    requireAdmin($pdo);
+    try {
+        ensureCareersTables($pdo);
+        $jobs = $pdo->query("SELECT *, COALESCE(NULLIF(job_type,''),type) as job_type FROM job_listings ORDER BY created_at DESC")->fetchAll();
+        sendResponse('success','Jobs retrieved',['jobs'=>$jobs]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
 if ($path === '/careers' && $method === 'POST') {
     requireAdmin($pdo);
     $data = getRequestData();
     try {
-        $pdo->prepare("INSERT INTO job_listings (title,department,location,type,description,requirements,salary_range,is_active) VALUES (?,?,?,?,?,?,?,1)")
-            ->execute([$data['title']??'',$data['department']??'',$data['location']??'',$data['type']??'full-time',$data['description']??'',$data['requirements']??'',$data['salary_range']??'']);
+        ensureCareersTables($pdo);
+        $jobType = $data['job_type'] ?? $data['type'] ?? 'Full-time';
+        $deadline = !empty($data['deadline']) ? $data['deadline'] : null;
+        $pdo->prepare("INSERT INTO job_listings (title,department,location,type,job_type,description,requirements,responsibilities,salary_range,deadline,is_active) VALUES (?,?,?,?,?,?,?,?,?,?,1)")
+            ->execute([$data['title']??'',$data['department']??'',$data['location']??'',$jobType,$jobType,$data['description']??'',$data['requirements']??'',$data['responsibilities']??'',$data['salary_range']??'',$deadline]);
         sendResponse('success','Job created',['id'=>$pdo->lastInsertId()],201);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
@@ -1185,14 +1209,21 @@ if (preg_match('#^/careers/(\d+)$#',$path,$m) && $method === 'PUT') {
     requireAdmin($pdo);
     $data = getRequestData();
     try {
+        ensureCareersTables($pdo);
         $fields=[]; $vals=[];
-        foreach (['title','department','location','type','description','requirements','salary_range','is_active'] as $f) {
-            if (isset($data[$f])) { $fields[]="$f=?"; $vals[]=$data[$f]; }
+        foreach (['title','department','location','description','requirements','responsibilities','salary_range','is_active'] as $f) {
+            if (array_key_exists($f,$data)) { $fields[]="$f=?"; $vals[]=$data[$f]; }
         }
+        if (array_key_exists('job_type',$data)||array_key_exists('type',$data)) {
+            $jt=$data['job_type']??$data['type'];
+            $fields[]='type=?'; $vals[]=$jt;
+            $fields[]='job_type=?'; $vals[]=$jt;
+        }
+        if (array_key_exists('deadline',$data)) { $fields[]='deadline=?'; $vals[]=!empty($data['deadline'])?$data['deadline']:null; }
         $vals[]=(int)$m[1];
         $pdo->prepare("UPDATE job_listings SET ".implode(',',$fields)." WHERE id=?")->execute($vals);
         sendResponse('success','Updated');
-    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
 if (preg_match('#^/careers/(\d+)$#',$path,$m) && $method === 'DELETE') {
@@ -1204,27 +1235,46 @@ if (preg_match('#^/careers/(\d+)$#',$path,$m) && $method === 'DELETE') {
 if ($path === '/careers/applications' && $method === 'GET') {
     requireAdmin($pdo);
     try {
-        $pdo->exec("CREATE TABLE IF NOT EXISTS job_listings (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255) NOT NULL, department VARCHAR(100) DEFAULT NULL, location VARCHAR(100) DEFAULT NULL, type VARCHAR(50) DEFAULT 'full-time', description TEXT, requirements TEXT, salary_range VARCHAR(100) DEFAULT NULL, is_active TINYINT DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
-        $pdo->exec("CREATE TABLE IF NOT EXISTS job_applications (id INT AUTO_INCREMENT PRIMARY KEY, job_id INT DEFAULT NULL, name VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL, phone VARCHAR(50) DEFAULT NULL, cover_letter TEXT, status VARCHAR(50) DEFAULT 'pending', notes TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
-        $apps = $pdo->query("SELECT ja.*,jl.title as job_title FROM job_applications ja LEFT JOIN job_listings jl ON jl.id=ja.job_id ORDER BY ja.created_at DESC")->fetchAll();
+        ensureCareersTables($pdo);
+        $apps = $pdo->query("SELECT ja.*, ja.name as full_name, jl.title as job_title FROM job_applications ja LEFT JOIN job_listings jl ON jl.id=ja.job_id ORDER BY ja.created_at DESC")->fetchAll();
         sendResponse('success','Applications retrieved',['applications'=>$apps]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
+function handleApplicationUpload($fileKey, $subdir) {
+    if (!isset($_FILES[$fileKey]) || $_FILES[$fileKey]['error'] !== UPLOAD_ERR_OK) return [null, null];
+    $uploadDir = __DIR__ . '/uploads/' . $subdir . '/';
+    if (!is_dir($uploadDir)) mkdir($uploadDir, 0755, true);
+    $origName = $_FILES[$fileKey]['name'];
+    $ext = strtolower(pathinfo($origName, PATHINFO_EXTENSION));
+    $storedName = uniqid($fileKey . '_', true) . '.' . $ext;
+    $destPath = $uploadDir . $storedName;
+    if (!move_uploaded_file($_FILES[$fileKey]['tmp_name'], $destPath)) return [null, null];
+    return ['uploads/' . $subdir . '/' . $storedName, $origName];
+}
+
 if (preg_match('#^/careers/(\d+)/apply$#',$path,$m) && $method === 'POST') {
-    $data = getRequestData();
+    $data = $_POST;
     try {
-        $pdo->prepare("INSERT INTO job_applications (job_id,name,email,phone,cover_letter,status) VALUES (?,?,?,?,?,'pending')")
-            ->execute([$m[1],$data['name']??'',$data['email']??'',$data['phone']??'',$data['cover_letter']??'']);
+        ensureCareersTables($pdo);
+        [$cvPath,$cvFilename] = handleApplicationUpload('cv','applications');
+        [$acadPath,$acadFilename] = handleApplicationUpload('academic_doc','applications');
+        $qual = $data['qualification'] ?? '';
+        if ($qual === 'other') $qual = $data['qualification_other'] ?? $qual;
+        $pdo->prepare("INSERT INTO job_applications (job_id,name,email,phone,cover_letter,qualification,qualification_other,cv_path,cv_filename,academic_doc_path,academic_doc_filename,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending')")
+            ->execute([$m[1],$data['full_name']??$data['name']??'',$data['email']??'',$data['phone']??'',$data['cover_letter']??'',$data['qualification']??'',$data['qualification_other']??'',$cvPath,$cvFilename,$acadPath,$acadFilename]);
         sendResponse('success','Application submitted',null,201);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
 if ($path === '/careers/general/apply' && $method === 'POST') {
-    $data = getRequestData();
+    $data = $_POST;
     try {
-        $pdo->prepare("INSERT INTO job_applications (job_id,name,email,phone,cover_letter,status) VALUES (NULL,?,?,?,?,'pending')")
-            ->execute([$data['name']??'',$data['email']??'',$data['phone']??'',$data['cover_letter']??'']);
+        ensureCareersTables($pdo);
+        [$cvPath,$cvFilename] = handleApplicationUpload('cv','applications');
+        [$acadPath,$acadFilename] = handleApplicationUpload('academic_doc','applications');
+        $pdo->prepare("INSERT INTO job_applications (job_id,name,email,phone,cover_letter,qualification,qualification_other,cv_path,cv_filename,academic_doc_path,academic_doc_filename,status) VALUES (NULL,?,?,?,?,?,?,?,?,?,?,'pending')")
+            ->execute([$data['full_name']??$data['name']??'',$data['email']??'',$data['phone']??'',$data['cover_letter']??'',$data['qualification']??'',$data['qualification_other']??'',$cvPath,$cvFilename,$acadPath,$acadFilename]);
         sendResponse('success','Application submitted',null,201);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
