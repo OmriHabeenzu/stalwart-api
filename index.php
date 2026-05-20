@@ -654,8 +654,8 @@ if ($path === '/tasks' && $method === 'POST') {
     $title = trim($data['title']??'');
     if (empty($title)) sendResponse('error','Title required',null,400);
     try {
-        $dueDate = $data['due_date'] ?? $data['dueDate'] ?? null;
-        $dueTime = $data['due_time'] ?? $data['dueTime'] ?? null;
+        $dueDate = !empty($data['due_date'] ?? $data['dueDate'] ?? '') ? ($data['due_date'] ?? $data['dueDate']) : null;
+        $dueTime = !empty($data['due_time'] ?? $data['dueTime'] ?? '') ? ($data['due_time'] ?? $data['dueTime']) : null;
         $status  = $data['status'] ?? 'pending';
         $pdo->prepare("INSERT INTO tasks (title,description,status,priority,category,due_date,due_time,recurrence,color,created_by) VALUES (?,?,?,?,?,?,?,?,?,?)")
             ->execute([$title,$data['description']??'',$status,$data['priority']??'medium',$data['category']??'general',$dueDate,$dueTime,$data['recurrence']??'none',$data['color']??null,$user['id']]);
@@ -695,8 +695,8 @@ if (preg_match('#^/tasks/(\d+)$#',$path,$m) && $method === 'PUT') {
         if (isset($data['category']))     { $fields[]='category=?';     $vals[]=$data['category']; }
         if (isset($data['recurrence']))   { $fields[]='recurrence=?';   $vals[]=$data['recurrence']; }
         if (isset($data['color']))        { $fields[]='color=?';        $vals[]=$data['color']; }
-        if (array_key_exists('due_date',$data)||array_key_exists('dueDate',$data)) { $fields[]='due_date=?'; $vals[]=$data['due_date']??$data['dueDate']??null; }
-        if (array_key_exists('due_time',$data)||array_key_exists('dueTime',$data)) { $fields[]='due_time=?'; $vals[]=$data['due_time']??$data['dueTime']??null; }
+        if (array_key_exists('due_date',$data)||array_key_exists('dueDate',$data)) { $raw=$data['due_date']??$data['dueDate']??''; $fields[]='due_date=?'; $vals[]=!empty($raw)?$raw:null; }
+        if (array_key_exists('due_time',$data)||array_key_exists('dueTime',$data)) { $raw=$data['due_time']??$data['dueTime']??''; $fields[]='due_time=?'; $vals[]=!empty($raw)?$raw:null; }
         if (isset($data['status']) && $data['status']==='completed') { $fields[]='completed_at=NOW()'; }
         elseif (isset($data['status']) && $data['status']!=='completed') { $fields[]='completed_at=NULL'; }
         if (!empty($fields)) { $vals[]=$taskId; $pdo->prepare("UPDATE tasks SET ".implode(',',$fields).",updated_at=NOW() WHERE id=?")->execute($vals); }
