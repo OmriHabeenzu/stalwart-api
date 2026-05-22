@@ -2026,40 +2026,27 @@ if ($path === '/deploy/pull' && $method === 'POST') {
     sendResponse('success', 'Pulled', $results);
 }
 
-// FRONTEND ASSET DEPLOY (upload built files to public_html)
+// FRONTEND ASSET DEPLOY (upload tar.gz of dist/ to public_html)
 // ==========================================
 if ($path === '/deploy-frontend' && $method === 'POST') {
     if (($_GET['token'] ?? '') !== 'stalwart2026') { echo json_encode(['error'=>'Unauthorized']); exit; }
-    // API is at /home/stalwartzm.com/api.stalwartzm.com/ — frontend is at ../public_html/
-    $frontendDir = realpath(__DIR__ . '/../public_html');
-    if (!$frontendDir) {
-        echo json_encode(['error'=>'Frontend dir not found','tried'=>__DIR__.'/../public_html']); exit;
+    $frontendDir = __DIR__ . '/../public_html';
+    if (!is_dir($frontendDir)) {
+        echo json_encode(['error'=>'Frontend dir not found','tried'=>$frontendDir]); exit;
     }
-    // PHP converts '.' and '-' in field names to '_' in $_FILES keys
-    // Map: php_key => [subdir, real_filename]
-    $map = [
-        'index_html'           => ['', 'index.html'],
-        'sw_js'                => ['', 'sw.js'],
-        'manifest_webmanifest' => ['', 'manifest.webmanifest'],
-        'index_js'             => ['assets/', 'index.js'],
-        'index_css'            => ['assets/', 'index.css'],
-        'workbox_js'           => ['assets/', 'workbox-window.prod.es5.js'],
-    ];
-    $results = [];
-    foreach ($_FILES as $key => $file) {
-        if (!isset($map[$key])) { $results[$key] = 'SKIPPED'; continue; }
-        if ($file['error'] !== UPLOAD_ERR_OK) { $results[$key] = 'UPLOAD_ERR '.$file['error']; continue; }
-        [$subdir, $realName] = $map[$key];
-        $destDir = $frontendDir . '/' . $subdir;
-        if ($subdir && !is_dir($destDir)) mkdir($destDir, 0755, true);
-        $dest = $destDir . $realName;
-        $results[$realName] = move_uploaded_file($file['tmp_name'], $dest)
-            ? 'OK (' . $file['size'] . ' bytes)'
-            : 'FAILED to write (dest: '.$dest.')';
+    if (!isset($_FILES['archive']) || $_FILES['archive']['error'] !== UPLOAD_ERR_OK) {
+        echo json_encode(['error'=>'No archive uploaded or upload error','code'=>($_FILES['archive']['error'] ?? 'missing')]); exit;
     }
+    $tmp = $_FILES['archive']['tmp_name'];
+    $output = [];
+    $exitCode = 0;
+    exec('tar -xzf ' . escapeshellarg($tmp) . ' -C ' . escapeshellarg(realpath($frontendDir)) . ' 2>&1', $output, $exitCode);
     if (!is_dir(__DIR__.'/logs')) mkdir(__DIR__.'/logs', 0755, true);
-    file_put_contents(__DIR__.'/logs/deploy-frontend.log', date('Y-m-d H:i:s')."\n".json_encode($results)."\n---\n", FILE_APPEND);
-    echo json_encode(['success'=>true,'files'=>$results,'time'=>date('Y-m-d H:i:s')]); exit;
+    file_put_contents(__DIR__.'/logs/deploy-frontend.log', date('Y-m-d H:i:s')."\nexitCode=$exitCode\n".implode("\n",$output)."\n---\n", FILE_APPEND);
+    if ($exitCode !== 0) {
+        echo json_encode(['error'=>'Extract failed','output'=>$output,'exitCode'=>$exitCode]); exit;
+    }
+    echo json_encode(['success'=>true,'time'=>date('Y-m-d H:i:s')]); exit;
 }
 
 // 404
