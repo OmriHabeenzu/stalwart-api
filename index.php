@@ -610,7 +610,41 @@ if ($path === '/calendar/today' && $method === 'GET') {
         curl_setopt_array($ch2,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}"],CURLOPT_TIMEOUT=>30]);
         $evData = json_decode(curl_exec($ch2),true); curl_close($ch2);
         $events = array_map(fn($e) => ['name'=>$e['summary']??'','event_id'=>$e['id']??''], $evData['items']??[]);
-        sendResponse('success','Events retrieved',['events'=>$events]);
+
+        // Server-side caller split — prevents two callers ever seeing the same names
+        $user = requireAuth($pdo);
+        $isAdmin = ($user['role'] === 'admin');
+        $callerPosition = null;
+        $totalCallers = 0;
+
+        if (!$isAdmin) {
+            // Find ordered list of callers scheduled for this weekday (1=Mon…5=Fri)
+            $weekday = (int)date('N', strtotime($date)); // ISO: 1=Monday
+            $stmt = $pdo->prepare(
+                "SELECT user_id FROM call_schedule WHERE weekday=? AND role='caller' ORDER BY id ASC"
+            );
+            $stmt->execute([$weekday]);
+            $callerIds = $stmt->fetchAll(PDO::FETCH_COLUMN);
+            $totalCallers = count($callerIds);
+
+            if ($totalCallers >= 2) {
+                $pos = array_search((int)$user['id'], array_map('intval', $callerIds));
+                if ($pos !== false) {
+                    $callerPosition = (int)$pos;
+                    $mid = (int)ceil(count($events) / 2);
+                    $events = $callerPosition === 0
+                        ? array_slice($events, 0, $mid)
+                        : array_slice($events, $mid);
+                }
+                // If user not found in caller list (follow-up staff etc.), they get nothing here
+            }
+        }
+
+        sendResponse('success','Events retrieved',[
+            'events'        => $events,
+            'total_callers' => $totalCallers,
+            'your_position' => $callerPosition, // 0 = first half, 1 = second half, null = all
+        ]);
     } catch (\Throwable $e) { sendResponse('error','Calendar error: '.$e->getMessage(),null,500); }
 }
 
