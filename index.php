@@ -618,12 +618,11 @@ if ($path === '/calendar/today' && $method === 'GET') {
         $totalCallers = 0;
 
         if (!$isAdmin) {
-            // Find ordered list of callers scheduled for this weekday (1=Mon…5=Fri)
-            $weekday = (int)date('N', strtotime($date)); // ISO: 1=Monday
+            // Find ordered list of callers scheduled for this specific date
             $stmt = $pdo->prepare(
-                "SELECT user_id FROM call_schedule WHERE weekday=? AND role='caller' ORDER BY id ASC"
+                "SELECT user_id FROM call_schedule WHERE schedule_date=? AND role='caller' ORDER BY id ASC"
             );
-            $stmt->execute([$weekday]);
+            $stmt->execute([$date]);
             $callerIds = $stmt->fetchAll(PDO::FETCH_COLUMN);
             $totalCallers = count($callerIds);
 
