@@ -617,10 +617,12 @@ if ($path === '/calendar/today' && $method === 'GET') {
         $callerPosition = null;
         $totalCallers = 0;
 
+        $totalEventsInCalendar = count($events); // for debug
+
         if (!$isAdmin) {
             // Find ordered list of callers scheduled for this specific date
             $stmt = $pdo->prepare(
-                "SELECT user_id FROM call_schedule WHERE schedule_date=? AND role='caller' ORDER BY id ASC"
+                "SELECT DISTINCT user_id FROM call_schedule WHERE schedule_date=? AND role='caller' ORDER BY MIN(id) ASC"
             );
             $stmt->execute([$date]);
             $callerIds = $stmt->fetchAll(PDO::FETCH_COLUMN);
@@ -630,19 +632,20 @@ if ($path === '/calendar/today' && $method === 'GET') {
                 $pos = array_search((int)$user['id'], array_map('intval', $callerIds));
                 if ($pos !== false) {
                     $callerPosition = (int)$pos;
-                    $mid = (int)ceil(count($events) / 2);
-                    $events = $callerPosition === 0
-                        ? array_slice($events, 0, $mid)
-                        : array_slice($events, $mid);
+                    // N-way split: divide evenly among all callers
+                    $total = count($events);
+                    $chunkSize = (int)ceil($total / $totalCallers);
+                    $start = $callerPosition * $chunkSize;
+                    $events = array_slice($events, $start, $chunkSize);
                 }
-                // If user not found in caller list (follow-up staff etc.), they get nothing here
             }
         }
 
         sendResponse('success','Events retrieved',[
-            'events'        => $events,
-            'total_callers' => $totalCallers,
-            'your_position' => $callerPosition, // 0 = first half, 1 = second half, null = all
+            'events'              => $events,
+            'total_callers'       => $totalCallers,
+            'your_position'       => $callerPosition,
+            'total_in_calendar'   => $totalEventsInCalendar, // debug: raw count before split
         ]);
     } catch (\Throwable $e) { sendResponse('error','Calendar error: '.$e->getMessage(),null,500); }
 }
