@@ -1,11 +1,8 @@
 Options -Indexes
 RewriteEngine On
 
-# Handle OPTIONS preflight at server level — return 200 before PHP runs
-RewriteCond %{REQUEST_METHOD} OPTIONS
-RewriteRule ^(.*)$ - [R=200,L]
-
-# Route all requests through index.php
+# Route ALL requests (including OPTIONS preflight) through index.php
+# PHP handles CORS headers — do NOT intercept OPTIONS here
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d
 RewriteRule ^ index.php [L]
@@ -20,17 +17,6 @@ RewriteRule ^ index.php [L]
     Require all denied
 </FilesMatch>
 
-# CORS headers — set at server level so they appear on ALL responses including errors
-<IfModule mod_headers.c>
-    SetEnvIf Origin "^https://(www\.)?stalwartzm\.com$" CORS_OK=1
-    SetEnvIf Origin "^http://localhost(:[0-9]+)?$" CORS_OK=1
-
-    Header always set Access-Control-Allow-Origin "%{HTTP_ORIGIN}e" env=CORS_OK
-    Header always set Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
-    Header always set Access-Control-Allow-Headers "Content-Type, Authorization, X-Requested-With"
-    Header always set Access-Control-Allow-Credentials "true"
-</IfModule>
-
-# Security headers for API responses
+# Security headers
 Header always set X-Content-Type-Options "nosniff"
 Header always set X-Frame-Options "DENY"
