@@ -790,7 +790,23 @@ if ($path === '/planner/reschedule' && $method === 'POST') {
             $desc = updateDateInDesc($evData['description'] ?? '', $newDate);
             if ($newBalance !== null) $desc = replaceKBalance($desc, $newBalance);
 
-            $payload = json_encode(['start'=>['date'=>$newDate],'end'=>['date'=>$endDate],'description'=>$desc]);
+            // Preserve the original event's time format (dateTime vs date).
+            // Sending start.date to a timed event causes Google to silently ignore the date change.
+            if (isset($evData['start']['dateTime'])) {
+                $origTZ   = $evData['start']['timeZone'] ?? 'Africa/Lusaka';
+                $tz       = new \DateTimeZone($origTZ);
+                $origDT   = new \DateTime($evData['start']['dateTime']);
+                $newStart = (new \DateTime($newDate, $tz))->setTime((int)$origDT->format('H'), (int)$origDT->format('i'), (int)$origDT->format('s'));
+                $origEnd  = new \DateTime($evData['end']['dateTime'] ?? $evData['start']['dateTime']);
+                $newEnd   = (new \DateTime($newDate, $tz))->setTime((int)$origEnd->format('H'), (int)$origEnd->format('i'), (int)$origEnd->format('s'));
+                $payload  = json_encode([
+                    'start'       => ['dateTime' => $newStart->format(\DateTime::RFC3339), 'timeZone' => $origTZ],
+                    'end'         => ['dateTime' => $newEnd->format(\DateTime::RFC3339),   'timeZone' => $origTZ],
+                    'description' => $desc,
+                ]);
+            } else {
+                $payload = json_encode(['start'=>['date'=>$newDate],'end'=>['date'=>$endDate],'description'=>$desc]);
+            }
             $ch = curl_init($baseUrl.urlencode($eventId).'?sendUpdates=all');
             curl_setopt_array($ch,[CURLOPT_CUSTOMREQUEST=>'PATCH',CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}","Content-Type: application/json"],CURLOPT_TIMEOUT=>15]);
             $res = json_decode(curl_exec($ch),true);
