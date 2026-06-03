@@ -651,40 +651,75 @@ if ($path === '/calendar/today' && $method === 'GET') {
 }
 
 // ==========================================
+// EVENT PLANNER — shared helpers
+// ==========================================
+function getGCalToken($sa) {
+    $now = time();
+    $h = base64url_enc(json_encode(['alg'=>'RS256','typ'=>'JWT']));
+    $p = base64url_enc(json_encode(['iss'=>$sa['client_email'],'scope'=>'https://www.googleapis.com/auth/calendar','aud'=>'https://oauth2.googleapis.com/token','exp'=>$now+3600,'iat'=>$now]));
+    $input = "$h.$p"; openssl_sign($input,$sig,$sa['private_key'],'SHA256');
+    $jwt = $input.'.'.base64url_enc($sig);
+    $ch = curl_init('https://oauth2.googleapis.com/token');
+    curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>http_build_query(['grant_type'=>'urn:ietf:params:oauth:grant-type:jwt-bearer','assertion'=>$jwt]),CURLOPT_HTTPHEADER=>['Content-Type: application/x-www-form-urlencoded'],CURLOPT_TIMEOUT=>15]);
+    $d = json_decode(curl_exec($ch),true); curl_close($ch);
+    return $d['access_token'] ?? null;
+}
+function getGCalSettings($pdo) {
+    return $pdo->query("SELECT setting_key,setting_value FROM settings WHERE setting_key IN ('google_calendar_id','google_service_account_json')")->fetchAll(\PDO::FETCH_KEY_PAIR);
+}
+function parseKBalance($desc) {
+    if (!$desc) return null;
+    preg_match_all('/K([\d,]+\.?\d*)/i',$desc,$m);
+    if (empty($m[1])) return null;
+    return max(array_map(fn($a)=>floatval(str_replace(',','',$a)),$m[1]));
+}
+function replaceKBalance($desc,$newBal) {
+    preg_match_all('/K([\d,]+\.?\d*)/',$desc,$m,PREG_OFFSET_CAPTURE);
+    if (empty($m[0])) return trim($desc)."\nCurrent balance: K".number_format($newBal,2);
+    $maxAmt=0;$maxIdx=0;
+    foreach ($m[1] as $i=>$match) { $amt=floatval(str_replace(',','',$match[0])); if($amt>$maxAmt){$maxAmt=$amt;$maxIdx=$i;} }
+    return substr_replace($desc,'K'.number_format($newBal,2),$m[0][$maxIdx][1],strlen($m[0][$maxIdx][0]));
+}
+function formatOrdinalDate($dateStr) {
+    $d=new \DateTime($dateStr); $day=(int)$d->format('j');
+    $s=match(true){in_array($day,[11,12,13])=>'th',$day%10===1=>'st',$day%10===2=>'nd',$day%10===3=>'rd',default=>'th'};
+    return "{$day}{$s} ".$d->format('F, Y');
+}
+function updateDateInDesc($desc,$newDate) {
+    $fmt=formatOrdinalDate($newDate);
+    $pat='\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+,?\s*\d{4}';
+    foreach(["/(due on\s+){$pat}/i","/(due\s*date\s*:?\s*){$pat}/i"] as $re) {
+        if (preg_match($re,$desc)) return preg_replace($re,'${1}'.$fmt,$desc);
+    }
+    return $desc;
+}
+
+// ==========================================
 // EVENT PLANNER — list events (write scope)
 // ==========================================
 if ($path === '/planner/events' && $method === 'GET') {
     requireAdmin($pdo);
     try {
-        $rows = $pdo->query("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('google_calendar_id','google_service_account_json')")->fetchAll(PDO::FETCH_KEY_PAIR);
-        $calendarId = $rows['google_calendar_id'] ?? '';
-        $sa = json_decode($rows['google_service_account_json'] ?? '', true);
+        $cfg = getGCalSettings($pdo);
+        $calendarId = $cfg['google_calendar_id'] ?? '';
+        $sa = json_decode($cfg['google_service_account_json'] ?? '', true);
         if (!$sa || !$calendarId) sendResponse('error','Calendar not configured',null,400);
-
-        $now = time();
-        $h = base64url_enc(json_encode(['alg'=>'RS256','typ'=>'JWT']));
-        $p = base64url_enc(json_encode(['iss'=>$sa['client_email'],'scope'=>'https://www.googleapis.com/auth/calendar','aud'=>'https://oauth2.googleapis.com/token','exp'=>$now+3600,'iat'=>$now]));
-        $input = "$h.$p"; openssl_sign($input, $sig, $sa['private_key'], 'SHA256');
-        $jwt = $input.'.'.base64url_enc($sig);
-        $ch = curl_init('https://oauth2.googleapis.com/token');
-        curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>http_build_query(['grant_type'=>'urn:ietf:params:oauth:grant-type:jwt-bearer','assertion'=>$jwt]),CURLOPT_HTTPHEADER=>['Content-Type: application/x-www-form-urlencoded'],CURLOPT_TIMEOUT=>15]);
-        $tokenData = json_decode(curl_exec($ch),true); curl_close($ch);
-        $token = $tokenData['access_token'] ?? null;
+        $token = getGCalToken($sa);
         if (!$token) sendResponse('error','Could not authenticate with Google Calendar',null,500);
 
         $date = $_GET['date'] ?? date('Y-m-d');
         $timeMin = urlencode($date.'T00:00:00+02:00');
         $timeMax = urlencode($date.'T23:59:59+02:00');
         $url = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events?timeMin={$timeMin}&timeMax={$timeMax}&singleEvents=true&orderBy=startTime&maxResults=2500";
-        $ch2 = curl_init($url);
-        curl_setopt_array($ch2,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}"],CURLOPT_TIMEOUT=>20]);
-        $evData = json_decode(curl_exec($ch2),true); curl_close($ch2);
+        $ch = curl_init($url);
+        curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}"],CURLOPT_TIMEOUT=>20]);
+        $evData = json_decode(curl_exec($ch),true); curl_close($ch);
 
         $events = [];
         foreach ($evData['items'] ?? [] as $e) {
-            $events[] = ['id' => $e['id'], 'name' => $e['summary'] ?? ''];
+            $events[] = ['id'=>$e['id'],'name'=>$e['summary']??''];
         }
-        usort($events, fn($a,$b) => strcasecmp($a['name'], $b['name']));
+        usort($events, fn($a,$b)=>strcasecmp($a['name'],$b['name']));
         sendResponse('success','Events loaded',['events'=>$events,'total'=>count($events)]);
     } catch (\Throwable $e) { sendResponse('error',$e->getMessage(),null,500); }
 }
@@ -695,55 +730,142 @@ if ($path === '/planner/events' && $method === 'GET') {
 if ($path === '/planner/reschedule' && $method === 'POST') {
     requireAdmin($pdo);
     try {
+        set_time_limit(0); // allow long-running batches
         $body = json_decode(file_get_contents('php://input'), true);
         $eventIds = $body['event_ids'] ?? [];
         $newDate  = $body['new_date']   ?? '';
         if (empty($eventIds) || !$newDate) sendResponse('error','event_ids and new_date required',null,400);
         if (!\DateTime::createFromFormat('Y-m-d', $newDate)) sendResponse('error','Invalid date format',null,400);
 
-        $rows = $pdo->query("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('google_calendar_id','google_service_account_json')")->fetchAll(PDO::FETCH_KEY_PAIR);
-        $calendarId = $rows['google_calendar_id'] ?? '';
-        $sa = json_decode($rows['google_service_account_json'] ?? '', true);
+        $cfg = getGCalSettings($pdo);
+        $calendarId = $cfg['google_calendar_id'] ?? '';
+        $sa = json_decode($cfg['google_service_account_json'] ?? '', true);
         if (!$sa || !$calendarId) sendResponse('error','Calendar not configured',null,400);
-
-        $now = time();
-        $h = base64url_enc(json_encode(['alg'=>'RS256','typ'=>'JWT']));
-        $p = base64url_enc(json_encode(['iss'=>$sa['client_email'],'scope'=>'https://www.googleapis.com/auth/calendar','aud'=>'https://oauth2.googleapis.com/token','exp'=>$now+3600,'iat'=>$now]));
-        $input = "$h.$p"; openssl_sign($input, $sig, $sa['private_key'], 'SHA256');
-        $jwt = $input.'.'.base64url_enc($sig);
-        $ch = curl_init('https://oauth2.googleapis.com/token');
-        curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>http_build_query(['grant_type'=>'urn:ietf:params:oauth:grant-type:jwt-bearer','assertion'=>$jwt]),CURLOPT_HTTPHEADER=>['Content-Type: application/x-www-form-urlencoded'],CURLOPT_TIMEOUT=>15]);
-        $tokenData = json_decode(curl_exec($ch),true); curl_close($ch);
-        $token = $tokenData['access_token'] ?? null;
+        $token = getGCalToken($sa);
         if (!$token) sendResponse('error','Could not authenticate with Google Calendar',null,500);
 
         $endDate = date('Y-m-d', strtotime($newDate . ' +1 day'));
-        $patchPayload = json_encode(['start'=>['date'=>$newDate],'end'=>['date'=>$endDate]]);
         $success = 0; $failed = [];
+        $baseUrl = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events/";
 
         foreach ($eventIds as $eventId) {
-            $url = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events/".urlencode($eventId)."?sendUpdates=all";
-            $ch = curl_init($url);
-            curl_setopt_array($ch,[
-                CURLOPT_CUSTOMREQUEST => 'PATCH',
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_POSTFIELDS => $patchPayload,
-                CURLOPT_HTTPHEADER => ["Authorization: Bearer {$token}", "Content-Type: application/json"],
-                CURLOPT_TIMEOUT => 15,
-            ]);
-            $res = json_decode(curl_exec($ch), true);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            curl_close($ch);
+            // GET event first so we can update the date in its description
+            $ch = curl_init($baseUrl.urlencode($eventId));
+            curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}"],CURLOPT_TIMEOUT=>15]);
+            $evData = json_decode(curl_exec($ch),true); curl_close($ch);
 
-            if ($httpCode === 200 && isset($res['id'])) {
+            $newDesc = updateDateInDesc($evData['description'] ?? '', $newDate);
+            $payload = json_encode(['start'=>['date'=>$newDate],'end'=>['date'=>$endDate],'description'=>$newDesc]);
+
+            $ch = curl_init($baseUrl.urlencode($eventId).'?sendUpdates=all');
+            curl_setopt_array($ch,[CURLOPT_CUSTOMREQUEST=>'PATCH',CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}","Content-Type: application/json"],CURLOPT_TIMEOUT=>15]);
+            $res = json_decode(curl_exec($ch),true);
+            $code = curl_getinfo($ch,CURLINFO_HTTP_CODE); curl_close($ch);
+
+            if ($code===200 && isset($res['id'])) {
                 $success++;
             } else {
-                $failed[] = ($res['summary'] ?? $eventId) . ': ' . ($res['error']['message'] ?? "HTTP $httpCode");
+                $failed[] = ($evData['summary']??$eventId).': '.($res['error']['message']??"HTTP $code");
             }
-            usleep(300000); // 0.3s pause between events to avoid rate limits
+            sleep(1); // 1s between events — respects rate limits, stays within HTTP timeout for batches of ≤30
         }
 
         sendResponse('success','Reschedule complete',['success'=>$success,'failed'=>$failed,'total'=>count($eventIds)]);
+    } catch (\Throwable $e) { sendResponse('error',$e->getMessage(),null,500); }
+}
+
+// ==========================================
+// EVENT PLANNER — loans (balances)
+// ==========================================
+if ($path === '/planner/loans' && $method === 'GET') {
+    requireAdmin($pdo);
+    try {
+        $cfg = getGCalSettings($pdo);
+        $calendarId = $cfg['google_calendar_id'] ?? '';
+        $sa = json_decode($cfg['google_service_account_json'] ?? '', true);
+        if (!$sa || !$calendarId) sendResponse('error','Calendar not configured',null,400);
+        $token = getGCalToken($sa);
+        if (!$token) sendResponse('error','Could not authenticate with Google Calendar',null,500);
+
+        $date = $_GET['date'] ?? date('Y-m-d');
+        $tz = new \DateTimeZone('Africa/Lusaka');
+        $timeMin = urlencode((new \DateTime($date.' 00:00:00',$tz))->format(\DateTime::RFC3339));
+        $timeMax = urlencode((new \DateTime($date.' 23:59:59',$tz))->format(\DateTime::RFC3339));
+        $baseUrl = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events";
+
+        $loans = []; $pageToken = '';
+        do {
+            $url = "{$baseUrl}?timeMin={$timeMin}&timeMax={$timeMax}&singleEvents=true&orderBy=startTime&maxResults=2500".($pageToken?"&pageToken={$pageToken}":'');
+            $ch = curl_init($url);
+            curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}"],CURLOPT_TIMEOUT=>20]);
+            $evData = json_decode(curl_exec($ch),true); curl_close($ch);
+            foreach ($evData['items']??[] as $e) {
+                $title = trim($e['summary']??'');
+                // Skip stagnant loans (. or , in title), busy, blank
+                if (!$title || strcasecmp($title,'busy')===0) continue;
+                if (strpos($title,'.')!==false || strpos($title,',')!==false) continue;
+                $desc    = $e['description'] ?? '';
+                $balance = parseKBalance($desc);
+                $start   = $e['start']['date'] ?? substr($e['start']['dateTime']??'',0,10);
+                $loans[] = ['id'=>$e['id'],'name'=>$title,'balance'=>$balance,'description'=>$desc,'date'=>$start];
+            }
+            $pageToken = $evData['nextPageToken'] ?? '';
+        } while ($pageToken);
+
+        usort($loans, function($a,$b) {
+            if (($a['balance']===null)!==($b['balance']===null)) return $a['balance']===null?1:-1;
+            return strcasecmp($a['name'],$b['name']);
+        });
+        $withBal   = array_values(array_filter($loans,fn($l)=>$l['balance']!==null));
+        $withoutBal= array_values(array_filter($loans,fn($l)=>$l['balance']===null));
+        $portfolio = array_sum(array_column($withBal,'balance'));
+        sendResponse('success','Loans loaded',['loans'=>$loans,'with_balance'=>$withBal,'without_balance'=>$withoutBal,'stats'=>['total'=>count($loans),'with_balance'=>count($withBal),'without_balance'=>count($withoutBal),'total_portfolio'=>round($portfolio,2)]]);
+    } catch (\Throwable $e) { sendResponse('error',$e->getMessage(),null,500); }
+}
+
+// ==========================================
+// EVENT PLANNER — update loan balances
+// ==========================================
+if ($path === '/planner/loans/update' && $method === 'POST') {
+    requireAdmin($pdo);
+    try {
+        $body = json_decode(file_get_contents('php://input'), true);
+        $updates = $body['updates'] ?? []; // [{event_id, name, new_balance, description}]
+        if (empty($updates)) sendResponse('error','No updates provided',null,400);
+
+        $cfg = getGCalSettings($pdo);
+        $calendarId = $cfg['google_calendar_id'] ?? '';
+        $sa = json_decode($cfg['google_service_account_json'] ?? '', true);
+        if (!$sa || !$calendarId) sendResponse('error','Calendar not configured',null,400);
+        $token = getGCalToken($sa);
+        if (!$token) sendResponse('error','Could not authenticate with Google Calendar',null,500);
+
+        $success = 0; $failed = [];
+        $baseUrl = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events/";
+
+        foreach ($updates as $u) {
+            $eventId    = $u['event_id']    ?? '';
+            $newBalance = floatval($u['new_balance'] ?? 0);
+            $currentDesc= $u['description'] ?? '';
+            if (!$eventId || $newBalance <= 0) continue;
+
+            $newDesc = replaceKBalance($currentDesc, $newBalance);
+            $payload = json_encode(['description'=>$newDesc]);
+
+            $ch = curl_init($baseUrl.urlencode($eventId).'?sendUpdates=none');
+            curl_setopt_array($ch,[CURLOPT_CUSTOMREQUEST=>'PATCH',CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}","Content-Type: application/json"],CURLOPT_TIMEOUT=>15]);
+            $res = json_decode(curl_exec($ch),true);
+            $code = curl_getinfo($ch,CURLINFO_HTTP_CODE); curl_close($ch);
+
+            if ($code===200 && isset($res['id'])) {
+                $success++;
+            } else {
+                $failed[] = ($u['name']??$eventId).': '.($res['error']['message']??"HTTP $code");
+            }
+            usleep(200000); // 0.2s — no notifications, so fast is fine
+        }
+
+        sendResponse('success','Balances updated',['success'=>$success,'failed'=>$failed,'total'=>count($updates)]);
     } catch (\Throwable $e) { sendResponse('error',$e->getMessage(),null,500); }
 }
 
