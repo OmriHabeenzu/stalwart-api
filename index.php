@@ -715,9 +715,12 @@ if ($path === '/planner/events' && $method === 'GET') {
         curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}"],CURLOPT_TIMEOUT=>20]);
         $evData = json_decode(curl_exec($ch),true); curl_close($ch);
 
+        $includeDesc = ($_GET['desc'] ?? '') === '1';
         $events = [];
         foreach ($evData['items'] ?? [] as $e) {
-            $events[] = ['id'=>$e['id'],'name'=>$e['summary']??''];
+            $item = ['id'=>$e['id'],'name'=>$e['summary']??''];
+            if ($includeDesc) $item['description'] = $e['description'] ?? '';
+            $events[] = $item;
         }
         usort($events, fn($a,$b)=>strcasecmp($a['name'],$b['name']));
         sendResponse('success','Events loaded',['events'=>$events,'total'=>count($events)]);
