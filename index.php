@@ -544,6 +544,20 @@ if ($path === '/call-reports/today-unanswered' && $method === 'GET') {
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
+// Returns ALL names from reports for a date (answered + unanswered) so we can detect skipped clients
+if ($path === '/call-reports/today-names' && $method === 'GET') {
+    requireAuth($pdo);
+    try {
+        $date = $_GET['date'] ?? date('Y-m-d');
+        $stmt = $pdo->prepare("SELECT cre.customer_name, cre.status FROM call_report_entries cre JOIN call_reports cr ON cre.report_id = cr.id WHERE cr.report_date = ? ORDER BY cre.sort_order");
+        $stmt->execute([$date]);
+        $rows = $stmt->fetchAll();
+        $unanswered = array_values(array_map(fn($r)=>$r['customer_name'], array_filter($rows, fn($r)=>$r['status']==='unanswered')));
+        $answered   = array_values(array_map(fn($r)=>$r['customer_name'], array_filter($rows, fn($r)=>$r['status']==='answered')));
+        sendResponse('success','Names retrieved',['unanswered'=>$unanswered,'answered'=>$answered,'total'=>count($rows)]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
 // ==========================================
 // GOOGLE CALENDAR
 // ==========================================
