@@ -797,13 +797,11 @@ if ($path === '/planner/reschedule' && $method === 'POST') {
 
             if ($code===200 && isset($res['id'])) {
                 $success++;
-                $failed[] = null; // placeholder to keep index alignment
             } else {
-                $success--; // undo placeholder increment
-                $failed[] = ($evData['summary']??$eventId).': '.($res['error']['message']??"HTTP $code");
+                $errMsg = $res['error']['message'] ?? "HTTP $code";
+                $failed[] = ($evData['summary']??$eventId).': '.$errMsg;
             }
         }
-        $failed = array_values(array_filter($failed));
         sendResponse('success','Reschedule complete',['success'=>$success,'failed'=>$failed,'total'=>count($events)]);
     } catch (\Throwable $e) { sendResponse('error',$e->getMessage(),null,500); }
 }
