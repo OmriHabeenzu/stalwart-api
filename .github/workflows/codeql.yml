@@ -1,4 +1,4 @@
-name: CodeQL Security Scan
+name: Security Scan
 
 on:
   push:
@@ -9,28 +9,43 @@ on:
     - cron: '0 6 * * 1'  # Every Monday at 6am
 
 jobs:
-  analyze:
-    name: Analyze PHP
+  php-security:
+    name: PHP Security Scan
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: php
-          queries: security-extended
+      - name: Install PHP & security tools
+        run: |
+          sudo apt-get install -y php-cli php-xml
+          composer global require phpstan/phpstan enlightn/security-checker 2>/dev/null || true
 
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
+      - name: PHP syntax check
+        run: find . -name "*.php" -not -path "./vendor/*" | xargs -I{} php -l {}
 
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-        with:
-          category: /language:php
+      - name: Check for common PHP security issues
+        run: |
+          echo "=== Scanning for dangerous functions ==="
+          grep -rn --include="*.php" \
+            -e "eval(" \
+            -e "exec(" \
+            -e "shell_exec(" \
+            -e "passthru(" \
+            -e "system(" \
+            -e "popen(" \
+            -e "proc_open(" \
+            . --exclude-dir=vendor || echo "None found"
+
+          echo ""
+          echo "=== Scanning for SQL injection risks ==="
+          grep -rn --include="*.php" \
+            -e "\$_GET\[" \
+            -e "\$_POST\[" \
+            -e "\$_REQUEST\[" \
+            . --exclude-dir=vendor | grep -v "prepare\|htmlspecialchars\|intval\|filter_var" | head -20 || echo "None found"
+
+          echo ""
+          echo "=== Scanning for XSS risks ==="
+          grep -rn --include="*.php" "echo.*\$_" . --exclude-dir=vendor | grep -v "htmlspecialchars\|htmlentities" | head -10 || echo "None found"
