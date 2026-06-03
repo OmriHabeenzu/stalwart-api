@@ -730,12 +730,23 @@ if ($path === '/planner/events' && $method === 'GET') {
 if ($path === '/planner/reschedule' && $method === 'POST') {
     requireAdmin($pdo);
     try {
-        set_time_limit(0); // allow long-running batches
+        // Frontend sends one event at a time — no sleep needed here; delay is handled client-side
         $body = json_decode(file_get_contents('php://input'), true);
-        $eventIds = $body['event_ids'] ?? [];
-        $newDate  = $body['new_date']   ?? '';
-        if (empty($eventIds) || !$newDate) sendResponse('error','event_ids and new_date required',null,400);
-        if (!\DateTime::createFromFormat('Y-m-d', $newDate)) sendResponse('error','Invalid date format',null,400);
+        // Accept either {event_id, new_date, new_balance?} (single) or {events:[{id,new_balance?}], new_date} (batch)
+        $newDate = $body['new_date'] ?? '';
+        if (!$newDate || !\DateTime::createFromFormat('Y-m-d', $newDate)) sendResponse('error','Invalid or missing new_date',null,400);
+
+        // Normalise to array of {id, new_balance?}
+        if (isset($body['event_id'])) {
+            $events = [['id'=>$body['event_id'], 'new_balance'=>$body['new_balance']??null]];
+        } else {
+            $events = $body['events'] ?? [];
+            // backward compat: plain event_ids array
+            if (empty($events) && !empty($body['event_ids'])) {
+                $events = array_map(fn($id)=>['id'=>$id,'new_balance'=>null], $body['event_ids']);
+            }
+        }
+        if (empty($events)) sendResponse('error','No events provided',null,400);
 
         $cfg = getGCalSettings($pdo);
         $calendarId = $cfg['google_calendar_id'] ?? '';
@@ -748,15 +759,20 @@ if ($path === '/planner/reschedule' && $method === 'POST') {
         $success = 0; $failed = [];
         $baseUrl = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events/";
 
-        foreach ($eventIds as $eventId) {
-            // GET event first so we can update the date in its description
+        foreach ($events as $ev) {
+            $eventId   = $ev['id'] ?? '';
+            $newBalance= isset($ev['new_balance']) && $ev['new_balance'] > 0 ? floatval($ev['new_balance']) : null;
+            if (!$eventId) continue;
+
+            // GET event to read current description
             $ch = curl_init($baseUrl.urlencode($eventId));
             curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}"],CURLOPT_TIMEOUT=>15]);
             $evData = json_decode(curl_exec($ch),true); curl_close($ch);
 
-            $newDesc = updateDateInDesc($evData['description'] ?? '', $newDate);
-            $payload = json_encode(['start'=>['date'=>$newDate],'end'=>['date'=>$endDate],'description'=>$newDesc]);
+            $desc = updateDateInDesc($evData['description'] ?? '', $newDate);
+            if ($newBalance !== null) $desc = replaceKBalance($desc, $newBalance);
 
+            $payload = json_encode(['start'=>['date'=>$newDate],'end'=>['date'=>$endDate],'description'=>$desc]);
             $ch = curl_init($baseUrl.urlencode($eventId).'?sendUpdates=all');
             curl_setopt_array($ch,[CURLOPT_CUSTOMREQUEST=>'PATCH',CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}","Content-Type: application/json"],CURLOPT_TIMEOUT=>15]);
             $res = json_decode(curl_exec($ch),true);
@@ -764,13 +780,14 @@ if ($path === '/planner/reschedule' && $method === 'POST') {
 
             if ($code===200 && isset($res['id'])) {
                 $success++;
+                $failed[] = null; // placeholder to keep index alignment
             } else {
+                $success--; // undo placeholder increment
                 $failed[] = ($evData['summary']??$eventId).': '.($res['error']['message']??"HTTP $code");
             }
-            sleep(1); // 1s between events — respects rate limits, stays within HTTP timeout for batches of ≤30
         }
-
-        sendResponse('success','Reschedule complete',['success'=>$success,'failed'=>$failed,'total'=>count($eventIds)]);
+        $failed = array_values(array_filter($failed));
+        sendResponse('success','Reschedule complete',['success'=>$success,'failed'=>$failed,'total'=>count($events)]);
     } catch (\Throwable $e) { sendResponse('error',$e->getMessage(),null,500); }
 }
 
