@@ -70,7 +70,9 @@ try {
     http_response_code(500); echo json_encode(['status'=>'error','message'=>'Database connection failed']); exit(1);
 }
 
-// SCHEMA MIGRATIONS
+// SCHEMA MIGRATIONS — guarded so they only run once per hour, not on every request
+$_migFile = sys_get_temp_dir() . '/stalwart_mig_' . date('YmdH') . '.lock';
+if (!file_exists($_migFile)) { @file_put_contents($_migFile, '1');
 try {
     $pdo->exec("CREATE TABLE IF NOT EXISTS chat_sessions (id INT AUTO_INCREMENT PRIMARY KEY, customer_name VARCHAR(255) NOT NULL, customer_email VARCHAR(255), customer_phone VARCHAR(50), status VARCHAR(50) DEFAULT 'active', last_message TEXT, last_message_time DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
     $pdo->exec("CREATE TABLE IF NOT EXISTS chat_messages (id INT AUTO_INCREMENT PRIMARY KEY, session_id INT NOT NULL, message TEXT NOT NULL, sender_type VARCHAR(50) DEFAULT 'customer', sender_name VARCHAR(255), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
@@ -144,6 +146,7 @@ try {
     $pdo->exec("CREATE TABLE IF NOT EXISTS job_listings (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255) NOT NULL, department VARCHAR(100) DEFAULT NULL, location VARCHAR(100) DEFAULT NULL, type VARCHAR(50) DEFAULT 'full-time', description TEXT, requirements TEXT, salary_range VARCHAR(100) DEFAULT NULL, is_active TINYINT DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
     $pdo->exec("CREATE TABLE IF NOT EXISTS job_applications (id INT AUTO_INCREMENT PRIMARY KEY, job_id INT DEFAULT NULL, name VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL, phone VARCHAR(50) DEFAULT NULL, cover_letter TEXT, status VARCHAR(50) DEFAULT 'pending', notes TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
 } catch (\Throwable $e) {}
+} // end migration guard
 
 // HELPERS
 function sendResponse($status, $message, $data = null, $httpCode = 200) {
