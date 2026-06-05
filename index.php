@@ -813,7 +813,14 @@ if ($path === '/planner/reschedule' && $method === 'POST') {
             $code = curl_getinfo($ch,CURLINFO_HTTP_CODE); curl_close($ch);
 
             if ($code===200 && isset($res['id'])) {
-                $success++;
+                // Verify Google actually moved the event — 200 doesn't guarantee the date changed
+                $returnedDate = $res['start']['date'] ?? substr($res['start']['dateTime'] ?? '', 0, 10);
+                if ($returnedDate === $newDate) {
+                    $success++;
+                } else {
+                    $evName = $evData['summary'] ?? $eventId;
+                    $failed[] = $evName . ': date not updated (still ' . ($returnedDate ?: 'unknown') . ') — format mismatch?';
+                }
             } else {
                 $errMsg = $res['error']['message'] ?? "HTTP $code";
                 $failed[] = ($evData['summary']??$eventId).': '.$errMsg;
