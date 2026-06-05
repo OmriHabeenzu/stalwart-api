@@ -640,7 +640,7 @@ if ($path === '/calendar/today' && $method === 'GET') {
         if (!$isAdmin) {
             // Find ordered list of callers scheduled for this specific date
             $stmt = $pdo->prepare(
-                "SELECT DISTINCT user_id FROM call_schedule WHERE schedule_date=? AND role='caller' ORDER BY MIN(id) ASC"
+                "SELECT user_id FROM call_schedule WHERE schedule_date=? AND role='caller' ORDER BY id ASC"
             );
             $stmt->execute([$date]);
             $callerIds = $stmt->fetchAll(PDO::FETCH_COLUMN);
