@@ -793,7 +793,20 @@ if ($path === '/planner/reschedule' && $method === 'POST') {
             $desc = updateDateInDesc($evData['description'] ?? '', $newDate);
             if ($newBalance !== null) $desc = replaceKBalance($desc, $newBalance);
 
-            $payload = json_encode(['start'=>['date'=>$newDate],'end'=>['date'=>$endDate],'description'=>$desc]);
+            // Preserve the original time format: timed events use dateTime, all-day use date.
+            // Google silently ignores date changes when the format doesn't match the original.
+            if (isset($evData['start']['dateTime'])) {
+                // Timed event — replace only the date portion (first 10 chars), keep the time+tz suffix
+                $tSuffix  = substr($evData['start']['dateTime'], 10);
+                $endSuffix= isset($evData['end']['dateTime']) ? substr($evData['end']['dateTime'], 10) : $tSuffix;
+                $payload = json_encode([
+                    'start'       => ['dateTime' => $newDate . $tSuffix,   'timeZone' => $evData['start']['timeZone'] ?? 'Africa/Lusaka'],
+                    'end'         => ['dateTime' => $newDate . $endSuffix, 'timeZone' => $evData['end']['timeZone']   ?? 'Africa/Lusaka'],
+                    'description' => $desc,
+                ]);
+            } else {
+                $payload = json_encode(['start'=>['date'=>$newDate],'end'=>['date'=>$endDate],'description'=>$desc]);
+            }
             $ch = curl_init($baseUrl.urlencode($eventId).'?sendUpdates=all');
             curl_setopt_array($ch,[CURLOPT_CUSTOMREQUEST=>'PATCH',CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}","Content-Type: application/json"],CURLOPT_TIMEOUT=>15]);
             $res = json_decode(curl_exec($ch),true);
