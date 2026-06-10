@@ -1980,7 +1980,7 @@ if ($path === '/analytics/google' && $method === 'GET') {
         $dailyFmt=[];
         foreach ($daily['rows']??[] as $row) { $d=$row['dimensionValues'][0]['value']; $dailyFmt[]=['date'=>substr($d,0,4).'-'.substr($d,4,2).'-'.substr($d,6,2),'pageViews'=>(int)$row['metricValues'][0]['value'],'users'=>(int)$row['metricValues'][1]['value']]; }
         $fmt=fn($rows,$dk,$mk)=>array_map(fn($r)=>[$dk=>$r['dimensionValues'][0]['value'],$mk=>(int)$r['metricValues'][0]['value']],$rows['rows']??[]);
-        sendResponse('success','OK',['overview'=>$ov,'daily'=>$dailyFmt,'topPages'=>$fmt($topPages,'page','views'),'sources'=>$fmt($sources,'source','sessions'),'devices'=>$fmt($devices,'device','users'),'countries'=>$fmt($countries,'country','users')]);
+        sendResponse('success','OK',['propertyId'=>$propertyId,'overview'=>$ov,'daily'=>$dailyFmt,'topPages'=>$fmt($topPages,'page','views'),'sources'=>$fmt($sources,'source','sessions'),'devices'=>$fmt($devices,'device','users'),'countries'=>$fmt($countries,'country','users')]);
     } catch (\Throwable $e) { sendResponse('error','Google Analytics error: '.$e->getMessage(),null,500); }
 }
 
