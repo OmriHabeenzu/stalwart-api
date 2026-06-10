@@ -99,6 +99,8 @@ try {
     try { $pdo->exec("ALTER TABLE users ADD COLUMN department VARCHAR(100) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE users ADD COLUMN profile_image VARCHAR(500) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE users ADD COLUMN last_login DATETIME DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE users ADD COLUMN last_login_ip VARCHAR(45) DEFAULT NULL"); } catch (\Throwable $e) {}
+    $pdo->exec("CREATE TABLE IF NOT EXISTS page_content (id INT AUTO_INCREMENT PRIMARY KEY, page_key VARCHAR(100) NOT NULL, section_key VARCHAR(100) NOT NULL, label VARCHAR(255) NOT NULL, content TEXT, content_type VARCHAR(50) DEFAULT 'text', sort_order INT DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY uniq_page_section (page_key, section_key))");
     $pdo->exec("CREATE TABLE IF NOT EXISTS notices (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255) NOT NULL, message TEXT NOT NULL, type VARCHAR(50) DEFAULT 'info', pinned TINYINT DEFAULT 0, created_by INT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     try { $pdo->exec("ALTER TABLE notices MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT, ADD PRIMARY KEY (id)"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE notices ADD COLUMN created_by_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
@@ -256,6 +258,9 @@ if ($path === '/auth/login' && $method === 'POST') {
         if (!$user || !password_verify($password, $user['password'])) sendResponse('error','Invalid credentials',null,401);
         if (!$user['is_active']) sendResponse('error','Account is inactive',null,403);
         $token = JWT::encode(['user_id'=>$user['id'],'email'=>$user['email'],'role'=>$user['role'],'exp'=>time()+86400*7]);
+        $ip = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['REMOTE_ADDR'] ?? null;
+        if ($ip) $ip = trim(explode(',', $ip)[0]);
+        try { $pdo->prepare("UPDATE users SET last_login=NOW(), last_login_ip=? WHERE id=?")->execute([$ip, $user['id']]); } catch (\Throwable $e) {}
         unset($user['password']);
         logActivity($pdo,$user['id'],$user['email'],'login','User logged in');
         sendResponse('success','Login successful',['token'=>$token,'user'=>$user]);
@@ -271,6 +276,17 @@ if ($path === '/auth/me' && $method === 'GET') {
         if (!$u) sendResponse('error','User not found',null,404);
         sendResponse('success','User retrieved',['user'=>$u]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if ($path === '/auth/profile' && $method === 'GET') {
+    $user = requireAuth($pdo);
+    try {
+        $stmt = $pdo->prepare("SELECT id,name,email,role,is_active,created_at,last_login,last_login_ip,profile_image,phone,department FROM users WHERE id=?");
+        $stmt->execute([$user['id']]);
+        $profile = $stmt->fetch();
+        if (!$profile) sendResponse('error','Not found',null,404);
+        sendResponse('success','Profile retrieved',['profile'=>$profile]);
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
 }
 
 if ($path === '/auth/logout' && $method === 'POST') {
@@ -307,7 +323,7 @@ if ($path === '/auth/change-password' && $method === 'POST') {
 if ($path === '/users' && $method === 'GET') {
     requireAdmin($pdo);
     try {
-        $users = $pdo->query("SELECT id,name,email,role,is_active,can_manage_calls,phone,department,created_at FROM users ORDER BY name")->fetchAll();
+        $users = $pdo->query("SELECT id,name,email,role,is_active,can_manage_calls,phone,department,created_at,last_login FROM users ORDER BY name")->fetchAll();
         sendResponse('success','Users retrieved',['users'=>$users]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
@@ -327,11 +343,14 @@ if (preg_match('#^/users/(\d+)$#',$path,$m) && $method === 'PUT') {
     try {
         $fields = []; $vals = [];
         if (isset($data['name']))             { $fields[]='name=?';             $vals[]=$data['name']; }
+        if (isset($data['email']))            { $fields[]='email=?';            $vals[]=$data['email']; }
         if (isset($data['role']))             { $fields[]='role=?';             $vals[]=$data['role']; }
         if (isset($data['is_active']))        { $fields[]='is_active=?';        $vals[]=(int)$data['is_active']; }
+        if (isset($data['status']))           { $fields[]='is_active=?';        $vals[]=$data['status']==='active'?1:0; }
         if (isset($data['can_manage_calls'])) { $fields[]='can_manage_calls=?'; $vals[]=(int)$data['can_manage_calls']; }
         if (isset($data['phone']))            { $fields[]='phone=?';            $vals[]=$data['phone']; }
         if (isset($data['department']))       { $fields[]='department=?';       $vals[]=$data['department']; }
+        if (!empty($data['password']))        { $fields[]='password=?';         $vals[]=password_hash($data['password'],PASSWORD_DEFAULT); }
         if (empty($fields)) sendResponse('error','Nothing to update',null,400);
         $vals[] = $uid;
         $pdo->prepare("UPDATE users SET ".implode(',',$fields)." WHERE id=?")->execute($vals);
@@ -345,10 +364,21 @@ if (preg_match('#^/users/(\d+)$#',$path,$m) && $method === 'PUT') {
 if ($path === '/notifications' && $method === 'GET') {
     $user = requireAuth($pdo);
     try {
-        $stmt = $pdo->prepare("SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50");
-        $stmt->execute([$user['id']]);
+        $typeFilter  = $_GET['type']   ?? '';
+        $unreadOnly  = ($_GET['unread'] ?? '') === 'true';
+        $limit       = min((int)($_GET['limit']  ?? 50), 100);
+        $offset      = (int)($_GET['offset'] ?? 0);
+        // Always exclude 'message' type (chat notifications) from default view
+        $conditions = ['user_id=?'];
+        $params     = [$user['id']];
+        if ($typeFilter) { $conditions[] = 'type=?'; $params[] = $typeFilter; }
+        else             { $conditions[] = "type != 'message'"; }
+        if ($unreadOnly)  { $conditions[] = 'is_read=0'; }
+        $where = implode(' AND ', $conditions);
+        $stmt = $pdo->prepare("SELECT * FROM notifications WHERE $where ORDER BY created_at DESC LIMIT $limit OFFSET $offset");
+        $stmt->execute($params);
         $notifications = $stmt->fetchAll();
-        $unreadStmt = $pdo->prepare("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0");
+        $unreadStmt = $pdo->prepare("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0 AND type != 'message'");
         $unreadStmt->execute([$user['id']]);
         $unread = (int)$unreadStmt->fetchColumn();
         sendResponse('success','Notifications retrieved',['notifications'=>$notifications,'unread_count'=>$unread]);
@@ -1388,6 +1418,14 @@ if (preg_match('#^/content/team/(\d+)$#',$path,$m) && $method === 'PUT') {
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
+if (preg_match('#^/content/team/(\d+)$#',$path,$m) && $method === 'DELETE') {
+    requireAdmin($pdo);
+    try {
+        $pdo->prepare("DELETE FROM team_members WHERE id=?")->execute([$m[1]]);
+        sendResponse('success','Team member deleted');
+    } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
+}
+
 if ($path === '/content/homepage' && $method === 'GET') {
     try {
         $rows = $pdo->query("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('homepage_hero_image_id','homepage_why_choose_image_id')")->fetchAll(PDO::FETCH_KEY_PAIR);
@@ -1517,6 +1555,8 @@ function saveApplicationFiles($fileKey, $subdir) {
 if ($path === '/careers' && $method === 'GET') {
     try {
         ensureCareersTables($pdo);
+        // Auto-deactivate jobs whose deadline has passed
+        try { $pdo->exec("UPDATE job_listings SET is_active=0 WHERE is_active=1 AND deadline IS NOT NULL AND deadline < CURDATE()"); } catch (\Throwable $e2) {}
         $jobs = $pdo->query("SELECT *, COALESCE(NULLIF(job_type,''),type) as job_type FROM job_listings WHERE is_active=1 ORDER BY created_at DESC")->fetchAll();
         sendResponse('success','Jobs retrieved',['jobs'=>$jobs]);
     } catch (\Throwable $e) { sendResponse('success','OK',['jobs'=>[]]); }
