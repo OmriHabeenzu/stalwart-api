@@ -101,6 +101,7 @@ try {
     try { $pdo->exec("ALTER TABLE users ADD COLUMN last_login DATETIME DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE users ADD COLUMN last_login_ip VARCHAR(45) DEFAULT NULL"); } catch (\Throwable $e) {}
     $pdo->exec("CREATE TABLE IF NOT EXISTS page_content (id INT AUTO_INCREMENT PRIMARY KEY, page_key VARCHAR(100) NOT NULL, section_key VARCHAR(100) NOT NULL, label VARCHAR(255) NOT NULL, content TEXT, content_type VARCHAR(50) DEFAULT 'text', sort_order INT DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY uniq_page_section (page_key, section_key))");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS password_resets (id INT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(255) NOT NULL, token VARCHAR(255) NOT NULL, expires_at DATETIME NOT NULL, used TINYINT DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, INDEX idx_token (token), INDEX idx_email (email))");
     $pdo->exec("CREATE TABLE IF NOT EXISTS notices (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255) NOT NULL, message TEXT NOT NULL, type VARCHAR(50) DEFAULT 'info', pinned TINYINT DEFAULT 0, created_by INT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     try { $pdo->exec("ALTER TABLE notices MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT, ADD PRIMARY KEY (id)"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE notices ADD COLUMN created_by_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
@@ -289,6 +290,39 @@ if ($path === '/auth/profile' && $method === 'GET') {
     } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
 }
 
+if ($path === '/auth/profile/photo' && $method === 'POST') {
+    $user = requireAuth($pdo);
+    if (empty($_FILES['photo'])) sendResponse('error','No file uploaded',null,400);
+    $file = $_FILES['photo'];
+    if ($file['error'] !== UPLOAD_ERR_OK) sendResponse('error','Upload error',null,400);
+    $allowed = ['image/jpeg','image/png','image/gif','image/webp'];
+    if (!in_array($file['type'], $allowed)) sendResponse('error','Only image files allowed',null,400);
+    if ($file['size'] > 5 * 1024 * 1024) sendResponse('error','File too large (max 5MB)',null,400);
+    $uploadDir = __DIR__ . '/uploads/';
+    if (!is_dir($uploadDir)) mkdir($uploadDir, 0755, true);
+    $filename = 'avatar_' . $user['id'] . '_' . uniqid() . '.jpg';
+    $targetPath = $uploadDir . $filename;
+    if (!move_uploaded_file($file['tmp_name'], $targetPath)) sendResponse('error','Failed to save file',null,500);
+    if (function_exists('imagecreatefromstring')) {
+        $src = imagecreatefromstring(file_get_contents($targetPath));
+        if ($src) {
+            $ow = imagesx($src); $oh = imagesy($src);
+            $size = min($ow, $oh);
+            $cx = (int)(($ow - $size) / 2); $cy = (int)(($oh - $size) / 2);
+            $dst = imagecreatetruecolor(400, 400);
+            imagecopyresampled($dst, $src, 0, 0, $cx, $cy, 400, 400, $size, $size);
+            imagedestroy($src);
+            imagejpeg($dst, $targetPath, 85);
+            imagedestroy($dst);
+        }
+    }
+    $filePath = 'uploads/' . $filename;
+    try {
+        $pdo->prepare("UPDATE users SET profile_image=? WHERE id=?")->execute([$filePath, $user['id']]);
+        sendResponse('success','Photo updated', ['profile_image' => $filePath]);
+    } catch (\Throwable $e) { sendResponse('error','Failed to save',null,500); }
+}
+
 if ($path === '/auth/logout' && $method === 'POST') {
     $user = requireAuth($pdo);
     logActivity($pdo,$user['id'],$user['email'],'logout','User logged out');
@@ -314,6 +348,54 @@ if ($path === '/auth/change-password' && $method === 'POST') {
         if (!$row||!password_verify($current,$row['password'])) sendResponse('error','Current password incorrect',null,401);
         $pdo->prepare("UPDATE users SET password=? WHERE id=?")->execute([password_hash($new,PASSWORD_DEFAULT),$user['id']]);
         sendResponse('success','Password changed');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+// ==========================================
+// FORGOT / RESET PASSWORD
+// ==========================================
+if ($path === '/auth/forgot-password' && $method === 'POST') {
+    $data = getRequestData();
+    $email = trim(strtolower($data['email'] ?? ''));
+    if (empty($email)) sendResponse('error','Email required',null,400);
+    try {
+        $stmt = $pdo->prepare("SELECT id,name FROM users WHERE email=? AND is_active=1 LIMIT 1");
+        $stmt->execute([$email]);
+        $user = $stmt->fetch();
+        // Always return success to prevent email enumeration
+        if ($user) {
+            $token = bin2hex(random_bytes(32));
+            $expires = date('Y-m-d H:i:s', strtotime('+1 hour'));
+            $pdo->prepare("DELETE FROM password_resets WHERE email=?")->execute([$email]);
+            $pdo->prepare("INSERT INTO password_resets (email,token,expires_at) VALUES (?,?,?)")->execute([$email,$token,$expires]);
+            $siteRow = $pdo->query("SELECT setting_value FROM settings WHERE setting_key='site_url' LIMIT 1")->fetchColumn();
+            $baseUrl = $siteRow ?: 'https://stalwartzm.com';
+            $resetLink = rtrim($baseUrl,'/') . '/reset-password?token=' . $token;
+            $html = "<p>Hi {$user['name']},</p><p>You requested a password reset. Click the link below to set a new password. This link expires in 1 hour.</p><p><a href='{$resetLink}' style='background:#4f46e5;color:#fff;padding:10px 20px;text-decoration:none;border-radius:6px;display:inline-block;'>Reset Password</a></p><p>If you did not request this, ignore this email.</p><p>— Stalwart Zambia</p>";
+            sendEmail($email, $user['name'], 'Reset your Stalwart password', $html);
+        }
+        sendResponse('success','If that email is registered you will receive a reset link shortly');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if ($path === '/auth/reset-password' && $method === 'POST') {
+    $data = getRequestData();
+    $token = trim($data['token'] ?? '');
+    $newPass = $data['new_password'] ?? '';
+    if (empty($token) || empty($newPass)) sendResponse('error','Token and new password required',null,400);
+    if (strlen($newPass) < 8) sendResponse('error','Password must be at least 8 characters',null,400);
+    try {
+        $stmt = $pdo->prepare("SELECT * FROM password_resets WHERE token=? AND used=0 AND expires_at > NOW() LIMIT 1");
+        $stmt->execute([$token]);
+        $reset = $stmt->fetch();
+        if (!$reset) sendResponse('error','Invalid or expired reset link',null,400);
+        $userStmt = $pdo->prepare("SELECT id FROM users WHERE email=? AND is_active=1 LIMIT 1");
+        $userStmt->execute([$reset['email']]);
+        $user = $userStmt->fetch();
+        if (!$user) sendResponse('error','User not found',null,404);
+        $pdo->prepare("UPDATE users SET password=? WHERE id=?")->execute([password_hash($newPass,PASSWORD_DEFAULT),$user['id']]);
+        $pdo->prepare("UPDATE password_resets SET used=1 WHERE token=?")->execute([$token]);
+        sendResponse('success','Password reset successfully. You can now log in.');
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
@@ -1162,7 +1244,15 @@ if ($path === '/chat/sessions' && $method === 'POST') {
     try {
         $pdo->prepare("INSERT INTO chat_sessions (customer_name,customer_email,customer_phone,status,last_message_time) VALUES (?,?,?,?,NOW())")
             ->execute([$customerName,$data['customer_email']??'',$data['customer_phone']??'','active']);
-        sendResponse('success','Chat session created',['id'=>$pdo->lastInsertId()]);
+        $sessionId = $pdo->lastInsertId();
+        // Notify all active staff about new chat
+        try {
+            $staffIds = $pdo->query("SELECT id FROM users WHERE is_active=1")->fetchAll(PDO::FETCH_COLUMN);
+            foreach ($staffIds as $sid) {
+                createNotification($pdo, $sid, 'chat', "New chat from {$customerName} — check the Chat page");
+            }
+        } catch (\Throwable $e2) {}
+        sendResponse('success','Chat session created',['id'=>$sessionId]);
     } catch (\Throwable $e) { sendResponse('error','Failed to create chat session: '.$e->getMessage(),null,500); }
 }
 
