@@ -578,6 +578,37 @@ if ($path === '/settings' && ($method === 'POST' || $method === 'PUT')) {
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
+if ($path === '/admin/run-schema-fix' && $method === 'POST') {
+    // One-time unconditional escape hatch: the hourly migration-guard lock
+    // file (keyed by date('YmdH')) can be created by a request that ran
+    // BEFORE a schema fix was deployed, which then blocks that same fix from
+    // running for the rest of that hour with no way to clear the lock file
+    // on a live server without shell access. This bypasses the lock entirely.
+    requireAdmin($pdo);
+    $stmts = [
+        "ALTER TABLE tasks ADD COLUMN start_date DATE NULL AFTER due_time",
+        "ALTER TABLE tasks ADD COLUMN maturity_date DATE NULL AFTER start_date",
+        "ALTER TABLE tasks ADD COLUMN days_overdue INT NULL DEFAULT NULL AFTER maturity_date",
+        "ALTER TABLE tasks ADD COLUMN parent_task_id INT DEFAULT NULL",
+        "ALTER TABLE tasks ADD INDEX idx_parent_task_id (parent_task_id)",
+        "ALTER TABLE tasks ADD COLUMN last_recurred_at DATETIME NULL",
+        "ALTER TABLE task_assignees ADD COLUMN status ENUM('pending','in_progress','completed') DEFAULT 'pending' AFTER user_id",
+        "ALTER TABLE task_assignees ADD COLUMN completed_at DATETIME NULL AFTER status",
+        "ALTER TABLE task_assignees ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP AFTER completed_at",
+        "CREATE TABLE IF NOT EXISTS task_completions (id INT AUTO_INCREMENT PRIMARY KEY, task_id INT NOT NULL, completed_by INT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS client_documents (id INT AUTO_INCREMENT PRIMARY KEY, loan_account_id INT NOT NULL, document_type ENUM('passport_photo','id_document','receipt','loan_agreement','other') NOT NULL DEFAULT 'other', file_name VARCHAR(255) NOT NULL, original_filename VARCHAR(255) NOT NULL, file_size INT NOT NULL, mime_type VARCHAR(100) NOT NULL, uploaded_by INT DEFAULT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (loan_account_id) REFERENCES loan_accounts(id) ON DELETE CASCADE, FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE SET NULL, INDEX idx_loan_account (loan_account_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+        "ALTER TABLE loan_accounts MODIFY loan_status ENUM('pending','active','rejected','paid_off','defaulted','suspended') DEFAULT 'active'",
+        "ALTER TABLE loan_accounts MODIFY disbursement_date DATE NULL",
+        "ALTER TABLE loan_accounts MODIFY maturity_date DATE NULL",
+    ];
+    $results = [];
+    foreach ($stmts as $sql) {
+        try { $pdo->exec($sql); $results[] = "OK: $sql"; }
+        catch (\Throwable $e) { $results[] = "SKIP (".$e->getMessage()."): $sql"; }
+    }
+    sendResponse('success', 'Schema fix applied', ['results' => $results]);
+}
+
 if ($path === '/admin/test-email' && $method === 'POST') {
     requireAdmin($pdo);
     $data = getRequestData();
