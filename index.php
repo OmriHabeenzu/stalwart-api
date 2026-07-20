@@ -136,6 +136,7 @@ try {
     $pdo->exec("CREATE TABLE IF NOT EXISTS task_comments (id INT AUTO_INCREMENT PRIMARY KEY, task_id INT NOT NULL, user_id INT NOT NULL, comment TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     $pdo->exec("CREATE TABLE IF NOT EXISTS task_attachments (id INT AUTO_INCREMENT PRIMARY KEY, task_id INT NOT NULL, uploaded_by INT NOT NULL, file_name VARCHAR(255) NOT NULL, file_path VARCHAR(500) NOT NULL, file_size INT, mime_type VARCHAR(100), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     $pdo->exec("CREATE TABLE IF NOT EXISTS task_completions (id INT AUTO_INCREMENT PRIMARY KEY, task_id INT NOT NULL, completed_by INT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS task_completion_assignees (id INT AUTO_INCREMENT PRIMARY KEY, completion_id INT NOT NULL, user_id INT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     try { $pdo->exec("ALTER TABLE tasks ADD COLUMN category VARCHAR(50) DEFAULT 'general'"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE tasks ADD COLUMN due_time TIME DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE tasks ADD COLUMN recurrence VARCHAR(20) DEFAULT 'none'"); } catch (\Throwable $e) {}
@@ -1332,7 +1333,7 @@ if ($path === '/analytics/stats' && $method === 'GET') {
         try { $apps['total']=(int)$pdo->query("SELECT COUNT(*) FROM job_applications")->fetchColumn(); $apps['pending']=(int)$pdo->query("SELECT COUNT(*) FROM job_applications WHERE status='pending'")->fetchColumn(); $apps['this_month']=(int)$pdo->query("SELECT COUNT(*) FROM job_applications WHERE MONTH(created_at)=MONTH(NOW()) AND YEAR(created_at)=YEAR(NOW())")->fetchColumn(); } catch(Exception $e){}
         try { $tests['total']=(int)$pdo->query("SELECT COUNT(*) FROM testimonials")->fetchColumn(); $tests['approved']=(int)$pdo->query("SELECT COUNT(*) FROM testimonials WHERE is_approved=1")->fetchColumn(); $tests['pending']=$tests['total']-$tests['approved']; } catch(Exception $e){}
         try { $chats['total']=(int)$pdo->query("SELECT COUNT(*) FROM chat_sessions")->fetchColumn(); $chats['active']=(int)$pdo->query("SELECT COUNT(*) FROM chat_sessions WHERE status='active'")->fetchColumn(); $chats['messages']=(int)$pdo->query("SELECT COUNT(*) FROM chat_messages")->fetchColumn(); } catch(Exception $e){}
-        try { $tasks['total']=(int)$pdo->query("SELECT COUNT(*) FROM tasks")->fetchColumn(); $tasks['completed']=(int)$pdo->query("SELECT COUNT(*) FROM tasks WHERE status='completed'")->fetchColumn(); $tasks['pending']=(int)$pdo->query("SELECT COUNT(*) FROM tasks WHERE status='pending'")->fetchColumn(); } catch(Exception $e){}
+        try { $tasks['total']=(int)$pdo->query("SELECT COUNT(*) FROM tasks")->fetchColumn(); $tasks['completed']=(int)$pdo->query("SELECT (SELECT COUNT(*) FROM tasks WHERE status='completed') + (SELECT COUNT(*) FROM task_completions)")->fetchColumn(); $tasks['pending']=(int)$pdo->query("SELECT COUNT(*) FROM tasks WHERE status='pending'")->fetchColumn(); } catch(Exception $e){}
         try { $loans['active_accounts']=(int)$pdo->query("SELECT COUNT(*) FROM loan_accounts WHERE loan_status='active'")->fetchColumn(); $loans['total_payments']=(int)$pdo->query("SELECT COUNT(*) FROM loan_payments")->fetchColumn(); $loans['pending_payments']=(int)$pdo->query("SELECT COUNT(*) FROM loan_payments WHERE status='pending'")->fetchColumn(); $loans['total_revenue']=(float)$pdo->query("SELECT COALESCE(SUM(amount),0) FROM loan_payments WHERE status='completed'")->fetchColumn(); } catch(Exception $e){}
         sendResponse('success','Stats retrieved',['users'=>['total'=>$users],'logs'=>['total'=>$logs,'last_7_days'=>$logs7],'applications'=>$apps,'testimonials'=>$tests,'chats'=>$chats,'tasks'=>$tasks,'loans'=>$loans]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
@@ -1438,6 +1439,14 @@ if (preg_match('#^/tasks/(\d+)$#',$path,$m) && $method === 'PUT') {
             }
         }
 
+        // Keep each assignee's personal "done" checkbox in sync with the task's
+        // own status — previously these only synced if someone separately used
+        // the per-assignee toggle, which nobody did, so Dashboard/Staff
+        // Performance (which read task_assignees.status) always saw 0.
+        if (isset($data['status']) && $data['status'] === 'completed' && $old['status'] !== 'completed') {
+            $pdo->prepare("UPDATE task_assignees SET status='completed', completed_at=NOW() WHERE task_id=?")->execute([$taskId]);
+        }
+
         // Completion-triggered recurrence: only for tasks that already have a
         // Recurrence set (not 'none') — a plain one-off task just stays completed.
         // Resets the SAME row back to pending with a shifted due date, logging
@@ -1450,8 +1459,20 @@ if (preg_match('#^/tasks/(\d+)$#',$path,$m) && $method === 'PUT') {
             $interval = $intervalMap[$old['recurrence']] ?? '+1 day';
             $recurrenceNextDue = date('Y-m-d', strtotime($interval));
             $pdo->prepare("INSERT INTO task_completions (task_id, completed_by) VALUES (?, ?)")->execute([$taskId, $user['id']]);
+            $completionId = $pdo->lastInsertId();
+            $cycleAssignees = $pdo->prepare("SELECT user_id FROM task_assignees WHERE task_id=?");
+            $cycleAssignees->execute([$taskId]);
+            $cycleAssigneeIds = $cycleAssignees->fetchAll(PDO::FETCH_COLUMN);
+            if (!empty($cycleAssigneeIds)) {
+                $caStmt = $pdo->prepare("INSERT INTO task_completion_assignees (completion_id, user_id) VALUES (?, ?)");
+                foreach ($cycleAssigneeIds as $uid) $caStmt->execute([$completionId, $uid]);
+            }
             $pdo->prepare("UPDATE tasks SET status='pending', due_date=?, start_date=?, maturity_date=NULL, days_overdue=NULL, completed_at=NULL, last_recurred_at=NOW(), updated_at=NOW() WHERE id=?")
                 ->execute([$recurrenceNextDue, $recurrenceNextDue, $taskId]);
+            // Each cycle starts fresh — reset the live per-assignee checkboxes
+            // too, matching the task's own reset (historical credit for this
+            // cycle is preserved above in task_completion_assignees).
+            $pdo->prepare("UPDATE task_assignees SET status='pending', completed_at=NULL WHERE task_id=?")->execute([$taskId]);
             $recurrenceReset = true;
         }
 
@@ -1497,6 +1518,7 @@ if (preg_match('#^/tasks/(\d+)$#',$path,$m) && $method === 'DELETE') {
             $pdo->prepare("DELETE FROM task_assignees WHERE task_id=?")->execute([$cid]);
             $pdo->prepare("DELETE FROM task_comments WHERE task_id=?")->execute([$cid]);
             $pdo->prepare("DELETE FROM task_attachments WHERE task_id=?")->execute([$cid]);
+            $pdo->prepare("DELETE tca FROM task_completion_assignees tca JOIN task_completions tc ON tc.id=tca.completion_id WHERE tc.task_id=?")->execute([$cid]);
             $pdo->prepare("DELETE FROM task_completions WHERE task_id=?")->execute([$cid]);
         }
         if (!empty($childIds)) {
@@ -1506,6 +1528,7 @@ if (preg_match('#^/tasks/(\d+)$#',$path,$m) && $method === 'DELETE') {
         $pdo->prepare("DELETE FROM task_assignees WHERE task_id=?")->execute([$taskId]);
         $pdo->prepare("DELETE FROM task_comments WHERE task_id=?")->execute([$taskId]);
         $pdo->prepare("DELETE FROM task_attachments WHERE task_id=?")->execute([$taskId]);
+        $pdo->prepare("DELETE tca FROM task_completion_assignees tca JOIN task_completions tc ON tc.id=tca.completion_id WHERE tc.task_id=?")->execute([$taskId]);
         $pdo->prepare("DELETE FROM task_completions WHERE task_id=?")->execute([$taskId]);
         $pdo->prepare("DELETE FROM tasks WHERE id=?")->execute([$taskId]);
         sendResponse('success','Task deleted');
@@ -2653,8 +2676,16 @@ if ($path === '/analytics/staff' && $method === 'GET') {
         $users=$pdo->query("SELECT id,name,email,role FROM users WHERE is_active=1 ORDER BY name")->fetchAll();
         $performance=[];
         foreach ($users as $u) {
-            $taskStmt=$pdo->prepare("SELECT COUNT(DISTINCT t.id) AS total_assigned,SUM(CASE WHEN ta.status='completed' THEN 1 ELSE 0 END) AS total_completed,SUM(CASE WHEN ta.status!='completed' AND t.status='pending' THEN 1 ELSE 0 END) AS pending,SUM(CASE WHEN ta.status!='completed' AND t.status='in_progress' THEN 1 ELSE 0 END) AS in_progress,SUM(CASE WHEN ta.status='completed' AND YEAR(ta.completed_at)=? AND MONTH(ta.completed_at)=? THEN 1 ELSE 0 END) AS completed_this_month FROM tasks t JOIN task_assignees ta ON ta.task_id=t.id WHERE ta.user_id=?");
+            // Recurring tasks reset task_assignees back to pending every cycle
+            // (so history doesn't survive there) — their completions instead
+            // live in task_completion_assignees, one row per assignee per
+            // cycle, which is where the "count every cycle" numbers come from.
+            $taskStmt=$pdo->prepare("SELECT COUNT(DISTINCT t.id) AS total_assigned,SUM(CASE WHEN ta.status='completed' AND t.recurrence='none' THEN 1 ELSE 0 END) AS total_completed,SUM(CASE WHEN ta.status!='completed' AND t.status='pending' THEN 1 ELSE 0 END) AS pending,SUM(CASE WHEN ta.status!='completed' AND t.status='in_progress' THEN 1 ELSE 0 END) AS in_progress,SUM(CASE WHEN ta.status='completed' AND t.recurrence='none' AND YEAR(ta.completed_at)=? AND MONTH(ta.completed_at)=? THEN 1 ELSE 0 END) AS completed_this_month FROM tasks t JOIN task_assignees ta ON ta.task_id=t.id WHERE ta.user_id=?");
             $taskStmt->execute([$year,$mon,$u['id']]); $taskData=$taskStmt->fetch();
+            $recurStmt=$pdo->prepare("SELECT COUNT(*) AS recurring_total, SUM(CASE WHEN YEAR(tc.created_at)=? AND MONTH(tc.created_at)=? THEN 1 ELSE 0 END) AS recurring_this_month FROM task_completion_assignees tca JOIN task_completions tc ON tc.id=tca.completion_id WHERE tca.user_id=?");
+            $recurStmt->execute([$year,$mon,$u['id']]); $recurData=$recurStmt->fetch();
+            $taskData['total_completed'] = (int)($taskData['total_completed'] ?? 0) + (int)($recurData['recurring_total'] ?? 0);
+            $taskData['completed_this_month'] = (int)($taskData['completed_this_month'] ?? 0) + (int)($recurData['recurring_this_month'] ?? 0);
             $callStmt=$pdo->prepare("SELECT COUNT(*) AS report_days,COALESCE(SUM(total_count),0) AS total_calls,COALESCE(SUM(answered_count),0) AS answered_calls,COALESCE(SUM(unanswered_count),0) AS unanswered_calls,ROUND(COALESCE(SUM(answered_count),0)/NULLIF(SUM(total_count),0)*100,1) AS answer_rate FROM call_reports WHERE (staff_id=? OR (staff_id IS NULL AND staff_name=?)) AND YEAR(report_date)=? AND MONTH(report_date)=?");
             $callStmt->execute([$u['id'],$u['name'],$year,$mon]); $callData=$callStmt->fetch();
             $performance[]=['id'=>$u['id'],'name'=>$u['name'],'email'=>$u['email'],'role'=>$u['role'],'tasks'=>$taskData,'calls'=>$callData];
