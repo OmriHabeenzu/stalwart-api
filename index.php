@@ -144,6 +144,20 @@ try {
     try { $pdo->exec("ALTER TABLE tasks ADD COLUMN parent_task_id INT DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE tasks ADD INDEX idx_parent_task_id (parent_task_id)"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE tasks ADD COLUMN last_recurred_at DATETIME NULL"); } catch (\Throwable $e) {}
+    // These were previously only applied via one-off migration scripts run
+    // manually against the local dev DB — never against production, which is
+    // why live task creation failed with "Unknown column 'start_date'".
+    // Moved inline so every deploy self-heals the live schema too.
+    try { $pdo->exec("ALTER TABLE tasks ADD COLUMN start_date DATE NULL AFTER due_time"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE tasks ADD COLUMN maturity_date DATE NULL AFTER start_date"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE tasks ADD COLUMN days_overdue INT NULL DEFAULT NULL AFTER maturity_date"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE task_assignees ADD COLUMN status ENUM('pending','in_progress','completed') DEFAULT 'pending' AFTER user_id"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE task_assignees ADD COLUMN completed_at DATETIME NULL AFTER status"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE task_assignees ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP AFTER completed_at"); } catch (\Throwable $e) {}
+    $pdo->exec("CREATE TABLE IF NOT EXISTS client_documents (id INT AUTO_INCREMENT PRIMARY KEY, loan_account_id INT NOT NULL, document_type ENUM('passport_photo','id_document','receipt','loan_agreement','other') NOT NULL DEFAULT 'other', file_name VARCHAR(255) NOT NULL, original_filename VARCHAR(255) NOT NULL, file_size INT NOT NULL, mime_type VARCHAR(100) NOT NULL, uploaded_by INT DEFAULT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (loan_account_id) REFERENCES loan_accounts(id) ON DELETE CASCADE, FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE SET NULL, INDEX idx_loan_account (loan_account_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+    try { $pdo->exec("ALTER TABLE loan_accounts MODIFY loan_status ENUM('pending','active','rejected','paid_off','defaulted','suspended') DEFAULT 'active'"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE loan_accounts MODIFY disbursement_date DATE NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE loan_accounts MODIFY maturity_date DATE NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE task_comments MODIFY COLUMN user_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE task_comments ADD COLUMN user_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE task_attachments ADD COLUMN mime_type VARCHAR(100) DEFAULT NULL"); } catch (\Throwable $e) {}
