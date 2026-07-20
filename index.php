@@ -135,12 +135,15 @@ try {
     $pdo->exec("CREATE TABLE IF NOT EXISTS task_assignees (id INT AUTO_INCREMENT PRIMARY KEY, task_id INT NOT NULL, user_id INT NOT NULL, status ENUM('pending','in_progress','completed') DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uniq_task_user (task_id,user_id))");
     $pdo->exec("CREATE TABLE IF NOT EXISTS task_comments (id INT AUTO_INCREMENT PRIMARY KEY, task_id INT NOT NULL, user_id INT NOT NULL, comment TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     $pdo->exec("CREATE TABLE IF NOT EXISTS task_attachments (id INT AUTO_INCREMENT PRIMARY KEY, task_id INT NOT NULL, uploaded_by INT NOT NULL, file_name VARCHAR(255) NOT NULL, file_path VARCHAR(500) NOT NULL, file_size INT, mime_type VARCHAR(100), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS task_completions (id INT AUTO_INCREMENT PRIMARY KEY, task_id INT NOT NULL, completed_by INT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     try { $pdo->exec("ALTER TABLE tasks ADD COLUMN category VARCHAR(50) DEFAULT 'general'"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE tasks ADD COLUMN due_time TIME DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE tasks ADD COLUMN recurrence VARCHAR(20) DEFAULT 'none'"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE tasks ADD COLUMN color VARCHAR(20) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE tasks ADD COLUMN completed_at DATETIME DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE tasks ADD COLUMN parent_task_id INT DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE tasks ADD INDEX idx_parent_task_id (parent_task_id)"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE tasks ADD COLUMN last_recurred_at DATETIME NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE task_comments MODIFY COLUMN user_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE task_comments ADD COLUMN user_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE task_attachments ADD COLUMN mime_type VARCHAR(100) DEFAULT NULL"); } catch (\Throwable $e) {}
@@ -223,6 +226,43 @@ function sendEmail($to, $toName, $subject, $htmlBody) {
         $mail->addAddress($to,$toName); $mail->isHTML(true); $mail->Subject=$subject; $mail->Body=$htmlBody;
         $mail->send();
     } catch (Exception $e) { error_log('Mail error: '.$e->getMessage()); }
+}
+// Emails every current assignee of a task with a short list of what changed —
+// used on creation (new assignment) and on update (status/reassignment/date
+// changes), never on every field edit (title/description/etc. stay silent).
+function emailTaskAssignees($pdo, $taskId, $title, $subject, $changeLines) {
+    if (empty($changeLines)) return;
+    try {
+        $stmt = $pdo->prepare("SELECT u.email, u.name FROM task_assignees ta JOIN users u ON u.id=ta.user_id WHERE ta.task_id=? AND u.email IS NOT NULL AND u.email!=''");
+        $stmt->execute([$taskId]);
+        $items = implode('', array_map(fn($l) => '<li>' . htmlspecialchars($l) . '</li>', $changeLines));
+        foreach ($stmt->fetchAll() as $a) {
+            $html = "<p>Hi {$a['name']},</p><p>Task <strong>" . htmlspecialchars($title) . "</strong> has been updated:</p><ul>{$items}</ul><p>— Stalwart Zambia</p>";
+            sendEmail($a['email'], $a['name'], $subject, $html);
+        }
+    } catch (\Throwable $e) {}
+}
+// Shared by POST /tasks and POST /tasks/{id}/subtasks — inserts a task row
+// (optionally as a child via $parentTaskId), assigns users, and emails them.
+// Returns the new task id, or null if title is blank.
+function createTaskRow($pdo, $user, $data, $parentTaskId = null) {
+    $title = trim($data['title'] ?? '');
+    if (empty($title)) return null;
+    $dueDate = !empty($data['due_date'] ?? $data['dueDate'] ?? '') ? ($data['due_date'] ?? $data['dueDate']) : null;
+    $dueTime = !empty($data['due_time'] ?? $data['dueTime'] ?? '') ? ($data['due_time'] ?? $data['dueTime']) : null;
+    $startDate = !empty($data['start_date'] ?? $data['startDate'] ?? '') ? ($data['start_date'] ?? $data['startDate']) : null;
+    $maturityDate = !empty($data['maturity_date'] ?? $data['maturityDate'] ?? '') ? ($data['maturity_date'] ?? $data['maturityDate']) : null;
+    $status = $data['status'] ?? 'pending';
+    $pdo->prepare("INSERT INTO tasks (title,description,status,priority,category,due_date,due_time,start_date,maturity_date,recurrence,color,created_by,parent_task_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        ->execute([$title,$data['description']??'',$status,$data['priority']??'medium',$data['category']??'general',$dueDate,$dueTime,$startDate,$maturityDate,$data['recurrence']??'none',$data['color']??null,$user['id'],$parentTaskId]);
+    $taskId = $pdo->lastInsertId();
+    $assignees = $data['assignees'] ?? $data['assignee_ids'] ?? [];
+    if (!empty($assignees)) {
+        $stmt = $pdo->prepare("INSERT IGNORE INTO task_assignees (task_id,user_id,status) VALUES (?,?,'pending')");
+        foreach ($assignees as $uid) { $uid=(int)$uid; if ($uid>0) $stmt->execute([$taskId,$uid]); }
+        emailTaskAssignees($pdo, $taskId, $title, "New Task Assigned: {$title}", ["You've been assigned to this task."]);
+    }
+    return $taskId;
 }
 function base64url_enc($d) { return rtrim(strtr(base64_encode($d),'+/','-_'),'='); }
 
@@ -524,6 +564,36 @@ if ($path === '/settings' && ($method === 'POST' || $method === 'PUT')) {
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
+if ($path === '/admin/test-email' && $method === 'POST') {
+    requireAdmin($pdo);
+    $data = getRequestData();
+    $to = trim($data['email'] ?? '');
+    if (empty($to) || !filter_var($to, FILTER_VALIDATE_EMAIL)) sendResponse('error','Valid email required',null,400);
+    try {
+        $stmt = $pdo->query("SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('smtpHost','smtpPort','smtpUser','smtpPassword','smtpFromEmail','smtpFromName','smtpEncryption')");
+        $cfg = []; foreach ($stmt->fetchAll() as $row) $cfg[$row['setting_key']] = $row['setting_value'];
+        $host = trim($cfg['smtpHost']??''); $user = trim($cfg['smtpUser']??''); $pass = $cfg['smtpPassword']??'';
+        if (empty($host)||empty($user)||empty($pass)) {
+            @mail($to,'Stalwart Zambia — Test Email','<p>This is a test email sent via PHP mail() (no SMTP configured).</p>',"Content-Type: text/html\r\nFrom: Stalwart <noreply@stalwartzm.com>");
+            sendResponse('success','Test email sent via PHP mail() fallback (no SMTP configured)');
+        }
+        $mail = new PHPMailer(true); $mail->isSMTP(); $mail->Host=$host; $mail->Port=(int)($cfg['smtpPort']??587);
+        $mail->SMTPAuth=true; $mail->Username=$user; $mail->Password=$pass; $mail->CharSet='UTF-8'; $mail->Timeout=15;
+        $enc = strtolower($cfg['smtpEncryption']??'tls');
+        if ($enc==='ssl') $mail->SMTPSecure=PHPMailer::ENCRYPTION_SMTPS;
+        elseif ($enc==='tls') $mail->SMTPSecure=PHPMailer::ENCRYPTION_STARTTLS;
+        $mail->SMTPOptions=['ssl'=>['verify_peer'=>false,'verify_peer_name'=>false,'allow_self_signed'=>true]];
+        $mail->setFrom(trim($cfg['smtpFromEmail']??'')?: $user, trim($cfg['smtpFromName']??'')?: 'Stalwart Zambia');
+        $mail->addAddress($to); $mail->isHTML(true);
+        $mail->Subject = 'Stalwart Zambia — Test Email';
+        $mail->Body = '<p>This is a test email confirming your SMTP settings are working.</p>';
+        $mail->send();
+        sendResponse('success','Test email sent successfully');
+    } catch (PHPMailerException $e) {
+        sendResponse('error','Send failed: '.$e->getMessage(),null,500);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
 // ==========================================
 // CALL SCHEDULE
 // ==========================================
@@ -686,24 +756,14 @@ if ($path === '/calendar/events' && $method === 'GET') {
         if (empty($calendarId)||empty($serviceAccountJson)) sendResponse('success','No calendar configured',['events'=>[]]);
         $sa = json_decode($serviceAccountJson, true);
         if (!$sa) sendResponse('success','Invalid service account',['events'=>[]]);
-        $now = time();
-        $h = base64url_enc(json_encode(['alg'=>'RS256','typ'=>'JWT']));
-        $p = base64url_enc(json_encode(['iss'=>$sa['client_email'],'scope'=>'https://www.googleapis.com/auth/calendar.readonly','aud'=>'https://oauth2.googleapis.com/token','exp'=>$now+3600,'iat'=>$now]));
-        $input = "$h.$p";
-        openssl_sign($input,$sig,$sa['private_key'],'SHA256');
-        $jwt = $input.'.'.base64url_enc($sig);
-        $ch = curl_init('https://oauth2.googleapis.com/token');
-        curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>http_build_query(['grant_type'=>'urn:ietf:params:oauth:grant-type:jwt-bearer','assertion'=>$jwt]),CURLOPT_HTTPHEADER=>['Content-Type: application/x-www-form-urlencoded'],CURLOPT_TIMEOUT=>15]);
-        $tokenData = json_decode(curl_exec($ch),true); curl_close($ch);
-        $token = $tokenData['access_token'] ?? null;
+        $token = getGCalToken($sa);
         if (!$token) sendResponse('success','Could not get calendar token',['events'=>[]]);
         $date = $_GET['date'] ?? date('Y-m-d');
         $timeMin = urlencode($date.'T00:00:00+02:00');
         $timeMax = urlencode($date.'T23:59:59+02:00');
         $url = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events?timeMin={$timeMin}&timeMax={$timeMax}&singleEvents=true&orderBy=startTime&maxResults=500";
-        $ch2 = curl_init($url);
-        curl_setopt_array($ch2,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}"],CURLOPT_TIMEOUT=>30]);
-        $evData = json_decode(curl_exec($ch2),true); curl_close($ch2);
+        $evData = curlGetGCalRetry($url, $token);
+        if ($evData === null) sendResponse('error','Could not reach Google Calendar to list events. Please try again.',null,502);
         sendResponse('success','Events retrieved',['events'=>$evData['items']??[]]);
     } catch (\Throwable $e) { sendResponse('success','Calendar error: '.$e->getMessage(),['events'=>[]]);  }
 }
@@ -721,24 +781,14 @@ if ($path === '/calendar/today' && $method === 'GET') {
         if (!$hasCal) sendResponse('error','Calendar ID not configured',['missing'=>'calendar_id'],400);
         $sa = json_decode($serviceAccountJson, true);
         if (!$sa) sendResponse('error','Invalid service account JSON',['missing'=>'service_account'],400);
-        $now = time();
-        $h = base64url_enc(json_encode(['alg'=>'RS256','typ'=>'JWT']));
-        $p = base64url_enc(json_encode(['iss'=>$sa['client_email'],'scope'=>'https://www.googleapis.com/auth/calendar.readonly','aud'=>'https://oauth2.googleapis.com/token','exp'=>$now+3600,'iat'=>$now]));
-        $input = "$h.$p";
-        openssl_sign($input,$sig,$sa['private_key'],'SHA256');
-        $jwt = $input.'.'.base64url_enc($sig);
-        $ch = curl_init('https://oauth2.googleapis.com/token');
-        curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>http_build_query(['grant_type'=>'urn:ietf:params:oauth:grant-type:jwt-bearer','assertion'=>$jwt]),CURLOPT_HTTPHEADER=>['Content-Type: application/x-www-form-urlencoded'],CURLOPT_TIMEOUT=>15]);
-        $tokenData = json_decode(curl_exec($ch),true); curl_close($ch);
-        $token = $tokenData['access_token'] ?? null;
+        $token = getGCalToken($sa);
         if (!$token) sendResponse('error','Could not authenticate with Google Calendar',null,500);
         $date = $_GET['date'] ?? date('Y-m-d');
         $timeMin = urlencode($date.'T00:00:00+02:00');
         $timeMax = urlencode($date.'T23:59:59+02:00');
         $url = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events?timeMin={$timeMin}&timeMax={$timeMax}&singleEvents=true&orderBy=startTime&maxResults=500";
-        $ch2 = curl_init($url);
-        curl_setopt_array($ch2,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}"],CURLOPT_TIMEOUT=>30]);
-        $evData = json_decode(curl_exec($ch2),true); curl_close($ch2);
+        $evData = curlGetGCalRetry($url, $token);
+        if ($evData === null) sendResponse('error','Could not reach Google Calendar to list events. Please try again.',null,502);
         $events = array_map(fn($e) => ['name'=>$e['summary']??'','event_id'=>$e['id']??''], $evData['items']??[]);
 
         // Server-side caller split — prevents two callers ever seeing the same names
@@ -789,10 +839,42 @@ function getGCalToken($sa) {
     $p = base64url_enc(json_encode(['iss'=>$sa['client_email'],'scope'=>'https://www.googleapis.com/auth/calendar','aud'=>'https://oauth2.googleapis.com/token','exp'=>$now+3600,'iat'=>$now]));
     $input = "$h.$p"; openssl_sign($input,$sig,$sa['private_key'],'SHA256');
     $jwt = $input.'.'.base64url_enc($sig);
-    $ch = curl_init('https://oauth2.googleapis.com/token');
-    curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>http_build_query(['grant_type'=>'urn:ietf:params:oauth:grant-type:jwt-bearer','assertion'=>$jwt]),CURLOPT_HTTPHEADER=>['Content-Type: application/x-www-form-urlencoded'],CURLOPT_TIMEOUT=>15]);
-    $d = json_decode(curl_exec($ch),true); curl_close($ch);
-    return $d['access_token'] ?? null;
+
+    // The connection to Google's token endpoint is intermittently flaky from this
+    // network — some attempts hang until timeout while immediately-retried ones
+    // succeed in ~1-2s. Retry a few times with a short per-attempt timeout rather
+    // than making the caller wait out one long timeout and fail outright.
+    for ($attempt = 1; $attempt <= 6; $attempt++) {
+        $ch = curl_init('https://oauth2.googleapis.com/token');
+        curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>http_build_query(['grant_type'=>'urn:ietf:params:oauth:grant-type:jwt-bearer','assertion'=>$jwt]),CURLOPT_HTTPHEADER=>['Content-Type: application/x-www-form-urlencoded'],CURLOPT_TIMEOUT=>5,CURLOPT_CONNECTTIMEOUT=>5]);
+        $result = curl_exec($ch);
+        curl_close($ch);
+        $d = json_decode($result, true);
+        if (isset($d['access_token'])) return $d['access_token'];
+    }
+    return null;
+}
+
+// Same intermittent-network problem affects the actual Calendar API calls, not
+// just the token exchange. A plain curl_exec() that fails (timeout/DNS/reset)
+// returns false, and json_decode(false) is null — which every call site here
+// used to treat identically to "Google returned zero items", silently masking
+// real connectivity failures as empty results. This distinguishes the two:
+// returns the decoded response on success (even if genuinely empty), or null
+// only when every retry truly failed to reach Google at all.
+function curlGetGCalRetry($url, $token, $maxAttempts = 4, $timeout = 6) {
+    for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}"],CURLOPT_TIMEOUT=>$timeout,CURLOPT_CONNECTTIMEOUT=>$timeout]);
+        $result = curl_exec($ch);
+        $ok = curl_errno($ch) === 0;
+        curl_close($ch);
+        if ($ok) {
+            $decoded = json_decode($result, true);
+            if ($decoded !== null) return $decoded;
+        }
+    }
+    return null;
 }
 function getGCalSettings($pdo) {
     return $pdo->query("SELECT setting_key,setting_value FROM settings WHERE setting_key IN ('google_calendar_id','google_service_account_json')")->fetchAll(\PDO::FETCH_KEY_PAIR);
@@ -809,6 +891,24 @@ function replaceKBalance($desc,$newBal) {
     $maxAmt=0;$maxIdx=0;
     foreach ($m[1] as $i=>$match) { $amt=floatval(str_replace(',','',$match[0])); if($amt>$maxAmt){$maxAmt=$amt;$maxIdx=$i;} }
     return substr_replace($desc,'K'.number_format($newBal,2),$m[0][$maxIdx][1],strlen($m[0][$maxIdx][0]));
+}
+// Mirrors the frontend's isCleared()/getLoanCategory() (EventPlannerPage.jsx /
+// ClientsPage.jsx) — same naming convention embedded in calendar event titles:
+// "." = stagnant, "," = active, ends with "?" = standby (waiting to confirm,
+// skipped by the automated reschedule), else paid (only if explicitly marked
+// cleared/K0) or active otherwise.
+function isEventCleared($name, $desc = '') {
+    if (stripos($name, 'cleared') !== false) return true;
+    if (stripos($desc, 'cleared') !== false) return true;
+    if (preg_match('/K\s*0+(\.0+)?\b/i', $desc)) return true;
+    return false;
+}
+function getEventCategory($name, $desc = '') {
+    if (strpos($name, '.') !== false) return 'stagnant';
+    if (strpos($name, ',') !== false) return 'active';
+    if (substr(rtrim($name), -1) === '?') return 'standby';
+    if (isEventCleared($name, $desc)) return 'paid';
+    return 'active';
 }
 function formatOrdinalDate($dateStr) {
     $d=new \DateTime($dateStr); $day=(int)$d->format('j');
@@ -841,9 +941,8 @@ if ($path === '/planner/events' && $method === 'GET') {
         $timeMin = urlencode($date.'T00:00:00+02:00');
         $timeMax = urlencode($date.'T23:59:59+02:00');
         $url = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events?timeMin={$timeMin}&timeMax={$timeMax}&singleEvents=true&orderBy=startTime&maxResults=2500";
-        $ch = curl_init($url);
-        curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}"],CURLOPT_TIMEOUT=>20]);
-        $evData = json_decode(curl_exec($ch),true); curl_close($ch);
+        $evData = curlGetGCalRetry($url, $token);
+        if ($evData === null) sendResponse('error','Could not reach Google Calendar to list events. Please try again.',null,502);
 
         $includeDesc = ($_GET['desc'] ?? '') === '1';
         $events = [];
@@ -888,57 +987,192 @@ if ($path === '/planner/reschedule' && $method === 'POST') {
         $token = getGCalToken($sa);
         if (!$token) sendResponse('error','Could not authenticate with Google Calendar',null,500);
 
-        $endDate = date('Y-m-d', strtotime($newDate . ' +1 day'));
-        $success = 0; $failed = [];
-        $baseUrl = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events/";
+        $result = rescheduleEvents($token, $calendarId, $events, $newDate);
+        sendResponse('success','Reschedule complete',$result);
+    } catch (\Throwable $e) { sendResponse('error',$e->getMessage(),null,500); }
+}
 
-        foreach ($events as $ev) {
-            $eventId   = $ev['id'] ?? '';
-            $newBalance= isset($ev['new_balance']) && $ev['new_balance'] > 0 ? floatval($ev['new_balance']) : null;
-            if (!$eventId) continue;
+// Shared by /planner/reschedule (manual, admin-initiated) and /planner/auto-reschedule
+// (cron-triggered daily sweep) — moves each event's date to $newDate, optionally
+// updating its balance, and reports back per-item success/failure. $events is
+// [{id, new_balance?}].
+function rescheduleEvents($token, $calendarId, $events, $newDate) {
+    $endDate = date('Y-m-d', strtotime($newDate . ' +1 day'));
+    $success = 0; $failed = [];
+    $baseUrl = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events/";
 
-            // GET event to read current description
-            $ch = curl_init($baseUrl.urlencode($eventId));
-            curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}"],CURLOPT_TIMEOUT=>15]);
-            $evData = json_decode(curl_exec($ch),true); curl_close($ch);
+    foreach ($events as $ev) {
+        $eventId   = $ev['id'] ?? '';
+        $newBalance= isset($ev['new_balance']) && $ev['new_balance'] > 0 ? floatval($ev['new_balance']) : null;
+        if (!$eventId) continue;
 
-            $desc = updateDateInDesc($evData['description'] ?? '', $newDate);
-            if ($newBalance !== null) $desc = replaceKBalance($desc, $newBalance);
+        // GET event to read current description
+        $evData = curlGetGCalRetry($baseUrl.urlencode($eventId), $token);
+        if ($evData === null) {
+            $failed[] = "{$eventId}: could not reach Google Calendar to read this event — skipped";
+            continue;
+        }
 
-            // Preserve the original time format: timed events use dateTime, all-day use date.
-            // Google silently ignores date changes when the format doesn't match the original.
-            if (isset($evData['start']['dateTime'])) {
-                // Timed event — replace only the date portion (first 10 chars), keep the time+tz suffix
-                $tSuffix  = substr($evData['start']['dateTime'], 10);
-                $endSuffix= isset($evData['end']['dateTime']) ? substr($evData['end']['dateTime'], 10) : $tSuffix;
-                $payload = json_encode([
-                    'start'       => ['dateTime' => $newDate . $tSuffix,   'timeZone' => $evData['start']['timeZone'] ?? 'Africa/Lusaka'],
-                    'end'         => ['dateTime' => $newDate . $endSuffix, 'timeZone' => $evData['end']['timeZone']   ?? 'Africa/Lusaka'],
-                    'description' => $desc,
-                ]);
+        $desc = updateDateInDesc($evData['description'] ?? '', $newDate);
+        if ($newBalance !== null) $desc = replaceKBalance($desc, $newBalance);
+
+        // Preserve the original time format: timed events use dateTime, all-day use date.
+        // Google silently ignores date changes when the format doesn't match the original.
+        if (isset($evData['start']['dateTime'])) {
+            // Timed event — replace only the date portion (first 10 chars), keep the time+tz suffix
+            $tSuffix  = substr($evData['start']['dateTime'], 10);
+            $endSuffix= isset($evData['end']['dateTime']) ? substr($evData['end']['dateTime'], 10) : $tSuffix;
+            $payload = json_encode([
+                'start'       => ['dateTime' => $newDate . $tSuffix,   'timeZone' => $evData['start']['timeZone'] ?? 'Africa/Lusaka'],
+                'end'         => ['dateTime' => $newDate . $endSuffix, 'timeZone' => $evData['end']['timeZone']   ?? 'Africa/Lusaka'],
+                'description' => $desc,
+            ]);
+        } else {
+            $payload = json_encode(['start'=>['date'=>$newDate],'end'=>['date'=>$endDate],'description'=>$desc]);
+        }
+        $ch = curl_init($baseUrl.urlencode($eventId).'?sendUpdates=all');
+        curl_setopt_array($ch,[CURLOPT_CUSTOMREQUEST=>'PATCH',CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}","Content-Type: application/json"],CURLOPT_TIMEOUT=>15]);
+        $res = json_decode(curl_exec($ch),true);
+        $code = curl_getinfo($ch,CURLINFO_HTTP_CODE); curl_close($ch);
+
+        if ($code===200 && isset($res['id'])) {
+            // Verify Google actually moved the event — 200 doesn't guarantee the date changed
+            $returnedDate = $res['start']['date'] ?? substr($res['start']['dateTime'] ?? '', 0, 10);
+            if ($returnedDate === $newDate) {
+                $success++;
             } else {
-                $payload = json_encode(['start'=>['date'=>$newDate],'end'=>['date'=>$endDate],'description'=>$desc]);
+                $evName = $evData['summary'] ?? $eventId;
+                $failed[] = $evName . ': date not updated (still ' . ($returnedDate ?: 'unknown') . ') — format mismatch?';
             }
-            $ch = curl_init($baseUrl.urlencode($eventId).'?sendUpdates=all');
-            curl_setopt_array($ch,[CURLOPT_CUSTOMREQUEST=>'PATCH',CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}","Content-Type: application/json"],CURLOPT_TIMEOUT=>15]);
-            $res = json_decode(curl_exec($ch),true);
-            $code = curl_getinfo($ch,CURLINFO_HTTP_CODE); curl_close($ch);
+        } else {
+            $errMsg = $res['error']['message'] ?? "HTTP $code";
+            $failed[] = ($evData['summary']??$eventId).': '.$errMsg;
+        }
+    }
+    return ['success'=>$success,'failed'=>$failed,'total'=>count($events)];
+}
 
-            if ($code===200 && isset($res['id'])) {
-                // Verify Google actually moved the event — 200 doesn't guarantee the date changed
-                $returnedDate = $res['start']['date'] ?? substr($res['start']['dateTime'] ?? '', 0, 10);
-                if ($returnedDate === $newDate) {
-                    $success++;
-                } else {
-                    $evName = $evData['summary'] ?? $eventId;
-                    $failed[] = $evName . ': date not updated (still ' . ($returnedDate ?: 'unknown') . ') — format mismatch?';
-                }
+// ==========================================
+// EVENT PLANNER — automated daily reschedule (cron-triggered, not an admin session)
+// ==========================================
+// Two scheduled hits of this same endpoint:
+//   mode=daily         ~15:20 — reschedules everything EXCEPT Standby ("...?") to
+//                       tomorrow. Standby clients are left untouched.
+//   mode=standby_sweep ~21:00 — sweeps up any Standby-tagged event still sitting on
+//                       today's date (i.e. wasn't otherwise touched) and force-moves
+//                       it to tomorrow too, so nothing goes stale overnight. The "?"
+//                       stays in the name — still Standby tomorrow until removed.
+// No interest/balance recalculation in either mode — date-only move.
+if ($path === '/planner/auto-reschedule' && $method === 'GET') {
+    $providedToken = $_GET['token'] ?? '';
+    $cronSecret = $pdo->query("SELECT setting_value FROM settings WHERE setting_key='cron_secret'")->fetchColumn();
+    if (!$cronSecret || !is_string($providedToken) || !hash_equals((string)$cronSecret, $providedToken)) {
+        sendResponse('error','Unauthorized',null,401);
+    }
+
+    $mode = ($_GET['mode'] ?? 'daily') === 'standby_sweep' ? 'standby_sweep' : 'daily';
+    $dryRun = ($_GET['dry_run'] ?? '') === '1';
+
+    try {
+        $cfg = getGCalSettings($pdo);
+        $calendarId = $cfg['google_calendar_id'] ?? '';
+        $sa = json_decode($cfg['google_service_account_json'] ?? '', true);
+        if (!$sa || !$calendarId) sendResponse('error','Calendar not configured',null,400);
+        $gToken = getGCalToken($sa);
+        if (!$gToken) sendResponse('error','Could not authenticate with Google Calendar',null,500);
+
+        $today = date('Y-m-d');
+        $tz = new \DateTimeZone('Africa/Lusaka');
+        $timeMin = urlencode((new \DateTime($today.' 00:00:00',$tz))->format(\DateTime::RFC3339));
+        $timeMax = urlencode((new \DateTime($today.' 23:59:59',$tz))->format(\DateTime::RFC3339));
+        $url = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events?timeMin={$timeMin}&timeMax={$timeMax}&singleEvents=true&orderBy=startTime&maxResults=2500";
+        $evData = curlGetGCalRetry($url, $gToken);
+        if ($evData === null) sendResponse('error','Could not reach Google Calendar to list events. Please try again.',null,502);
+
+        $eligible = []; $skippedNames = [];
+        foreach ($evData['items'] ?? [] as $e) {
+            $name = trim($e['summary'] ?? '');
+            if (!$name || strcasecmp($name,'busy') === 0) continue;
+            $category = getEventCategory($name, $e['description'] ?? '');
+            $isStandby = $category === 'standby';
+
+            // daily: touch everything except Standby. standby_sweep: touch ONLY Standby.
+            $shouldTouch = $mode === 'standby_sweep' ? $isStandby : !$isStandby;
+            if ($shouldTouch) {
+                $eligible[] = ['id'=>$e['id'], 'name'=>$name, 'new_balance'=>null];
             } else {
-                $errMsg = $res['error']['message'] ?? "HTTP $code";
-                $failed[] = ($evData['summary']??$eventId).': '.$errMsg;
+                $skippedNames[] = $name;
             }
         }
-        sendResponse('success','Reschedule complete',['success'=>$success,'failed'=>$failed,'total'=>count($events)]);
+
+        $newDate = date('Y-m-d', strtotime($today.' +1 day'));
+
+        if ($dryRun) {
+            sendResponse('success','Dry run — nothing was changed',[
+                'mode'=>$mode, 'date'=>$today, 'new_date'=>$newDate,
+                'would_reschedule'=>count($eligible), 'would_skip'=>count($skippedNames),
+                'eligible_names'=>array_column($eligible,'name'), 'skipped_names'=>$skippedNames,
+            ]);
+        }
+
+        $result = rescheduleEvents($gToken, $calendarId, $eligible, $newDate);
+
+        try {
+            $pdo->prepare("INSERT INTO activity_logs (user_id,username,action,description,created_at) VALUES (NULL,'cron',?,?,NOW())")
+                ->execute(["auto_reschedule_{$mode}", json_encode(['date'=>$today,'new_date'=>$newDate,'success'=>$result['success'],'failed'=>count($result['failed']),'skipped'=>count($skippedNames)])]);
+        } catch (\Throwable $e) {}
+
+        sendResponse('success','Auto-reschedule complete', array_merge(['mode'=>$mode,'skipped'=>count($skippedNames)], $result));
+    } catch (\Throwable $e) { sendResponse('error',$e->getMessage(),null,500); }
+}
+
+// ==========================================
+// EVENT PLANNER — toggle Standby ("?") marker on a calendar event's title
+// ==========================================
+// Admin-driven (unlike the cron-only auto-reschedule above) — this is the "Add to
+// Standby" tab's action. Renames the event's summary, appending/removing a
+// trailing "?", so the exact same convention getEventCategory() already reads
+// elsewhere immediately reflects it.
+if ($path === '/planner/toggle-standby' && $method === 'POST') {
+    requireAdmin($pdo);
+    try {
+        $body = json_decode(file_get_contents('php://input'), true);
+        $eventId = $body['event_id'] ?? '';
+        $standby = !empty($body['standby']);
+        if (!$eventId) sendResponse('error','event_id is required',null,400);
+
+        $cfg = getGCalSettings($pdo);
+        $calendarId = $cfg['google_calendar_id'] ?? '';
+        $sa = json_decode($cfg['google_service_account_json'] ?? '', true);
+        if (!$sa || !$calendarId) sendResponse('error','Calendar not configured',null,400);
+        $token = getGCalToken($sa);
+        if (!$token) sendResponse('error','Could not authenticate with Google Calendar',null,500);
+
+        $baseUrl = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events/";
+        $evData = curlGetGCalRetry($baseUrl.urlencode($eventId), $token);
+        if ($evData === null) sendResponse('error','Could not reach Google Calendar to read this event. Please try again.',null,502);
+
+        $currentName = trim($evData['summary'] ?? '');
+        if ($standby) {
+            $newName = rtrim($currentName, "? \t") . '?';
+        } else {
+            $newName = rtrim($currentName, "? \t");
+        }
+
+        if ($newName === $currentName) {
+            sendResponse('success', $standby ? 'Already on Standby' : 'Already not on Standby', ['name'=>$currentName]);
+        }
+
+        $ch = curl_init($baseUrl.urlencode($eventId).'?sendUpdates=none');
+        curl_setopt_array($ch,[CURLOPT_CUSTOMREQUEST=>'PATCH',CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>json_encode(['summary'=>$newName]),CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}","Content-Type: application/json"],CURLOPT_TIMEOUT=>15]);
+        $res = json_decode(curl_exec($ch),true);
+        $code = curl_getinfo($ch,CURLINFO_HTTP_CODE); curl_close($ch);
+
+        if ($code===200 && isset($res['id'])) {
+            sendResponse('success', $standby ? 'Added to Standby' : 'Removed from Standby', ['name'=>$res['summary']??$newName]);
+        } else {
+            sendResponse('error', $res['error']['message'] ?? "HTTP $code", null, 500);
+        }
     } catch (\Throwable $e) { sendResponse('error',$e->getMessage(),null,500); }
 }
 
@@ -964,9 +1198,8 @@ if ($path === '/planner/loans' && $method === 'GET') {
         $loans = []; $pageToken = '';
         do {
             $url = "{$baseUrl}?timeMin={$timeMin}&timeMax={$timeMax}&singleEvents=true&orderBy=startTime&maxResults=2500".($pageToken?"&pageToken={$pageToken}":'');
-            $ch = curl_init($url);
-            curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}"],CURLOPT_TIMEOUT=>20]);
-            $evData = json_decode(curl_exec($ch),true); curl_close($ch);
+            $evData = curlGetGCalRetry($url, $token);
+            if ($evData === null) sendResponse('error','Could not reach Google Calendar to list loans. Please try again.',null,502);
             foreach ($evData['items']??[] as $e) {
                 $title = trim($e['summary']??'');
                 // Skip stagnant loans (. or , in title), busy, blank
@@ -1067,34 +1300,44 @@ if ($path === '/analytics/stats' && $method === 'GET') {
 if ($path === '/tasks' && $method === 'GET') {
     $user = requireAuth($pdo);
     try {
-        $sel = "t.*, GROUP_CONCAT(DISTINCT CONCAT(ta.user_id,'|',REPLACE(COALESCE(u.name,''),'|',''),'|',COALESCE(ta.status,'pending')) ORDER BY u.name SEPARATOR ';;') as assignee_details, GROUP_CONCAT(DISTINCT u.name ORDER BY u.name SEPARATOR ', ') as assignees, (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id=t.id) as comment_count";
+        $sel = "t.*, GROUP_CONCAT(DISTINCT CONCAT(ta.user_id,'|',REPLACE(COALESCE(u.name,''),'|',''),'|',COALESCE(ta.status,'pending')) ORDER BY u.name SEPARATOR ';;') as assignee_details, GROUP_CONCAT(DISTINCT u.name ORDER BY u.name SEPARATOR ', ') as assignees, (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id=t.id) as comment_count, (SELECT COUNT(*) FROM tasks st WHERE st.parent_task_id=t.id) as subtask_total, (SELECT COUNT(*) FROM tasks st WHERE st.parent_task_id=t.id AND st.status='completed') as subtask_done, (SELECT COUNT(*) FROM task_completions tc2 WHERE tc2.task_id=t.id) as completion_count";
+        $order = "ORDER BY FIELD(t.status,'in_progress','pending','completed'), (t.last_recurred_at IS NULL), t.last_recurred_at DESC, t.due_date ASC, t.created_at DESC";
         if ($user['role'] === 'admin') {
-            $tasks = $pdo->query("SELECT $sel FROM tasks t LEFT JOIN task_assignees ta ON ta.task_id=t.id LEFT JOIN users u ON u.id=ta.user_id GROUP BY t.id ORDER BY FIELD(t.status,'in_progress','pending','completed'), t.due_date ASC, t.created_at DESC")->fetchAll();
+            $tasks = $pdo->query("SELECT $sel FROM tasks t LEFT JOIN task_assignees ta ON ta.task_id=t.id LEFT JOIN users u ON u.id=ta.user_id WHERE t.parent_task_id IS NULL GROUP BY t.id $order")->fetchAll();
         } else {
-            $stmt = $pdo->prepare("SELECT $sel FROM tasks t LEFT JOIN task_assignees ta ON ta.task_id=t.id LEFT JOIN users u ON u.id=ta.user_id WHERE EXISTS (SELECT 1 FROM task_assignees ta2 WHERE ta2.task_id=t.id AND ta2.user_id=?) OR t.created_by=? GROUP BY t.id ORDER BY FIELD(t.status,'in_progress','pending','completed'), t.due_date ASC, t.created_at DESC");
+            $stmt = $pdo->prepare("SELECT $sel FROM tasks t LEFT JOIN task_assignees ta ON ta.task_id=t.id LEFT JOIN users u ON u.id=ta.user_id WHERE t.parent_task_id IS NULL AND (EXISTS (SELECT 1 FROM task_assignees ta2 WHERE ta2.task_id=t.id AND ta2.user_id=?) OR t.created_by=?) GROUP BY t.id $order");
             $stmt->execute([$user['id'],$user['id']]); $tasks = $stmt->fetchAll();
         }
-        sendResponse('success','Tasks retrieved',['tasks'=>$tasks]);
+        // Subtasks assigned to the current user don't appear in the flat list
+        // above (parent_task_id IS NULL there) — surface them separately, tagged
+        // with their parent's title, so "My Tasks" can show work delegated to
+        // someone via a subtask even if they aren't assigned the parent task.
+        $subSel = "t.*, GROUP_CONCAT(DISTINCT CONCAT(ta.user_id,'|',REPLACE(COALESCE(u.name,''),'|',''),'|',COALESCE(ta.status,'pending')) ORDER BY u.name SEPARATOR ';;') as assignee_details, GROUP_CONCAT(DISTINCT u.name ORDER BY u.name SEPARATOR ', ') as assignees, (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id=t.id) as comment_count, pt.title as parent_title";
+        $subStmt = $pdo->prepare("SELECT $subSel FROM tasks t JOIN tasks pt ON pt.id=t.parent_task_id LEFT JOIN task_assignees ta ON ta.task_id=t.id LEFT JOIN users u ON u.id=ta.user_id WHERE t.parent_task_id IS NOT NULL AND EXISTS (SELECT 1 FROM task_assignees ta2 WHERE ta2.task_id=t.id AND ta2.user_id=?) GROUP BY t.id ORDER BY FIELD(t.status,'in_progress','pending','completed'), t.due_date ASC, t.created_at DESC");
+        $subStmt->execute([$user['id']]);
+        $mySubtasks = $subStmt->fetchAll();
+        // Flat log of every recurring-task completion event, so the Completed
+        // section can show a strikethrough entry per cycle in addition to the
+        // live task (which has already reset back to pending) — same source
+        // of truth as GET /tasks/{id}/completions, just merged across tasks.
+        $logSel = "tc.id as completion_id, tc.task_id, tc.created_at as completed_at, t.title, t.recurrence, t.priority, t.category, cu.name as completed_by_name, GROUP_CONCAT(DISTINCT u.name ORDER BY u.name SEPARATOR ', ') as assignees";
+        if ($user['role'] === 'admin') {
+            $completionLog = $pdo->query("SELECT $logSel FROM task_completions tc JOIN tasks t ON t.id=tc.task_id LEFT JOIN users cu ON cu.id=tc.completed_by LEFT JOIN task_assignees ta ON ta.task_id=t.id LEFT JOIN users u ON u.id=ta.user_id GROUP BY tc.id ORDER BY tc.created_at DESC")->fetchAll();
+        } else {
+            $logStmt = $pdo->prepare("SELECT $logSel FROM task_completions tc JOIN tasks t ON t.id=tc.task_id LEFT JOIN users cu ON cu.id=tc.completed_by LEFT JOIN task_assignees ta ON ta.task_id=t.id LEFT JOIN users u ON u.id=ta.user_id WHERE EXISTS (SELECT 1 FROM task_assignees ta2 WHERE ta2.task_id=t.id AND ta2.user_id=?) OR t.created_by=? GROUP BY tc.id ORDER BY tc.created_at DESC");
+            $logStmt->execute([$user['id'],$user['id']]);
+            $completionLog = $logStmt->fetchAll();
+        }
+        sendResponse('success','Tasks retrieved',['tasks'=>$tasks,'my_subtasks'=>$mySubtasks,'completion_log'=>$completionLog]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
 if ($path === '/tasks' && $method === 'POST') {
     $user = requireAdmin($pdo);
     $data = getRequestData();
-    $title = trim($data['title']??'');
-    if (empty($title)) sendResponse('error','Title required',null,400);
+    if (empty(trim($data['title']??''))) sendResponse('error','Title required',null,400);
     try {
-        $dueDate = !empty($data['due_date'] ?? $data['dueDate'] ?? '') ? ($data['due_date'] ?? $data['dueDate']) : null;
-        $dueTime = !empty($data['due_time'] ?? $data['dueTime'] ?? '') ? ($data['due_time'] ?? $data['dueTime']) : null;
-        $status  = $data['status'] ?? 'pending';
-        $pdo->prepare("INSERT INTO tasks (title,description,status,priority,category,due_date,due_time,recurrence,color,created_by) VALUES (?,?,?,?,?,?,?,?,?,?)")
-            ->execute([$title,$data['description']??'',$status,$data['priority']??'medium',$data['category']??'general',$dueDate,$dueTime,$data['recurrence']??'none',$data['color']??null,$user['id']]);
-        $taskId = $pdo->lastInsertId();
-        $assignees = $data['assignees'] ?? $data['assignee_ids'] ?? [];
-        if (!empty($assignees)) {
-            $stmt = $pdo->prepare("INSERT IGNORE INTO task_assignees (task_id,user_id,status) VALUES (?,?,'pending')");
-            foreach ($assignees as $uid) { $uid=(int)$uid; if ($uid>0) $stmt->execute([$taskId,$uid]); }
-        }
+        $taskId = createTaskRow($pdo, $user, $data, null);
         sendResponse('success','Task created',['id'=>$taskId],201);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
@@ -1117,6 +1360,16 @@ if (preg_match('#^/tasks/(\d+)$#',$path,$m) && $method === 'PUT') {
     $data = getRequestData();
     $taskId = (int)$m[1];
     try {
+        // Snapshot before/after so we only email on what the user actually asked
+        // to change (status, dates, reassignment) — never on every field edit.
+        $before = $pdo->prepare("SELECT status,due_date,start_date,maturity_date,title,description,priority,category,color,due_time,recurrence FROM tasks WHERE id=?");
+        $before->execute([$taskId]);
+        $old = $before->fetch();
+        if (!$old) sendResponse('error','Task not found',null,404);
+        $oldAssignees = $pdo->prepare("SELECT user_id FROM task_assignees WHERE task_id=?");
+        $oldAssignees->execute([$taskId]);
+        $oldAssigneeIds = $oldAssignees->fetchAll(PDO::FETCH_COLUMN);
+
         $fields=[]; $vals=[];
         if (isset($data['status']))       { $fields[]='status=?';       $vals[]=$data['status']; }
         if (isset($data['title']))        { $fields[]='title=?';        $vals[]=$data['title']; }
@@ -1127,6 +1380,8 @@ if (preg_match('#^/tasks/(\d+)$#',$path,$m) && $method === 'PUT') {
         if (isset($data['color']))        { $fields[]='color=?';        $vals[]=$data['color']; }
         if (array_key_exists('due_date',$data)||array_key_exists('dueDate',$data)) { $raw=$data['due_date']??$data['dueDate']??''; $fields[]='due_date=?'; $vals[]=!empty($raw)?$raw:null; }
         if (array_key_exists('due_time',$data)||array_key_exists('dueTime',$data)) { $raw=$data['due_time']??$data['dueTime']??''; $fields[]='due_time=?'; $vals[]=!empty($raw)?$raw:null; }
+        if (array_key_exists('start_date',$data)||array_key_exists('startDate',$data)) { $raw=$data['start_date']??$data['startDate']??''; $fields[]='start_date=?'; $vals[]=!empty($raw)?$raw:null; }
+        if (array_key_exists('maturity_date',$data)||array_key_exists('maturityDate',$data)) { $raw=$data['maturity_date']??$data['maturityDate']??''; $fields[]='maturity_date=?'; $vals[]=!empty($raw)?$raw:null; }
         if (isset($data['status']) && $data['status']==='completed') { $fields[]='completed_at=NOW()'; }
         elseif (isset($data['status']) && $data['status']!=='completed') { $fields[]='completed_at=NULL'; }
         if (!empty($fields)) { $vals[]=$taskId; $pdo->prepare("UPDATE tasks SET ".implode(',',$fields).",updated_at=NOW() WHERE id=?")->execute($vals); }
@@ -1137,6 +1392,51 @@ if (preg_match('#^/tasks/(\d+)$#',$path,$m) && $method === 'PUT') {
                 foreach ($data['assignees'] as $uid) { $uid=(int)$uid; if ($uid>0) $stmt->execute([$taskId,$uid]); }
             }
         }
+
+        // Completion-triggered recurrence: only for tasks that already have a
+        // Recurrence set (not 'none') — a plain one-off task just stays completed.
+        // Resets the SAME row back to pending with a shifted due date, logging
+        // the completion to task_completions, instead of spawning a new row —
+        // avoids accumulating a new duplicate task on every single cycle.
+        $recurrenceReset = false;
+        $recurrenceNextDue = null;
+        if (isset($data['status']) && $data['status'] === 'completed' && $old['status'] !== 'completed' && $old['recurrence'] !== 'none') {
+            $intervalMap = ['daily'=>'+1 day','weekly'=>'+1 week','monthly'=>'+1 month','quarterly'=>'+3 months','yearly'=>'+1 year'];
+            $interval = $intervalMap[$old['recurrence']] ?? '+1 day';
+            $recurrenceNextDue = date('Y-m-d', strtotime($interval));
+            $pdo->prepare("INSERT INTO task_completions (task_id, completed_by) VALUES (?, ?)")->execute([$taskId, $user['id']]);
+            $pdo->prepare("UPDATE tasks SET status='pending', due_date=?, start_date=?, maturity_date=NULL, days_overdue=NULL, completed_at=NULL, last_recurred_at=NOW(), updated_at=NOW() WHERE id=?")
+                ->execute([$recurrenceNextDue, $recurrenceNextDue, $taskId]);
+            $recurrenceReset = true;
+        }
+
+        // Build the change summary and email current assignees once, if anything
+        // notification-worthy actually changed.
+        $changeLines = [];
+        if ($recurrenceReset) {
+            $changeLines[] = "Completed for this cycle — automatically reset and now due {$recurrenceNextDue} for its next occurrence.";
+        } elseif (isset($data['status']) && $data['status'] !== $old['status']) {
+            $labels = ['pending'=>'Pending To Do','in_progress'=>'In Progress','completed'=>'Completed'];
+            $changeLines[] = 'Status changed to ' . ($labels[$data['status']] ?? $data['status']) . '.';
+        }
+        if (isset($data['assignees'])) {
+            $newAssigneeIds = array_map('intval', $data['assignees']);
+            $newlyAdded = array_diff($newAssigneeIds, $oldAssigneeIds);
+            if (!empty($newlyAdded)) $changeLines[] = "You've been assigned to this task.";
+        }
+        foreach ([['due_date','dueDate','Due date'], ['start_date','startDate','Start date'], ['maturity_date','maturityDate','Maturity date']] as [$snake,$camel,$label]) {
+            if (array_key_exists($snake,$data) || array_key_exists($camel,$data)) {
+                $raw = $data[$snake] ?? $data[$camel] ?? '';
+                $newVal = !empty($raw) ? $raw : null;
+                if ($newVal !== $old[$snake]) $changeLines[] = "{$label} changed to " . ($newVal ?: 'none') . '.';
+            }
+        }
+        if (!empty($changeLines)) {
+            $title = $data['title'] ?? $old['title'];
+            $subject = $recurrenceReset ? "Task Completed & Reset: {$title}" : "Task Updated: {$title}";
+            emailTaskAssignees($pdo, $taskId, $title, $subject, $changeLines);
+        }
+
         sendResponse('success','Task updated');
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
@@ -1145,11 +1445,52 @@ if (preg_match('#^/tasks/(\d+)$#',$path,$m) && $method === 'DELETE') {
     requireAdmin($pdo);
     $taskId = (int)$m[1];
     try {
+        $children = $pdo->prepare("SELECT id FROM tasks WHERE parent_task_id=?");
+        $children->execute([$taskId]);
+        $childIds = $children->fetchAll(PDO::FETCH_COLUMN);
+        foreach ($childIds as $cid) {
+            $pdo->prepare("DELETE FROM task_assignees WHERE task_id=?")->execute([$cid]);
+            $pdo->prepare("DELETE FROM task_comments WHERE task_id=?")->execute([$cid]);
+            $pdo->prepare("DELETE FROM task_attachments WHERE task_id=?")->execute([$cid]);
+            $pdo->prepare("DELETE FROM task_completions WHERE task_id=?")->execute([$cid]);
+        }
+        if (!empty($childIds)) {
+            $in = implode(',', array_fill(0, count($childIds), '?'));
+            $pdo->prepare("DELETE FROM tasks WHERE id IN ($in)")->execute($childIds);
+        }
         $pdo->prepare("DELETE FROM task_assignees WHERE task_id=?")->execute([$taskId]);
         $pdo->prepare("DELETE FROM task_comments WHERE task_id=?")->execute([$taskId]);
         $pdo->prepare("DELETE FROM task_attachments WHERE task_id=?")->execute([$taskId]);
+        $pdo->prepare("DELETE FROM task_completions WHERE task_id=?")->execute([$taskId]);
         $pdo->prepare("DELETE FROM tasks WHERE id=?")->execute([$taskId]);
         sendResponse('success','Task deleted');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/tasks/(\d+)/subtasks$#',$path,$m) && $method === 'GET') {
+    requireAuth($pdo);
+    $parentId = (int)$m[1];
+    try {
+        $sel = "t.*, GROUP_CONCAT(DISTINCT CONCAT(ta.user_id,'|',REPLACE(COALESCE(u.name,''),'|',''),'|',COALESCE(ta.status,'pending')) ORDER BY u.name SEPARATOR ';;') as assignee_details, GROUP_CONCAT(DISTINCT u.name ORDER BY u.name SEPARATOR ', ') as assignees, (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id=t.id) as comment_count";
+        $stmt = $pdo->prepare("SELECT $sel FROM tasks t LEFT JOIN task_assignees ta ON ta.task_id=t.id LEFT JOIN users u ON u.id=ta.user_id WHERE t.parent_task_id=? GROUP BY t.id ORDER BY t.created_at ASC");
+        $stmt->execute([$parentId]);
+        sendResponse('success','Subtasks retrieved',['subtasks'=>$stmt->fetchAll()]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/tasks/(\d+)/subtasks$#',$path,$m) && $method === 'POST') {
+    $user = requireAdmin($pdo);
+    $data = getRequestData();
+    $parentId = (int)$m[1];
+    if (empty(trim($data['title']??''))) sendResponse('error','Title required',null,400);
+    try {
+        $parent = $pdo->prepare("SELECT id, parent_task_id FROM tasks WHERE id=?");
+        $parent->execute([$parentId]);
+        $p = $parent->fetch();
+        if (!$p) sendResponse('error','Parent task not found',null,404);
+        if ($p['parent_task_id'] !== null) sendResponse('error','Cannot create a subtask of a subtask',null,400);
+        $taskId = createTaskRow($pdo, $user, $data, $parentId);
+        sendResponse('success','Subtask created',['id'=>$taskId],201);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
@@ -1166,6 +1507,51 @@ if (preg_match('#^/tasks/(\d+)/assignee-status$#',$path,$m) && $method === 'PATC
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
+// ==========================================
+// TASKS — daily overdue check (cron, mirrors /planner/auto-reschedule's token
+// pattern). Does NOT move due_date anymore — instead sets days_overdue (a
+// dedicated column; see migrations/alter_tasks_days_overdue.sql for why this
+// isn't stored in maturity_date) and sends one reminder (in-app + email) per
+// assignee per day the task stays overdue and incomplete.
+// ==========================================
+if ($path === '/tasks/daily-check' && $method === 'GET') {
+    $providedToken = $_GET['token'] ?? '';
+    $cronSecret = $pdo->query("SELECT setting_value FROM settings WHERE setting_key='cron_secret'")->fetchColumn();
+    if (!$cronSecret || !is_string($providedToken) || !hash_equals((string)$cronSecret, $providedToken)) {
+        sendResponse('error','Unauthorized',null,401);
+    }
+    try {
+        $dryRun = ($_GET['dry_run'] ?? '') === '1';
+        $overdue = $pdo->query("SELECT id, title, due_date, DATEDIFF(CURDATE(), due_date) AS days_overdue FROM tasks WHERE due_date < CURDATE() AND status != 'completed'")->fetchAll();
+
+        if ($dryRun) {
+            sendResponse('success','Dry run — nothing was changed', [
+                'would_remind' => count($overdue),
+                'tasks' => array_map(fn($t) => ['id'=>$t['id'],'title'=>$t['title'],'due_date'=>$t['due_date'],'days_overdue'=>(int)$t['days_overdue']], $overdue),
+            ]);
+        }
+
+        $updateStmt = $pdo->prepare("UPDATE tasks SET days_overdue=?, updated_at=NOW() WHERE id=?");
+        foreach ($overdue as $t) {
+            $updateStmt->execute([$t['days_overdue'], $t['id']]);
+
+            $assignees = $pdo->prepare("SELECT u.id, u.name, u.email FROM task_assignees ta JOIN users u ON u.id=ta.user_id WHERE ta.task_id=?");
+            $assignees->execute([$t['id']]);
+            foreach ($assignees->fetchAll() as $a) {
+                createNotification($pdo, $a['id'], 'task_overdue', "Task overdue: {$t['title']}", "This task is now {$t['days_overdue']} day(s) overdue.", '/dashboard/tasks');
+            }
+            emailTaskAssignees($pdo, $t['id'], $t['title'], "Task Overdue: {$t['title']}", ["This task is still pending and is now {$t['days_overdue']} day(s) overdue."]);
+        }
+
+        try {
+            $pdo->prepare("INSERT INTO activity_logs (user_id,username,action,description,created_at) VALUES (NULL,'cron',?,?,NOW())")
+                ->execute(['tasks_daily_check', json_encode(['reminded'=>count($overdue),'task_ids'=>array_column($overdue,'id')])]);
+        } catch (\Throwable $e) {}
+
+        sendResponse('success','Daily check complete', ['reminded'=>count($overdue)]);
+    } catch (\Throwable $e) { sendResponse('error',$e->getMessage(),null,500); }
+}
+
 if (preg_match('#^/tasks/(\d+)/comments$#',$path,$m) && $method === 'GET') {
     requireAuth($pdo);
     $taskId = (int)$m[1];
@@ -1173,6 +1559,16 @@ if (preg_match('#^/tasks/(\d+)/comments$#',$path,$m) && $method === 'GET') {
         $stmt = $pdo->prepare("SELECT tc.*,u.name as user_name FROM task_comments tc LEFT JOIN users u ON u.id=tc.user_id WHERE tc.task_id=? ORDER BY tc.created_at ASC");
         $stmt->execute([$taskId]);
         sendResponse('success','Comments retrieved',['comments'=>$stmt->fetchAll()]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/tasks/(\d+)/completions$#',$path,$m) && $method === 'GET') {
+    requireAuth($pdo);
+    $taskId = (int)$m[1];
+    try {
+        $stmt = $pdo->prepare("SELECT tcpl.*,u.name as completed_by_name FROM task_completions tcpl LEFT JOIN users u ON u.id=tcpl.completed_by WHERE tcpl.task_id=? ORDER BY tcpl.created_at DESC");
+        $stmt->execute([$taskId]);
+        sendResponse('success','Completions retrieved',['completions'=>$stmt->fetchAll()]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
@@ -1805,6 +2201,82 @@ if (preg_match('#^/loans/payments/([A-Z0-9\-]+)$#',$path,$m) && $method === 'GET
     } catch (\Throwable $e) { sendResponse('error','Failed',null,500); }
 }
 
+// Mirrors the tiered rate in frontend Calculator.jsx/ClientsPage.jsx — kept in sync
+// intentionally, since this public endpoint must compute totals itself and can't
+// trust client-submitted amounts.
+function loanInterestRate($amount) {
+    if ($amount <= 3000) return 0.10;
+    if ($amount <= 7499) return 0.15;
+    if ($amount <= 9999) return 0.20;
+    return 0.30;
+}
+
+if ($path === '/loans/apply' && $method === 'POST') {
+    $data = $_POST;
+    // Honeypot: bots fill every field, humans never see this one.
+    if (!empty($data['website'])) sendResponse('success','Application submitted',['loan_reference'=>null],201);
+
+    $name = trim($data['customer_name']??'');
+    $phone = trim($data['customer_phone']??'');
+    $nid = trim($data['national_id_last4']??'');
+    $email = trim($data['customer_email']??'');
+    $amount = (float)($data['loan_amount']??0);
+    $duration = max(1, (int)($data['duration_months']??1));
+
+    if (empty($name)||empty($phone)||strlen($nid)!==4||$amount<100||$amount>50000||$duration<1||$duration>24) {
+        sendResponse('error','Please check all required fields and try again',null,400);
+    }
+    if (empty($_FILES['passport_photo']['name']??'') || empty($_FILES['id_document']['name']??'')) {
+        sendResponse('error','Passport photo/selfie and ID document are both required',null,400);
+    }
+
+    try {
+        $rate = loanInterestRate($amount);
+        $totalRepayable = round($amount + 200 + ($amount * $rate * $duration), 2);
+        $monthlyInstallment = round($totalRepayable / $duration, 2);
+
+        $loanRef = null;
+        for ($i = 0; $i < 5; $i++) {
+            $candidate = 'STW-'.date('Y').'-'.str_pad((string)random_int(0, 99999), 5, '0', STR_PAD_LEFT);
+            $exists = $pdo->prepare("SELECT id FROM loan_accounts WHERE loan_reference=?");
+            $exists->execute([$candidate]);
+            if (!$exists->fetch()) { $loanRef = $candidate; break; }
+        }
+        if (!$loanRef) sendResponse('error','Failed to generate a reference, please try again',null,500);
+
+        // Validate and save every file BEFORE writing any DB row, so a rejected
+        // upload can never leave an orphaned loan_accounts record behind.
+        $docSpecs = [['field'=>'passport_photo','type'=>'passport_photo'],['field'=>'id_document','type'=>'id_document'],['field'=>'other','type'=>'other']];
+        $savedDocs = [];
+        foreach ($docSpecs as $spec) {
+            if (empty($_FILES[$spec['field']]['name']??'')) continue;
+            $saved = saveClientDocument($_FILES[$spec['field']]);
+            if (isset($saved['error'])) {
+                foreach ($savedDocs as $prior) { $p = __DIR__.'/'.$prior['file_name']; if (is_file($p)) @unlink($p); }
+                sendResponse('error',$saved['error'],null,400);
+            }
+            $savedDocs[] = ['type'=>$spec['type']] + $saved;
+        }
+
+        $pdo->beginTransaction();
+        $pdo->prepare("INSERT INTO loan_accounts (loan_reference,customer_name,customer_phone,customer_email,national_id_last4,loan_amount,total_repayable,amount_paid,outstanding_balance,monthly_installment,loan_status,disbursement_date,maturity_date) VALUES (?,?,?,?,?,?,?,0,?,?,'pending',NULL,NULL)")
+            ->execute([$loanRef,$name,$phone,$email,$nid,$amount,$totalRepayable,$totalRepayable,$monthlyInstallment]);
+        $loanAccountId = $pdo->lastInsertId();
+        foreach ($savedDocs as $doc) {
+            $pdo->prepare("INSERT INTO client_documents (loan_account_id,document_type,file_name,original_filename,file_size,mime_type,uploaded_by) VALUES (?,?,?,?,?,?,NULL)")
+                ->execute([$loanAccountId,$doc['type'],$doc['file_name'],$doc['original_filename'],$doc['file_size'],$doc['mime_type']]);
+        }
+        $pdo->commit();
+
+        notifyAdmins($pdo,'application','New Loan Application',"New loan application from {$name} for K".number_format($amount,2).".",'/dashboard/clients');
+        sendResponse('success','Application submitted',['loan_reference'=>$loanRef],201);
+    } catch (\Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e->getCode()==23000) sendResponse('error','Please try submitting again',null,409);
+        sendResponse('error','Failed: '.$e->getMessage(),null,500);
+    }
+}
+
 // Admin loan routes
 if ($path === '/loans/admin/accounts' && $method === 'GET') {
     requireAdmin($pdo);
@@ -1841,6 +2313,127 @@ if (preg_match('#^/loans/admin/payments/(\d+)/confirm$#',$path,$m) && $method ==
         $balance=$pdo->prepare("SELECT outstanding_balance FROM loan_accounts WHERE id=?"); $balance->execute([$payment['loan_account_id']]); $bal=$balance->fetch();
         if ($bal&&$bal['outstanding_balance']<=0) $pdo->prepare("UPDATE loan_accounts SET loan_status='paid_off',outstanding_balance=0 WHERE id=?")->execute([$payment['loan_account_id']]);
         sendResponse('success','Payment confirmed');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+// ==========================================
+// CLIENT PROFILES (admin)
+// ==========================================
+if (preg_match('#^/loans/admin/accounts/(\d+)$#',$path,$m) && $method === 'GET') {
+    requireAdmin($pdo);
+    try {
+        $stmt = $pdo->prepare("SELECT * FROM loan_accounts WHERE id=?");
+        $stmt->execute([$m[1]]);
+        $account = $stmt->fetch();
+        if (!$account) sendResponse('error','Client not found',null,404);
+        $payments = $pdo->prepare("SELECT * FROM loan_payments WHERE loan_account_id=? ORDER BY created_at DESC");
+        $payments->execute([$m[1]]);
+        $docs = $pdo->prepare("SELECT * FROM client_documents WHERE loan_account_id=? ORDER BY created_at DESC");
+        $docs->execute([$m[1]]);
+        sendResponse('success','Client retrieved',['account'=>$account,'payments'=>$payments->fetchAll(),'documents'=>$docs->fetchAll()]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/loans/admin/accounts/(\d+)$#',$path,$m) && $method === 'PUT') {
+    requireAdmin($pdo);
+    $data = getRequestData();
+    try {
+        $stmt=$pdo->prepare("SELECT id FROM loan_accounts WHERE id=?"); $stmt->execute([$m[1]]);
+        if (!$stmt->fetch()) sendResponse('error','Client not found',null,404);
+        $pdo->prepare("UPDATE loan_accounts SET customer_name=?,customer_phone=?,customer_email=?,national_id_last4=?,loan_amount=?,total_repayable=?,monthly_installment=?,loan_status=?,disbursement_date=?,maturity_date=?,next_payment_date=? WHERE id=?")
+            ->execute([
+                $data['customer_name'],$data['customer_phone'],$data['customer_email']??'',$data['national_id_last4'],
+                $data['loan_amount'],$data['total_repayable'],$data['monthly_installment'],$data['loan_status'],
+                $data['disbursement_date']?:null,$data['maturity_date']?:null,$data['next_payment_date']?:null,$m[1]
+            ]);
+        sendResponse('success','Client updated');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/loans/admin/accounts/(\d+)/status$#',$path,$m) && $method === 'PUT') {
+    requireAdmin($pdo);
+    $data = getRequestData();
+    $action = $data['action'] ?? '';
+    if (!in_array($action, ['approve','reject','mark_paid'])) sendResponse('error','Invalid action',null,400);
+    try {
+        $stmt=$pdo->prepare("SELECT * FROM loan_accounts WHERE id=?"); $stmt->execute([$m[1]]);
+        $account = $stmt->fetch();
+        if (!$account) sendResponse('error','Client not found',null,404);
+
+        if ($action === 'approve') {
+            $pdo->prepare("UPDATE loan_accounts SET loan_status='active' WHERE id=?")->execute([$m[1]]);
+            sendResponse('success','Application approved');
+        } elseif ($action === 'reject') {
+            $pdo->prepare("UPDATE loan_accounts SET loan_status='rejected' WHERE id=?")->execute([$m[1]]);
+            sendResponse('success','Application rejected');
+        } else { // mark_paid
+            $pdo->prepare("UPDATE loan_accounts SET loan_status='paid_off',amount_paid=total_repayable,outstanding_balance=0 WHERE id=?")->execute([$m[1]]);
+            sendResponse('success','Marked as paid');
+        }
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+function saveClientDocument($file) {
+    // Content is validated, not the client-supplied extension/MIME header — see security audit.
+    $maxSize = 10 * 1024 * 1024;
+    if (($file['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) return ['error'=>'Upload failed'];
+    if ($file['size'] > $maxSize) return ['error'=>'File exceeds 10MB limit'];
+
+    $tmpPath = $file['tmp_name'];
+    $ext = null;
+    $imgInfo = @getimagesize($tmpPath);
+    if ($imgInfo && in_array($imgInfo[2], [IMAGETYPE_JPEG, IMAGETYPE_PNG])) {
+        $ext = $imgInfo[2] === IMAGETYPE_PNG ? 'png' : 'jpg';
+    } else {
+        $head = file_get_contents($tmpPath, false, null, 0, 4);
+        if ($head === '%PDF') $ext = 'pdf';
+    }
+    if (!$ext) return ['error'=>'Only JPG, PNG, or PDF files are allowed'];
+
+    $uploadDir = __DIR__ . '/uploads/client_documents/';
+    if (!is_dir($uploadDir)) mkdir($uploadDir, 0755, true);
+    $htaccess = $uploadDir . '.htaccess';
+    if (!file_exists($htaccess)) {
+        file_put_contents($htaccess, "<FilesMatch \"\\.php$\">\n    Require all denied\n</FilesMatch>\n");
+    }
+
+    $storedName = bin2hex(random_bytes(16)) . '.' . $ext;
+    if (!move_uploaded_file($tmpPath, $uploadDir . $storedName)) return ['error'=>'Failed to save file'];
+
+    $mimeMap = ['jpg'=>'image/jpeg','png'=>'image/png','pdf'=>'application/pdf'];
+    return [
+        'file_name' => 'uploads/client_documents/' . $storedName,
+        'original_filename' => $file['name'],
+        'file_size' => $file['size'],
+        'mime_type' => $mimeMap[$ext],
+    ];
+}
+
+if (preg_match('#^/loans/admin/accounts/(\d+)/documents$#',$path,$m) && $method === 'POST') {
+    $user = requireAdmin($pdo);
+    try {
+        $stmt=$pdo->prepare("SELECT id FROM loan_accounts WHERE id=?"); $stmt->execute([$m[1]]);
+        if (!$stmt->fetch()) sendResponse('error','Client not found',null,404);
+        if (empty($_FILES['file'])) sendResponse('error','No file provided',null,400);
+        $docType = in_array($_POST['document_type']??'', ['passport_photo','id_document','receipt','loan_agreement','other']) ? $_POST['document_type'] : 'other';
+        $saved = saveClientDocument($_FILES['file']);
+        if (isset($saved['error'])) sendResponse('error',$saved['error'],null,400);
+        $pdo->prepare("INSERT INTO client_documents (loan_account_id,document_type,file_name,original_filename,file_size,mime_type,uploaded_by) VALUES (?,?,?,?,?,?,?)")
+            ->execute([$m[1],$docType,$saved['file_name'],$saved['original_filename'],$saved['file_size'],$saved['mime_type'],$user['id']??null]);
+        sendResponse('success','Document uploaded',['id'=>$pdo->lastInsertId()],201);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/loans/admin/documents/(\d+)$#',$path,$m) && $method === 'DELETE') {
+    requireAdmin($pdo);
+    try {
+        $stmt=$pdo->prepare("SELECT * FROM client_documents WHERE id=?"); $stmt->execute([$m[1]]);
+        $doc=$stmt->fetch();
+        if (!$doc) sendResponse('error','Document not found',null,404);
+        $pdo->prepare("DELETE FROM client_documents WHERE id=?")->execute([$m[1]]);
+        $filePath = __DIR__ . '/' . $doc['file_name'];
+        if (is_file($filePath)) @unlink($filePath);
+        sendResponse('success','Document deleted');
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
