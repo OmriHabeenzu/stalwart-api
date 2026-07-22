@@ -2722,7 +2722,20 @@ if ($path === '/analytics/staff' && $method === 'GET') {
             $performance[]=['id'=>$u['id'],'name'=>$u['name'],'email'=>$u['email'],'role'=>$u['role'],'tasks'=>$taskData,'calls'=>$callData];
         }
         $months=$pdo->query("SELECT DISTINCT DATE_FORMAT(report_date,'%Y-%m') AS month FROM call_reports ORDER BY month DESC LIMIT 24")->fetchAll(PDO::FETCH_COLUMN);
-        sendResponse('success','Staff performance retrieved',['month'=>$month,'staff'=>$performance,'available_months'=>$months]);
+
+        // Team-wide totals must count DISTINCT tasks/completion-events, not sum
+        // each staff member's individual credit — a task with 4 assignees
+        // credits all 4 (correct for their own cards) but is still only ONE
+        // completed task, so summing the per-staff numbers overcounts it 4x.
+        $teamStmt = $pdo->prepare("SELECT
+            (SELECT COUNT(*) FROM tasks WHERE parent_task_id IS NULL AND status='pending') AS pending,
+            (SELECT COUNT(*) FROM tasks WHERE parent_task_id IS NULL AND status='in_progress') AS in_progress,
+            (SELECT COUNT(*) FROM tasks WHERE parent_task_id IS NULL AND status='completed' AND recurrence='none' AND YEAR(completed_at)=? AND MONTH(completed_at)=?)
+            + (SELECT COUNT(*) FROM task_completions WHERE YEAR(created_at)=? AND MONTH(created_at)=?) AS completed_this_month");
+        $teamStmt->execute([$year,$mon,$year,$mon]);
+        $teamTotals = $teamStmt->fetch();
+
+        sendResponse('success','Staff performance retrieved',['month'=>$month,'staff'=>$performance,'available_months'=>$months,'team_totals'=>$teamTotals]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
