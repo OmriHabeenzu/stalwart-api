@@ -626,7 +626,18 @@ if ($path === '/admin/backfill-task-credits' && $method === 'POST') {
     try {
         $stmt = $pdo->prepare("UPDATE task_assignees ta JOIN tasks t ON t.id = ta.task_id SET ta.status='completed', ta.completed_at=COALESCE(ta.completed_at, t.completed_at) WHERE t.status='completed' AND YEAR(t.completed_at)=YEAR(CURDATE()) AND MONTH(t.completed_at)=MONTH(CURDATE()) AND ta.status!='completed'");
         $stmt->execute();
-        sendResponse('success', 'Backfill applied', ['rows_updated' => $stmt->rowCount()]);
+        $oneOffRows = $stmt->rowCount();
+
+        // Second gap: task_completions rows logged between when that table was
+        // built and when task_completion_assignees was added — those recurring
+        // completions have no credit rows at all. Backfill using each task's
+        // CURRENT assignees as the best available proxy for who was assigned
+        // at completion time.
+        $stmt2 = $pdo->prepare("INSERT INTO task_completion_assignees (completion_id, user_id) SELECT tc.id, ta.user_id FROM task_completions tc JOIN task_assignees ta ON ta.task_id = tc.task_id LEFT JOIN task_completion_assignees tca ON tca.completion_id = tc.id AND tca.user_id = ta.user_id WHERE tca.id IS NULL");
+        $stmt2->execute();
+        $recurringRows = $stmt2->rowCount();
+
+        sendResponse('success', 'Backfill applied', ['task_assignees_updated' => $oneOffRows, 'task_completion_assignees_inserted' => $recurringRows]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
