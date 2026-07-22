@@ -615,6 +615,21 @@ if ($path === '/admin/run-schema-fix' && $method === 'POST') {
     sendResponse('success', 'Schema fix applied', ['results' => $results]);
 }
 
+// One-time data repair: tasks completed before the assignee-sync fix existed
+// never got their task_assignees.status flipped to 'completed', so Staff
+// Performance showed 0 for real historical work this month. Credits every
+// assignee of a currently-completed task whose completed_at falls in the
+// current calendar month and whose personal status isn't already synced.
+// Idempotent — safe to call more than once, only touches rows still pending.
+if ($path === '/admin/backfill-task-credits' && $method === 'POST') {
+    requireAdmin($pdo);
+    try {
+        $stmt = $pdo->prepare("UPDATE task_assignees ta JOIN tasks t ON t.id = ta.task_id SET ta.status='completed', ta.completed_at=COALESCE(ta.completed_at, t.completed_at) WHERE t.status='completed' AND YEAR(t.completed_at)=YEAR(CURDATE()) AND MONTH(t.completed_at)=MONTH(CURDATE()) AND ta.status!='completed'");
+        $stmt->execute();
+        sendResponse('success', 'Backfill applied', ['rows_updated' => $stmt->rowCount()]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
 if ($path === '/admin/test-email' && $method === 'POST') {
     requireAdmin($pdo);
     $data = getRequestData();
