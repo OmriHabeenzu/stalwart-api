@@ -159,7 +159,8 @@ try {
     try { $pdo->exec("ALTER TABLE loan_accounts MODIFY loan_status ENUM('pending','active','rejected','paid_off','defaulted','suspended') DEFAULT 'active'"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE loan_accounts MODIFY disbursement_date DATE NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE loan_accounts MODIFY maturity_date DATE NULL"); } catch (\Throwable $e) {}
-    try { $pdo->exec("ALTER TABLE loan_accounts MODIFY id INT NOT NULL AUTO_INCREMENT"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE loan_accounts ADD PRIMARY KEY (id)"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE loan_accounts MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE task_comments MODIFY COLUMN user_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE task_comments ADD COLUMN user_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE task_attachments ADD COLUMN mime_type VARCHAR(100) DEFAULT NULL"); } catch (\Throwable $e) {}
@@ -602,7 +603,8 @@ if ($path === '/admin/run-schema-fix' && $method === 'POST') {
         "ALTER TABLE loan_accounts MODIFY loan_status ENUM('pending','active','rejected','paid_off','defaulted','suspended') DEFAULT 'active'",
         "ALTER TABLE loan_accounts MODIFY disbursement_date DATE NULL",
         "ALTER TABLE loan_accounts MODIFY maturity_date DATE NULL",
-        "ALTER TABLE loan_accounts MODIFY id INT NOT NULL AUTO_INCREMENT",
+        "ALTER TABLE loan_accounts ADD PRIMARY KEY (id)",
+        "ALTER TABLE loan_accounts MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT",
         "CREATE TABLE IF NOT EXISTS task_completion_assignees (id INT AUTO_INCREMENT PRIMARY KEY, completion_id INT NOT NULL, user_id INT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     ];
     $results = [];
