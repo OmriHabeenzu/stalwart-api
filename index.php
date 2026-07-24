@@ -161,6 +161,8 @@ try {
     try { $pdo->exec("ALTER TABLE loan_accounts MODIFY maturity_date DATE NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE loan_accounts ADD PRIMARY KEY (id)"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE loan_accounts MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE loan_accounts MODIFY customer_phone VARCHAR(20) NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE loan_accounts MODIFY national_id_last4 VARCHAR(4) NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE task_comments MODIFY COLUMN user_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE task_comments ADD COLUMN user_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE task_attachments ADD COLUMN mime_type VARCHAR(100) DEFAULT NULL"); } catch (\Throwable $e) {}
@@ -606,6 +608,8 @@ if ($path === '/admin/run-schema-fix' && $method === 'POST') {
         "ALTER TABLE loan_accounts ADD PRIMARY KEY (id)",
         "ALTER TABLE loan_accounts MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT",
         "CREATE TABLE IF NOT EXISTS task_completion_assignees (id INT AUTO_INCREMENT PRIMARY KEY, completion_id INT NOT NULL, user_id INT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        "ALTER TABLE loan_accounts MODIFY customer_phone VARCHAR(20) NULL",
+        "ALTER TABLE loan_accounts MODIFY national_id_last4 VARCHAR(4) NULL",
     ];
     $results = [];
     foreach ($stmts as $sql) {
@@ -2399,6 +2403,95 @@ if ($path === '/loans/admin/accounts' && $method === 'POST') {
         if ($e->getCode()==23000) sendResponse('error','A loan with that reference already exists',null,409);
         sendResponse('error','Failed: '.$e->getMessage(),null,500);
     }
+}
+
+// Same fuzzy name-matching used client-side in ClientsPage.jsx (nameSimilarity/
+// levenshtein, 70% threshold) — reimplemented server-side using PHP's built-in
+// levenshtein() instead of hand-rolling the row-by-row algorithm the JS version
+// needed (no native levenshtein in browsers).
+function loanClientNameSimilarity($name1, $name2) {
+    $clean = function($s) {
+        $s = strtolower(trim($s));
+        $s = preg_replace('/\b(mr|mrs|ms|dr|miss)\.?\s*/', '', $s);
+        $s = preg_replace('/[.,]/', '', $s);
+        return trim($s);
+    };
+    $n1 = $clean($name1); $n2 = $clean($name2);
+    if ($n1 === $n2) return 100;
+    if (strpos($n2, $n1) !== false || strpos($n1, $n2) !== false) return 90;
+    $w1 = explode(' ', $n1); $w2 = explode(' ', $n2);
+    $matched = 0;
+    foreach ($w1 as $a) foreach ($w2 as $b) if ($a === $b && strlen($a) > 2) $matched++;
+    if ($matched > 0) return min(85, $matched * 40);
+    $maxLen = max(strlen($n1), strlen($n2));
+    if (!$maxLen) return 0;
+    return round((1 - levenshtein($n1, $n2) / $maxLen) * 100);
+}
+
+if ($path === '/loans/admin/accounts/sync-calendar' && $method === 'POST') {
+    requireAdmin($pdo);
+    try {
+        $cfg = getGCalSettings($pdo);
+        $calendarId = $cfg['google_calendar_id'] ?? '';
+        $sa = json_decode($cfg['google_service_account_json'] ?? '', true);
+        if (!$sa || !$calendarId) sendResponse('error','Calendar not configured',null,400);
+        $token = getGCalToken($sa);
+        if (!$token) sendResponse('error','Could not authenticate with Google Calendar',null,500);
+
+        $date = date('Y-m-d');
+        $timeMin = urlencode($date.'T00:00:00+02:00');
+        $timeMax = urlencode($date.'T23:59:59+02:00');
+        $url = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events?timeMin={$timeMin}&timeMax={$timeMax}&singleEvents=true&orderBy=startTime&maxResults=2500";
+        $evData = curlGetGCalRetry($url, $token);
+        if ($evData === null) sendResponse('error','Could not reach Google Calendar. Please try again.',null,502);
+
+        $existing = $pdo->query("SELECT id, customer_name, customer_email FROM loan_accounts")->fetchAll();
+
+        $created = 0; $updated = 0; $unchanged = 0; $scanned = 0;
+        foreach ($evData['items'] ?? [] as $e) {
+            $name = trim($e['summary'] ?? '');
+            if (!$name || strcasecmp($name,'busy') === 0) continue;
+            $scanned++;
+
+            $desc = $e['description'] ?? '';
+            $balance = parseKBalance($desc) ?? 0;
+            $guestEmail = null;
+            foreach ($e['attendees'] ?? [] as $a) {
+                if (empty($a['organizer']) && empty($a['self']) && !empty($a['email'])) { $guestEmail = $a['email']; break; }
+            }
+
+            $best = null; $bestScore = 0;
+            foreach ($existing as $c) {
+                $score = loanClientNameSimilarity($c['customer_name'], $name);
+                if ($score > $bestScore) { $bestScore = $score; $best = $c; }
+            }
+
+            if ($best && $bestScore >= 70) {
+                if ($guestEmail && empty($best['customer_email'])) {
+                    $pdo->prepare("UPDATE loan_accounts SET customer_email=? WHERE id=?")->execute([$guestEmail, $best['id']]);
+                    $updated++;
+                } else {
+                    $unchanged++;
+                }
+                continue;
+            }
+
+            $loanReference = null;
+            for ($i = 0; $i < 5; $i++) {
+                $candidate = 'STW-'.date('Y').'-'.str_pad((string)random_int(0, 99999), 5, '0', STR_PAD_LEFT);
+                $refCheck = $pdo->prepare("SELECT id FROM loan_accounts WHERE loan_reference=?");
+                $refCheck->execute([$candidate]);
+                if (!$refCheck->fetch()) { $loanReference = $candidate; break; }
+            }
+            if (!$loanReference) continue;
+            $pdo->prepare("INSERT INTO loan_accounts (loan_reference,customer_name,customer_phone,customer_email,national_id_last4,loan_amount,total_repayable,amount_paid,outstanding_balance,monthly_installment,loan_status,disbursement_date,maturity_date) VALUES (?,?,NULL,?,NULL,?,?,0,?,?,?,NULL,NULL)")
+                ->execute([$loanReference, $name, $guestEmail, $balance, $balance, $balance, 0, 'pending']);
+            $existing[] = ['id' => $pdo->lastInsertId(), 'customer_name' => $name, 'customer_email' => $guestEmail];
+            $created++;
+        }
+
+        sendResponse('success','Calendar sync complete', ['created'=>$created,'updated'=>$updated,'unchanged'=>$unchanged,'scanned'=>$scanned]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
 if (preg_match('#^/loans/admin/payments/(\d+)/confirm$#',$path,$m) && $method === 'PUT') {
