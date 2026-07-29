@@ -966,6 +966,30 @@ function parseKBalance($desc) {
     if (empty($m[1])) return null;
     return max(array_map(fn($a)=>floatval(str_replace(',','',$a)),$m[1]));
 }
+// Same "due on <date>" / "due date: <date>" pattern updateDateInDesc() writes
+// (~line 999) — this reads it back out, for pulling a real next-payment date
+// out of a calendar reminder's description instead of leaving it blank.
+function parseDueDateFromDesc($desc) {
+    if (!$desc) return null;
+    $pat = '\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+,?\s*\d{4}';
+    foreach (["/due on\s+({$pat})/i", "/due\s*date\s*:?\s*({$pat})/i"] as $re) {
+        if (preg_match($re, $desc, $m)) {
+            $ts = strtotime($m[1]);
+            if ($ts !== false) return date('Y-m-d', $ts);
+        }
+    }
+    return null;
+}
+// Real calendar descriptions never carry a distinct "matures on <date>" line —
+// the only date present is the same "due on <date>" collection date. When the
+// description explicitly labels the loan "past maturity" (checked across all
+// live events: "REDUCING BALANCE"/"ROLL OVER MATTERS" reminders never use this
+// wording, only genuinely-matured loans do), that due date IS the maturity
+// date being chased, so it's reused here rather than left blank.
+function parseMaturityDateFromDesc($desc) {
+    if (!$desc || !preg_match('/matur/i', $desc)) return null;
+    return parseDueDateFromDesc($desc);
+}
 function replaceKBalance($desc,$newBal) {
     preg_match_all('/K([\d,]+\.?\d*)/',$desc,$m,PREG_OFFSET_CAPTURE);
     if (empty($m[0])) return trim($desc)."\nCurrent balance: K".number_format($newBal,2);
@@ -975,9 +999,11 @@ function replaceKBalance($desc,$newBal) {
 }
 // Mirrors the frontend's isCleared()/getLoanCategory() (EventPlannerPage.jsx /
 // ClientsPage.jsx) — same naming convention embedded in calendar event titles:
-// "." = stagnant, "," = active, ends with "?" = standby (waiting to confirm,
-// skipped by the automated reschedule), else paid (only if explicitly marked
-// cleared/K0) or active otherwise.
+// "." = stagnant, "," = active, else paid (only if explicitly marked
+// cleared/K0) or active otherwise. Standby is NOT part of this — it's a
+// same-session, admin-only visual flag on the Reschedule list and is never
+// written to the calendar (previously used a "?" marker; removed since
+// Standby never needs to survive past the current browser session).
 function isEventCleared($name, $desc = '') {
     if (stripos($name, 'cleared') !== false) return true;
     if (stripos($desc, 'cleared') !== false) return true;
@@ -987,7 +1013,6 @@ function isEventCleared($name, $desc = '') {
 function getEventCategory($name, $desc = '') {
     if (strpos($name, '.') !== false) return 'stagnant';
     if (strpos($name, ',') !== false) return 'active';
-    if (substr(rtrim($name), -1) === '?') return 'standby';
     if (isEventCleared($name, $desc)) return 'paid';
     return 'active';
 }
@@ -1136,14 +1161,9 @@ function rescheduleEvents($token, $calendarId, $events, $newDate) {
 // ==========================================
 // EVENT PLANNER — automated daily reschedule (cron-triggered, not an admin session)
 // ==========================================
-// Two scheduled hits of this same endpoint:
-//   mode=daily         ~15:20 — reschedules everything EXCEPT Standby ("...?") to
-//                       tomorrow. Standby clients are left untouched.
-//   mode=standby_sweep ~21:00 — sweeps up any Standby-tagged event still sitting on
-//                       today's date (i.e. wasn't otherwise touched) and force-moves
-//                       it to tomorrow too, so nothing goes stale overnight. The "?"
-//                       stays in the name — still Standby tomorrow until removed.
-// No interest/balance recalculation in either mode — date-only move.
+// Reschedules everything to tomorrow — Standby no longer exists as a calendar
+// marker (it's a same-session, admin-only visual flag on the Reschedule list
+// now), so there's nothing left for this cron to skip.
 if ($path === '/planner/auto-reschedule' && $method === 'GET') {
     $providedToken = $_GET['token'] ?? '';
     $cronSecret = $pdo->query("SELECT setting_value FROM settings WHERE setting_key='cron_secret'")->fetchColumn();
@@ -1151,7 +1171,6 @@ if ($path === '/planner/auto-reschedule' && $method === 'GET') {
         sendResponse('error','Unauthorized',null,401);
     }
 
-    $mode = ($_GET['mode'] ?? 'daily') === 'standby_sweep' ? 'standby_sweep' : 'daily';
     $dryRun = ($_GET['dry_run'] ?? '') === '1';
 
     try {
@@ -1170,29 +1189,19 @@ if ($path === '/planner/auto-reschedule' && $method === 'GET') {
         $evData = curlGetGCalRetry($url, $gToken);
         if ($evData === null) sendResponse('error','Could not reach Google Calendar to list events. Please try again.',null,502);
 
-        $eligible = []; $skippedNames = [];
+        $eligible = [];
         foreach ($evData['items'] ?? [] as $e) {
             $name = trim($e['summary'] ?? '');
             if (!$name || strcasecmp($name,'busy') === 0) continue;
-            $category = getEventCategory($name, $e['description'] ?? '');
-            $isStandby = $category === 'standby';
-
-            // daily: touch everything except Standby. standby_sweep: touch ONLY Standby.
-            $shouldTouch = $mode === 'standby_sweep' ? $isStandby : !$isStandby;
-            if ($shouldTouch) {
-                $eligible[] = ['id'=>$e['id'], 'name'=>$name, 'new_balance'=>null];
-            } else {
-                $skippedNames[] = $name;
-            }
+            $eligible[] = ['id'=>$e['id'], 'name'=>$name, 'new_balance'=>null];
         }
 
         $newDate = date('Y-m-d', strtotime($today.' +1 day'));
 
         if ($dryRun) {
             sendResponse('success','Dry run — nothing was changed',[
-                'mode'=>$mode, 'date'=>$today, 'new_date'=>$newDate,
-                'would_reschedule'=>count($eligible), 'would_skip'=>count($skippedNames),
-                'eligible_names'=>array_column($eligible,'name'), 'skipped_names'=>$skippedNames,
+                'date'=>$today, 'new_date'=>$newDate,
+                'would_reschedule'=>count($eligible), 'eligible_names'=>array_column($eligible,'name'),
             ]);
         }
 
@@ -1200,60 +1209,10 @@ if ($path === '/planner/auto-reschedule' && $method === 'GET') {
 
         try {
             $pdo->prepare("INSERT INTO activity_logs (user_id,username,action,description,created_at) VALUES (NULL,'cron',?,?,NOW())")
-                ->execute(["auto_reschedule_{$mode}", json_encode(['date'=>$today,'new_date'=>$newDate,'success'=>$result['success'],'failed'=>count($result['failed']),'skipped'=>count($skippedNames)])]);
+                ->execute(["auto_reschedule", json_encode(['date'=>$today,'new_date'=>$newDate,'success'=>$result['success'],'failed'=>count($result['failed'])])]);
         } catch (\Throwable $e) {}
 
-        sendResponse('success','Auto-reschedule complete', array_merge(['mode'=>$mode,'skipped'=>count($skippedNames)], $result));
-    } catch (\Throwable $e) { sendResponse('error',$e->getMessage(),null,500); }
-}
-
-// ==========================================
-// EVENT PLANNER — toggle Standby ("?") marker on a calendar event's title
-// ==========================================
-// Admin-driven (unlike the cron-only auto-reschedule above) — this is the "Add to
-// Standby" tab's action. Renames the event's summary, appending/removing a
-// trailing "?", so the exact same convention getEventCategory() already reads
-// elsewhere immediately reflects it.
-if ($path === '/planner/toggle-standby' && $method === 'POST') {
-    requireAdmin($pdo);
-    try {
-        $body = json_decode(file_get_contents('php://input'), true);
-        $eventId = $body['event_id'] ?? '';
-        $standby = !empty($body['standby']);
-        if (!$eventId) sendResponse('error','event_id is required',null,400);
-
-        $cfg = getGCalSettings($pdo);
-        $calendarId = $cfg['google_calendar_id'] ?? '';
-        $sa = json_decode($cfg['google_service_account_json'] ?? '', true);
-        if (!$sa || !$calendarId) sendResponse('error','Calendar not configured',null,400);
-        $token = getGCalToken($sa);
-        if (!$token) sendResponse('error','Could not authenticate with Google Calendar',null,500);
-
-        $baseUrl = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events/";
-        $evData = curlGetGCalRetry($baseUrl.urlencode($eventId), $token);
-        if ($evData === null) sendResponse('error','Could not reach Google Calendar to read this event. Please try again.',null,502);
-
-        $currentName = trim($evData['summary'] ?? '');
-        if ($standby) {
-            $newName = rtrim($currentName, "? \t") . '?';
-        } else {
-            $newName = rtrim($currentName, "? \t");
-        }
-
-        if ($newName === $currentName) {
-            sendResponse('success', $standby ? 'Already on Standby' : 'Already not on Standby', ['name'=>$currentName]);
-        }
-
-        $ch = curl_init($baseUrl.urlencode($eventId).'?sendUpdates=none');
-        curl_setopt_array($ch,[CURLOPT_CUSTOMREQUEST=>'PATCH',CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>json_encode(['summary'=>$newName]),CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}","Content-Type: application/json"],CURLOPT_TIMEOUT=>15]);
-        $res = json_decode(curl_exec($ch),true);
-        $code = curl_getinfo($ch,CURLINFO_HTTP_CODE); curl_close($ch);
-
-        if ($code===200 && isset($res['id'])) {
-            sendResponse('success', $standby ? 'Added to Standby' : 'Removed from Standby', ['name'=>$res['summary']??$newName]);
-        } else {
-            sendResponse('error', $res['error']['message'] ?? "HTTP $code", null, 500);
-        }
+        sendResponse('success','Auto-reschedule complete', $result);
     } catch (\Throwable $e) { sendResponse('error',$e->getMessage(),null,500); }
 }
 
@@ -2445,7 +2404,7 @@ if ($path === '/loans/admin/accounts/sync-calendar' && $method === 'POST') {
         $evData = curlGetGCalRetry($url, $token);
         if ($evData === null) sendResponse('error','Could not reach Google Calendar. Please try again.',null,502);
 
-        $existing = $pdo->query("SELECT id, customer_name, customer_email FROM loan_accounts")->fetchAll();
+        $existing = $pdo->query("SELECT id, customer_name, customer_email, next_payment_date, maturity_date FROM loan_accounts")->fetchAll();
 
         $created = 0; $updated = 0; $unchanged = 0; $scanned = 0;
         foreach ($evData['items'] ?? [] as $e) {
@@ -2455,6 +2414,8 @@ if ($path === '/loans/admin/accounts/sync-calendar' && $method === 'POST') {
 
             $desc = $e['description'] ?? '';
             $balance = parseKBalance($desc) ?? 0;
+            $dueDate = parseDueDateFromDesc($desc);
+            $maturityDate = parseMaturityDateFromDesc($desc);
             $guestEmail = null;
             foreach ($e['attendees'] ?? [] as $a) {
                 if (empty($a['organizer']) && empty($a['self']) && !empty($a['email'])) { $guestEmail = $a['email']; break; }
@@ -2467,8 +2428,13 @@ if ($path === '/loans/admin/accounts/sync-calendar' && $method === 'POST') {
             }
 
             if ($best && $bestScore >= 70) {
-                if ($guestEmail && empty($best['customer_email'])) {
-                    $pdo->prepare("UPDATE loan_accounts SET customer_email=? WHERE id=?")->execute([$guestEmail, $best['id']]);
+                $fields = []; $vals = [];
+                if ($guestEmail && empty($best['customer_email'])) { $fields[] = 'customer_email=?'; $vals[] = $guestEmail; }
+                if ($dueDate && empty($best['next_payment_date'])) { $fields[] = 'next_payment_date=?'; $vals[] = $dueDate; }
+                if ($maturityDate && empty($best['maturity_date'])) { $fields[] = 'maturity_date=?'; $vals[] = $maturityDate; }
+                if (!empty($fields)) {
+                    $vals[] = $best['id'];
+                    $pdo->prepare("UPDATE loan_accounts SET ".implode(',', $fields)." WHERE id=?")->execute($vals);
                     $updated++;
                 } else {
                     $unchanged++;
@@ -2484,9 +2450,13 @@ if ($path === '/loans/admin/accounts/sync-calendar' && $method === 'POST') {
                 if (!$refCheck->fetch()) { $loanReference = $candidate; break; }
             }
             if (!$loanReference) continue;
-            $pdo->prepare("INSERT INTO loan_accounts (loan_reference,customer_name,customer_phone,customer_email,national_id_last4,loan_amount,total_repayable,amount_paid,outstanding_balance,monthly_installment,loan_status,disbursement_date,maturity_date) VALUES (?,?,NULL,?,NULL,?,?,0,?,?,?,NULL,NULL)")
-                ->execute([$loanReference, $name, $guestEmail, $balance, $balance, $balance, 0, 'pending']);
-            $existing[] = ['id' => $pdo->lastInsertId(), 'customer_name' => $name, 'customer_email' => $guestEmail];
+            // Phone/national ID/disbursement date are never present in a
+            // calendar reminder's text (confirmed against all live event
+            // descriptions) — left NULL rather than guessed. next_payment_date
+            // and maturity_date ARE reliably derivable and pulled above.
+            $pdo->prepare("INSERT INTO loan_accounts (loan_reference,customer_name,customer_phone,customer_email,national_id_last4,loan_amount,total_repayable,amount_paid,outstanding_balance,monthly_installment,next_payment_date,loan_status,disbursement_date,maturity_date) VALUES (?,?,NULL,?,NULL,?,?,0,?,?,?,?,NULL,?)")
+                ->execute([$loanReference, $name, $guestEmail, $balance, $balance, $balance, 0, $dueDate, 'pending', $maturityDate]);
+            $existing[] = ['id' => $pdo->lastInsertId(), 'customer_name' => $name, 'customer_email' => $guestEmail, 'next_payment_date' => $dueDate, 'maturity_date' => $maturityDate];
             $created++;
         }
 
