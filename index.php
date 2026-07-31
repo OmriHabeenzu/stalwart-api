@@ -1053,7 +1053,12 @@ if ($path === '/planner/events' && $method === 'GET') {
         $includeDesc = ($_GET['desc'] ?? '') === '1';
         $events = [];
         foreach ($evData['items'] ?? [] as $e) {
-            $item = ['id'=>$e['id'],'name'=>$e['summary']??''];
+            $name = trim($e['summary'] ?? '');
+            // Busy-marker events (any variant — "Busy", "Busy Day", etc.) aren't
+            // real clients — exclude them so they never show up as a fake
+            // selectable name in the Reschedule list or Clients headcount.
+            if (!$name || stripos($name, 'busy') !== false) continue;
+            $item = ['id'=>$e['id'],'name'=>$name];
             if ($includeDesc) $item['description'] = $e['description'] ?? '';
             $events[] = $item;
         }
@@ -1192,7 +1197,10 @@ if ($path === '/planner/auto-reschedule' && $method === 'GET') {
         $eligible = [];
         foreach ($evData['items'] ?? [] as $e) {
             $name = trim($e['summary'] ?? '');
-            if (!$name || strcasecmp($name,'busy') === 0) continue;
+            // Any variant containing "busy" (not just an exact "Busy" match) —
+            // real calendar entries have drifted to "Busy Day", "Busy " etc,
+            // which an exact strcasecmp() silently let through as real clients.
+            if (!$name || stripos($name, 'busy') !== false) continue;
             $eligible[] = ['id'=>$e['id'], 'name'=>$name, 'new_balance'=>null];
         }
 
@@ -1242,8 +1250,8 @@ if ($path === '/planner/loans' && $method === 'GET') {
             if ($evData === null) sendResponse('error','Could not reach Google Calendar to list loans. Please try again.',null,502);
             foreach ($evData['items']??[] as $e) {
                 $title = trim($e['summary']??'');
-                // Skip stagnant loans (. or , in title), busy, blank
-                if (!$title || strcasecmp($title,'busy')===0) continue;
+                // Skip stagnant loans (. or , in title), busy (any variant), blank
+                if (!$title || stripos($title,'busy')!==false) continue;
                 if (strpos($title,'.')!==false || strpos($title,',')!==false) continue;
                 $desc    = $e['description'] ?? '';
                 $balance = parseKBalance($desc);
@@ -2409,7 +2417,7 @@ if ($path === '/loans/admin/accounts/sync-calendar' && $method === 'POST') {
         $created = 0; $updated = 0; $unchanged = 0; $scanned = 0;
         foreach ($evData['items'] ?? [] as $e) {
             $name = trim($e['summary'] ?? '');
-            if (!$name || strcasecmp($name,'busy') === 0) continue;
+            if (!$name || stripos($name, 'busy') !== false) continue;
             $scanned++;
 
             $desc = $e['description'] ?? '';
