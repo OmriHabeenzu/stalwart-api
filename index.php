@@ -137,6 +137,7 @@ try {
     $pdo->exec("CREATE TABLE IF NOT EXISTS task_attachments (id INT AUTO_INCREMENT PRIMARY KEY, task_id INT NOT NULL, uploaded_by INT NOT NULL, file_name VARCHAR(255) NOT NULL, file_path VARCHAR(500) NOT NULL, file_size INT, mime_type VARCHAR(100), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     $pdo->exec("CREATE TABLE IF NOT EXISTS task_completions (id INT AUTO_INCREMENT PRIMARY KEY, task_id INT NOT NULL, completed_by INT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
     $pdo->exec("CREATE TABLE IF NOT EXISTS task_completion_assignees (id INT AUTO_INCREMENT PRIMARY KEY, completion_id INT NOT NULL, user_id INT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS task_time_entries (id INT AUTO_INCREMENT PRIMARY KEY, task_id INT NOT NULL, user_id INT NOT NULL, started_at DATETIME NOT NULL, ended_at DATETIME NULL, duration_seconds INT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, INDEX idx_task (task_id), INDEX idx_user_running (user_id, ended_at))");
     try { $pdo->exec("ALTER TABLE tasks ADD COLUMN category VARCHAR(50) DEFAULT 'general'"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE tasks ADD COLUMN due_time TIME DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE tasks ADD COLUMN recurrence VARCHAR(20) DEFAULT 'none'"); } catch (\Throwable $e) {}
@@ -1407,6 +1408,16 @@ if (preg_match('#^/tasks/(\d+)$#',$path,$m) && $method === 'PUT') {
     $user = requireAuth($pdo);
     $data = getRequestData();
     $taskId = (int)$m[1];
+    // Status transitions (Start/Complete/Pending) stay open to any assignee —
+    // full edits (title, dates, priority, reassignment, etc.) are admin-only.
+    $editOnlyFields = ['title','description','priority','category','recurrence','color',
+        'due_date','dueDate','due_time','dueTime','start_date','startDate',
+        'maturity_date','maturityDate','assignees','assignee_ids'];
+    foreach ($editOnlyFields as $f) {
+        if (array_key_exists($f, $data) && $user['role'] !== 'admin') {
+            sendResponse('error','Only admins can edit task details',null,403);
+        }
+    }
     try {
         // Snapshot before/after so we only email on what the user actually asked
         // to change (status, dates, reassignment) — never on every field edit.
@@ -1469,12 +1480,14 @@ if (preg_match('#^/tasks/(\d+)$#',$path,$m) && $method === 'PUT') {
                 $caStmt = $pdo->prepare("INSERT INTO task_completion_assignees (completion_id, user_id) VALUES (?, ?)");
                 foreach ($cycleAssigneeIds as $uid) $caStmt->execute([$completionId, $uid]);
             }
-            $pdo->prepare("UPDATE tasks SET status='pending', due_date=?, start_date=?, maturity_date=NULL, days_overdue=NULL, completed_at=NULL, last_recurred_at=NOW(), updated_at=NOW() WHERE id=?")
+            // The new cycle starts as In Progress (not To Do) — a recurring
+            // task is ongoing/routine work, not a fresh unstarted item.
+            $pdo->prepare("UPDATE tasks SET status='in_progress', due_date=?, start_date=?, maturity_date=NULL, days_overdue=NULL, completed_at=NULL, last_recurred_at=NOW(), updated_at=NOW() WHERE id=?")
                 ->execute([$recurrenceNextDue, $recurrenceNextDue, $taskId]);
             // Each cycle starts fresh — reset the live per-assignee checkboxes
             // too, matching the task's own reset (historical credit for this
             // cycle is preserved above in task_completion_assignees).
-            $pdo->prepare("UPDATE task_assignees SET status='pending', completed_at=NULL WHERE task_id=?")->execute([$taskId]);
+            $pdo->prepare("UPDATE task_assignees SET status='in_progress', completed_at=NULL WHERE task_id=?")->execute([$taskId]);
             $recurrenceReset = true;
         }
 
@@ -1574,6 +1587,86 @@ if (preg_match('#^/tasks/(\d+)/assignee-status$#',$path,$m) && $method === 'PATC
     try {
         $pdo->prepare("UPDATE task_assignees SET status=? WHERE task_id=? AND user_id=?")->execute([$status,$taskId,$userId]);
         sendResponse('success','Status updated');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+// ==========================================
+// TASKS — time tracker. One running timer per user at a time; starting a new
+// one auto-stops whatever else that user left running.
+// ==========================================
+
+if ($path === '/tasks/time/active' && $method === 'GET') {
+    $user = requireAuth($pdo);
+    try {
+        $stmt = $pdo->prepare("SELECT te.id, te.task_id, te.started_at, t.title as task_title FROM task_time_entries te JOIN tasks t ON t.id=te.task_id WHERE te.user_id=? AND te.ended_at IS NULL ORDER BY te.started_at DESC LIMIT 1");
+        $stmt->execute([$user['id']]);
+        $active = $stmt->fetch();
+        sendResponse('success','Active timer retrieved', $active ?: null);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+// Timesheet — the current user's own logged time, most recent first.
+if ($path === '/tasks/time/log' && $method === 'GET') {
+    $user = requireAuth($pdo);
+    try {
+        $stmt = $pdo->prepare("SELECT te.*, t.title as task_title FROM task_time_entries te JOIN tasks t ON t.id=te.task_id WHERE te.user_id=? ORDER BY te.started_at DESC LIMIT 200");
+        $stmt->execute([$user['id']]);
+        $entries = $stmt->fetchAll();
+        $totalStmt = $pdo->prepare("SELECT COALESCE(SUM(COALESCE(duration_seconds, TIMESTAMPDIFF(SECOND, started_at, NOW()))),0) as total_seconds FROM task_time_entries WHERE user_id=?");
+        $totalStmt->execute([$user['id']]);
+        $totalSeconds = (int)$totalStmt->fetch()['total_seconds'];
+        sendResponse('success','Time log retrieved', ['entries'=>$entries,'total_seconds'=>$totalSeconds]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/tasks/(\d+)/time$#',$path,$m) && $method === 'GET') {
+    $user = requireAuth($pdo);
+    $taskId = (int)$m[1];
+    try {
+        $stmt = $pdo->prepare("SELECT te.*, u.name as user_name FROM task_time_entries te LEFT JOIN users u ON u.id=te.user_id WHERE te.task_id=? ORDER BY te.started_at DESC");
+        $stmt->execute([$taskId]);
+        $entries = $stmt->fetchAll();
+        $totalStmt = $pdo->prepare("SELECT COALESCE(SUM(COALESCE(duration_seconds, TIMESTAMPDIFF(SECOND, started_at, NOW()))),0) as total_seconds FROM task_time_entries WHERE task_id=?");
+        $totalStmt->execute([$taskId]);
+        $totalSeconds = (int)$totalStmt->fetch()['total_seconds'];
+        sendResponse('success','Time entries retrieved', ['entries'=>$entries,'total_seconds'=>$totalSeconds]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/tasks/(\d+)/time/start$#',$path,$m) && $method === 'POST') {
+    $user = requireAuth($pdo);
+    $taskId = (int)$m[1];
+    try {
+        $exists = $pdo->prepare("SELECT id FROM tasks WHERE id=?");
+        $exists->execute([$taskId]);
+        if (!$exists->fetch()) sendResponse('error','Task not found',null,404);
+        $running = $pdo->prepare("SELECT id FROM task_time_entries WHERE user_id=? AND ended_at IS NULL");
+        $running->execute([$user['id']]);
+        foreach ($running->fetchAll(PDO::FETCH_COLUMN) as $rid) {
+            $pdo->prepare("UPDATE task_time_entries SET ended_at=NOW(), duration_seconds=TIMESTAMPDIFF(SECOND, started_at, NOW()) WHERE id=?")->execute([$rid]);
+        }
+        $pdo->prepare("INSERT INTO task_time_entries (task_id, user_id, started_at) VALUES (?, ?, NOW())")->execute([$taskId, $user['id']]);
+        $entryId = $pdo->lastInsertId();
+        $startedStmt = $pdo->prepare("SELECT started_at FROM task_time_entries WHERE id=?");
+        $startedStmt->execute([$entryId]);
+        $started = $startedStmt->fetch()['started_at'];
+        sendResponse('success','Timer started', ['id'=>(int)$entryId,'task_id'=>$taskId,'started_at'=>$started], 201);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if (preg_match('#^/tasks/(\d+)/time/stop$#',$path,$m) && $method === 'POST') {
+    $user = requireAuth($pdo);
+    $taskId = (int)$m[1];
+    try {
+        $stmt = $pdo->prepare("SELECT id FROM task_time_entries WHERE task_id=? AND user_id=? AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1");
+        $stmt->execute([$taskId, $user['id']]);
+        $entry = $stmt->fetch();
+        if (!$entry) sendResponse('error','No running timer for this task',null,404);
+        $pdo->prepare("UPDATE task_time_entries SET ended_at=NOW(), duration_seconds=TIMESTAMPDIFF(SECOND, started_at, NOW()) WHERE id=?")->execute([$entry['id']]);
+        $durStmt = $pdo->prepare("SELECT duration_seconds FROM task_time_entries WHERE id=?");
+        $durStmt->execute([$entry['id']]);
+        $duration = (int)$durStmt->fetch()['duration_seconds'];
+        sendResponse('success','Timer stopped', ['id'=>(int)$entry['id'],'duration_seconds'=>$duration]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
