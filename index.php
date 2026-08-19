@@ -1480,14 +1480,14 @@ if (preg_match('#^/tasks/(\d+)$#',$path,$m) && $method === 'PUT') {
                 $caStmt = $pdo->prepare("INSERT INTO task_completion_assignees (completion_id, user_id) VALUES (?, ?)");
                 foreach ($cycleAssigneeIds as $uid) $caStmt->execute([$completionId, $uid]);
             }
-            // The new cycle starts as In Progress (not To Do) — a recurring
-            // task is ongoing/routine work, not a fresh unstarted item.
-            $pdo->prepare("UPDATE tasks SET status='in_progress', due_date=?, start_date=?, maturity_date=NULL, days_overdue=NULL, completed_at=NULL, last_recurred_at=NOW(), updated_at=NOW() WHERE id=?")
+            // The new cycle starts back in To Do — someone has to click Start
+            // to move it into In Progress, same as any other task.
+            $pdo->prepare("UPDATE tasks SET status='pending', due_date=?, start_date=?, maturity_date=NULL, days_overdue=NULL, completed_at=NULL, last_recurred_at=NOW(), updated_at=NOW() WHERE id=?")
                 ->execute([$recurrenceNextDue, $recurrenceNextDue, $taskId]);
             // Each cycle starts fresh — reset the live per-assignee checkboxes
             // too, matching the task's own reset (historical credit for this
             // cycle is preserved above in task_completion_assignees).
-            $pdo->prepare("UPDATE task_assignees SET status='in_progress', completed_at=NULL WHERE task_id=?")->execute([$taskId]);
+            $pdo->prepare("UPDATE task_assignees SET status='pending', completed_at=NULL WHERE task_id=?")->execute([$taskId]);
             $recurrenceReset = true;
         }
 
