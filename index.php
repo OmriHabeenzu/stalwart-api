@@ -1324,6 +1324,11 @@ if ($path === '/planner/loans/update' && $method === 'POST') {
 // ==========================================
 if ($path === '/analytics/stats' && $method === 'GET') {
     requireAdmin($pdo);
+    // 'completed' is scoped to a single month (default: current) so the
+    // figure reads as "completed in August" rather than an ever-growing
+    // lifetime total that gets less meaningful the longer the app is used.
+    $month = $_GET['month'] ?? date('Y-m');
+    [$year, $mon] = explode('-', $month);
     try {
         $users = (int)$pdo->query("SELECT COUNT(*) FROM users WHERE is_active=1")->fetchColumn();
         $logs  = (int)$pdo->query("SELECT COUNT(*) FROM activity_logs")->fetchColumn();
@@ -1336,9 +1341,18 @@ if ($path === '/analytics/stats' && $method === 'GET') {
         try { $apps['total']=(int)$pdo->query("SELECT COUNT(*) FROM job_applications")->fetchColumn(); $apps['pending']=(int)$pdo->query("SELECT COUNT(*) FROM job_applications WHERE status='pending'")->fetchColumn(); $apps['this_month']=(int)$pdo->query("SELECT COUNT(*) FROM job_applications WHERE MONTH(created_at)=MONTH(NOW()) AND YEAR(created_at)=YEAR(NOW())")->fetchColumn(); } catch(Exception $e){}
         try { $tests['total']=(int)$pdo->query("SELECT COUNT(*) FROM testimonials")->fetchColumn(); $tests['approved']=(int)$pdo->query("SELECT COUNT(*) FROM testimonials WHERE is_approved=1")->fetchColumn(); $tests['pending']=$tests['total']-$tests['approved']; } catch(Exception $e){}
         try { $chats['total']=(int)$pdo->query("SELECT COUNT(*) FROM chat_sessions")->fetchColumn(); $chats['active']=(int)$pdo->query("SELECT COUNT(*) FROM chat_sessions WHERE status='active'")->fetchColumn(); $chats['messages']=(int)$pdo->query("SELECT COUNT(*) FROM chat_messages")->fetchColumn(); } catch(Exception $e){}
-        try { $tasks['total']=(int)$pdo->query("SELECT COUNT(*) FROM tasks")->fetchColumn(); $tasks['completed']=(int)$pdo->query("SELECT (SELECT COUNT(*) FROM tasks WHERE status='completed') + (SELECT COUNT(*) FROM task_completions)")->fetchColumn(); $tasks['pending']=(int)$pdo->query("SELECT COUNT(*) FROM tasks WHERE status='pending'")->fetchColumn(); } catch(Exception $e){}
+        try {
+            $tasks['total']=(int)$pdo->query("SELECT COUNT(*) FROM tasks")->fetchColumn();
+            $completedStmt = $pdo->prepare(
+                "SELECT (SELECT COUNT(*) FROM tasks WHERE status='completed' AND recurrence='none' AND YEAR(completed_at)=? AND MONTH(completed_at)=?)
+                       + (SELECT COUNT(*) FROM task_completions WHERE YEAR(created_at)=? AND MONTH(created_at)=?)"
+            );
+            $completedStmt->execute([$year, $mon, $year, $mon]);
+            $tasks['completed']=(int)$completedStmt->fetchColumn();
+            $tasks['pending']=(int)$pdo->query("SELECT COUNT(*) FROM tasks WHERE status='pending'")->fetchColumn();
+        } catch(Exception $e){}
         try { $loans['active_accounts']=(int)$pdo->query("SELECT COUNT(*) FROM loan_accounts WHERE loan_status='active'")->fetchColumn(); $loans['total_payments']=(int)$pdo->query("SELECT COUNT(*) FROM loan_payments")->fetchColumn(); $loans['pending_payments']=(int)$pdo->query("SELECT COUNT(*) FROM loan_payments WHERE status='pending'")->fetchColumn(); $loans['total_revenue']=(float)$pdo->query("SELECT COALESCE(SUM(amount),0) FROM loan_payments WHERE status='completed'")->fetchColumn(); } catch(Exception $e){}
-        sendResponse('success','Stats retrieved',['users'=>['total'=>$users],'logs'=>['total'=>$logs,'last_7_days'=>$logs7],'applications'=>$apps,'testimonials'=>$tests,'chats'=>$chats,'tasks'=>$tasks,'loans'=>$loans]);
+        sendResponse('success','Stats retrieved',['month'=>$month,'users'=>['total'=>$users],'logs'=>['total'=>$logs,'last_7_days'=>$logs7],'applications'=>$apps,'testimonials'=>$tests,'chats'=>$chats,'tasks'=>$tasks,'loans'=>$loans]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
