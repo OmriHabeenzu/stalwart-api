@@ -1958,19 +1958,26 @@ if ($path === '/admin/send-daily-reminders' && $method === 'POST') {
                 if (!empty($r['email'])) { sendEmail($r['email'],$r['name'],"📞 Call Duty Reminder — {$dayName}","<p>Hello {$r['name']},</p><p>You are scheduled for <strong>{$roleLabel}</strong> today{$callerNote}.</p>"); $emailsSent++; }
             }
         }
-        // Same overdue + due-today task reminders the daily cron sends
-        // automatically — exposed here too so an admin can trigger them
-        // on demand (e.g. right before end of day) instead of waiting.
-        $taskResult = sendTaskDueReminders($pdo, false);
-        $overdueTasks = count($taskResult['overdue']);
-        $dueTodayTasks = count($taskResult['due_today']);
-        sendResponse('success',"Reminders sent to {$scheduleEntries} staff member(s), plus task reminders for {$overdueTasks} overdue and {$dueTodayTasks} due-today task(s)",[
-            'emails_sent'=>$emailsSent,
-            'schedule_entries'=>$scheduleEntries,
-            'due_tasks'=>$dueTodayTasks,
-            'overdue_tasks'=>$overdueTasks,
-        ]);
+        $dueTasks=(int)$pdo->query("SELECT COUNT(*) FROM tasks WHERE due_date='{$today}' AND status!='completed'")->fetchColumn();
+        sendResponse('success',"Reminders sent to {$scheduleEntries} staff member(s)",['emails_sent'=>$emailsSent,'schedule_entries'=>$scheduleEntries,'due_tasks'=>$dueTasks]);
     } catch (\Throwable $e) { sendResponse('error','Failed to send reminders: '.$e->getMessage(),null,500); }
+}
+
+// Independent of call-schedule reminders above — lives on the Tasks page
+// itself (admin-only button) so an admin managing tasks can trigger
+// overdue/due-today email reminders on the spot, same logic as the
+// automatic daily cron (/tasks/daily-check).
+if ($path === '/admin/send-task-reminders' && $method === 'POST') {
+    requireAdmin($pdo);
+    try {
+        $result = sendTaskDueReminders($pdo, false);
+        $overdueTasks = count($result['overdue']);
+        $dueTodayTasks = count($result['due_today']);
+        sendResponse('success',"Task reminders sent for {$overdueTasks} overdue and {$dueTodayTasks} due-today task(s)",[
+            'overdue_tasks'=>$overdueTasks,
+            'due_tasks'=>$dueTodayTasks,
+        ]);
+    } catch (\Throwable $e) { sendResponse('error','Failed to send task reminders: '.$e->getMessage(),null,500); }
 }
 
 // ==========================================
