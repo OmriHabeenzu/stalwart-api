@@ -1685,11 +1685,14 @@ if (preg_match('#^/tasks/(\d+)/time/stop$#',$path,$m) && $method === 'POST') {
 }
 
 // ==========================================
-// TASKS — daily overdue check (cron, mirrors /planner/auto-reschedule's token
-// pattern). Does NOT move due_date anymore — instead sets days_overdue (a
-// dedicated column; see migrations/alter_tasks_days_overdue.sql for why this
-// isn't stored in maturity_date) and sends one reminder (in-app + email) per
-// assignee per day the task stays overdue and incomplete.
+// TASKS — daily overdue + due-today check (cron, mirrors
+// /planner/auto-reschedule's token pattern). Does NOT move due_date anymore
+// — instead sets days_overdue (a dedicated column; see
+// migrations/alter_tasks_days_overdue.sql for why this isn't stored in
+// maturity_date) and sends one reminder (in-app + email) per assignee per
+// day a task stays overdue and incomplete, PLUS a same-day heads-up (in-app
+// + email) the day a task is actually due, before it has a chance to slip
+// into overdue.
 // ==========================================
 if ($path === '/tasks/daily-check' && $method === 'GET') {
     $providedToken = $_GET['token'] ?? '';
@@ -1700,11 +1703,14 @@ if ($path === '/tasks/daily-check' && $method === 'GET') {
     try {
         $dryRun = ($_GET['dry_run'] ?? '') === '1';
         $overdue = $pdo->query("SELECT id, title, due_date, DATEDIFF(CURDATE(), due_date) AS days_overdue FROM tasks WHERE due_date < CURDATE() AND status != 'completed'")->fetchAll();
+        $dueToday = $pdo->query("SELECT id, title, due_date FROM tasks WHERE due_date = CURDATE() AND status != 'completed'")->fetchAll();
 
         if ($dryRun) {
             sendResponse('success','Dry run — nothing was changed', [
                 'would_remind' => count($overdue),
+                'would_remind_due_today' => count($dueToday),
                 'tasks' => array_map(fn($t) => ['id'=>$t['id'],'title'=>$t['title'],'due_date'=>$t['due_date'],'days_overdue'=>(int)$t['days_overdue']], $overdue),
+                'due_today_tasks' => array_map(fn($t) => ['id'=>$t['id'],'title'=>$t['title'],'due_date'=>$t['due_date']], $dueToday),
             ]);
         }
 
@@ -1720,12 +1726,21 @@ if ($path === '/tasks/daily-check' && $method === 'GET') {
             emailTaskAssignees($pdo, $t['id'], $t['title'], "Task Overdue: {$t['title']}", ["This task is still pending and is now {$t['days_overdue']} day(s) overdue."]);
         }
 
+        foreach ($dueToday as $t) {
+            $assignees = $pdo->prepare("SELECT u.id, u.name, u.email FROM task_assignees ta JOIN users u ON u.id=ta.user_id WHERE ta.task_id=?");
+            $assignees->execute([$t['id']]);
+            foreach ($assignees->fetchAll() as $a) {
+                createNotification($pdo, $a['id'], 'task_due_today', "Task due today: {$t['title']}", "This task is due today.", '/dashboard/tasks');
+            }
+            emailTaskAssignees($pdo, $t['id'], $t['title'], "Task Due Today: {$t['title']}", ["This task is due today."]);
+        }
+
         try {
             $pdo->prepare("INSERT INTO activity_logs (user_id,username,action,description,created_at) VALUES (NULL,'cron',?,?,NOW())")
-                ->execute(['tasks_daily_check', json_encode(['reminded'=>count($overdue),'task_ids'=>array_column($overdue,'id')])]);
+                ->execute(['tasks_daily_check', json_encode(['reminded'=>count($overdue),'reminded_due_today'=>count($dueToday),'task_ids'=>array_column($overdue,'id'),'due_today_task_ids'=>array_column($dueToday,'id')])]);
         } catch (\Throwable $e) {}
 
-        sendResponse('success','Daily check complete', ['reminded'=>count($overdue)]);
+        sendResponse('success','Daily check complete', ['reminded'=>count($overdue),'reminded_due_today'=>count($dueToday)]);
     } catch (\Throwable $e) { sendResponse('error',$e->getMessage(),null,500); }
 }
 
