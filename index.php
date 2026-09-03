@@ -262,6 +262,38 @@ function emailTaskAssignees($pdo, $taskId, $title, $subject, $changeLines) {
         }
     } catch (\Throwable $e) {}
 }
+// Shared by the daily cron (/tasks/daily-check) AND the admin's manual
+// "Send Daily Reminders" button (/admin/send-daily-reminders) — finds
+// overdue and due-today incomplete tasks and, unless $dryRun, sends one
+// in-app + email reminder per assignee (plus bumps days_overdue). Returns
+// the raw task rows either way so both callers can report counts/details.
+function sendTaskDueReminders($pdo, $dryRun = false) {
+    $overdue = $pdo->query("SELECT id, title, due_date, DATEDIFF(CURDATE(), due_date) AS days_overdue FROM tasks WHERE due_date < CURDATE() AND status != 'completed'")->fetchAll();
+    $dueToday = $pdo->query("SELECT id, title, due_date FROM tasks WHERE due_date = CURDATE() AND status != 'completed'")->fetchAll();
+
+    if (!$dryRun) {
+        $updateStmt = $pdo->prepare("UPDATE tasks SET days_overdue=?, updated_at=NOW() WHERE id=?");
+        foreach ($overdue as $t) {
+            $updateStmt->execute([$t['days_overdue'], $t['id']]);
+            $assignees = $pdo->prepare("SELECT u.id, u.name, u.email FROM task_assignees ta JOIN users u ON u.id=ta.user_id WHERE ta.task_id=?");
+            $assignees->execute([$t['id']]);
+            foreach ($assignees->fetchAll() as $a) {
+                createNotification($pdo, $a['id'], 'task_overdue', "Task overdue: {$t['title']}", "This task is now {$t['days_overdue']} day(s) overdue.", '/dashboard/tasks');
+            }
+            emailTaskAssignees($pdo, $t['id'], $t['title'], "Task Overdue: {$t['title']}", ["This task is still pending and is now {$t['days_overdue']} day(s) overdue."]);
+        }
+        foreach ($dueToday as $t) {
+            $assignees = $pdo->prepare("SELECT u.id, u.name, u.email FROM task_assignees ta JOIN users u ON u.id=ta.user_id WHERE ta.task_id=?");
+            $assignees->execute([$t['id']]);
+            foreach ($assignees->fetchAll() as $a) {
+                createNotification($pdo, $a['id'], 'task_due_today', "Task due today: {$t['title']}", "This task is due today.", '/dashboard/tasks');
+            }
+            emailTaskAssignees($pdo, $t['id'], $t['title'], "Task Due Today: {$t['title']}", ["This task is due today."]);
+        }
+    }
+
+    return ['overdue' => $overdue, 'due_today' => $dueToday];
+}
 // Shared by POST /tasks and POST /tasks/{id}/subtasks — inserts a task row
 // (optionally as a child via $parentTaskId), assigns users, and emails them.
 // Returns the new task id, or null if title is blank.
@@ -1702,8 +1734,8 @@ if ($path === '/tasks/daily-check' && $method === 'GET') {
     }
     try {
         $dryRun = ($_GET['dry_run'] ?? '') === '1';
-        $overdue = $pdo->query("SELECT id, title, due_date, DATEDIFF(CURDATE(), due_date) AS days_overdue FROM tasks WHERE due_date < CURDATE() AND status != 'completed'")->fetchAll();
-        $dueToday = $pdo->query("SELECT id, title, due_date FROM tasks WHERE due_date = CURDATE() AND status != 'completed'")->fetchAll();
+        $result = sendTaskDueReminders($pdo, $dryRun);
+        $overdue = $result['overdue']; $dueToday = $result['due_today'];
 
         if ($dryRun) {
             sendResponse('success','Dry run — nothing was changed', [
@@ -1712,27 +1744,6 @@ if ($path === '/tasks/daily-check' && $method === 'GET') {
                 'tasks' => array_map(fn($t) => ['id'=>$t['id'],'title'=>$t['title'],'due_date'=>$t['due_date'],'days_overdue'=>(int)$t['days_overdue']], $overdue),
                 'due_today_tasks' => array_map(fn($t) => ['id'=>$t['id'],'title'=>$t['title'],'due_date'=>$t['due_date']], $dueToday),
             ]);
-        }
-
-        $updateStmt = $pdo->prepare("UPDATE tasks SET days_overdue=?, updated_at=NOW() WHERE id=?");
-        foreach ($overdue as $t) {
-            $updateStmt->execute([$t['days_overdue'], $t['id']]);
-
-            $assignees = $pdo->prepare("SELECT u.id, u.name, u.email FROM task_assignees ta JOIN users u ON u.id=ta.user_id WHERE ta.task_id=?");
-            $assignees->execute([$t['id']]);
-            foreach ($assignees->fetchAll() as $a) {
-                createNotification($pdo, $a['id'], 'task_overdue', "Task overdue: {$t['title']}", "This task is now {$t['days_overdue']} day(s) overdue.", '/dashboard/tasks');
-            }
-            emailTaskAssignees($pdo, $t['id'], $t['title'], "Task Overdue: {$t['title']}", ["This task is still pending and is now {$t['days_overdue']} day(s) overdue."]);
-        }
-
-        foreach ($dueToday as $t) {
-            $assignees = $pdo->prepare("SELECT u.id, u.name, u.email FROM task_assignees ta JOIN users u ON u.id=ta.user_id WHERE ta.task_id=?");
-            $assignees->execute([$t['id']]);
-            foreach ($assignees->fetchAll() as $a) {
-                createNotification($pdo, $a['id'], 'task_due_today', "Task due today: {$t['title']}", "This task is due today.", '/dashboard/tasks');
-            }
-            emailTaskAssignees($pdo, $t['id'], $t['title'], "Task Due Today: {$t['title']}", ["This task is due today."]);
         }
 
         try {
@@ -1947,8 +1958,18 @@ if ($path === '/admin/send-daily-reminders' && $method === 'POST') {
                 if (!empty($r['email'])) { sendEmail($r['email'],$r['name'],"📞 Call Duty Reminder — {$dayName}","<p>Hello {$r['name']},</p><p>You are scheduled for <strong>{$roleLabel}</strong> today{$callerNote}.</p>"); $emailsSent++; }
             }
         }
-        $dueTasks=(int)$pdo->query("SELECT COUNT(*) FROM tasks WHERE due_date='{$today}' AND status!='completed'")->fetchColumn();
-        sendResponse('success',"Reminders sent to {$scheduleEntries} staff member(s)",['emails_sent'=>$emailsSent,'schedule_entries'=>$scheduleEntries,'due_tasks'=>$dueTasks]);
+        // Same overdue + due-today task reminders the daily cron sends
+        // automatically — exposed here too so an admin can trigger them
+        // on demand (e.g. right before end of day) instead of waiting.
+        $taskResult = sendTaskDueReminders($pdo, false);
+        $overdueTasks = count($taskResult['overdue']);
+        $dueTodayTasks = count($taskResult['due_today']);
+        sendResponse('success',"Reminders sent to {$scheduleEntries} staff member(s), plus task reminders for {$overdueTasks} overdue and {$dueTodayTasks} due-today task(s)",[
+            'emails_sent'=>$emailsSent,
+            'schedule_entries'=>$scheduleEntries,
+            'due_tasks'=>$dueTodayTasks,
+            'overdue_tasks'=>$overdueTasks,
+        ]);
     } catch (\Throwable $e) { sendResponse('error','Failed to send reminders: '.$e->getMessage(),null,500); }
 }
 
