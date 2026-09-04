@@ -1734,6 +1734,23 @@ if ($path === '/tasks/daily-check' && $method === 'GET') {
     }
     try {
         $dryRun = ($_GET['dry_run'] ?? '') === '1';
+
+        // Some hosting panels don't offer a way to delete a stray/duplicate
+        // cron row, so this endpoint can end up hit several times within
+        // the same minute for what's meant to be a single scheduled run.
+        // Collapse near-simultaneous hits into one actual send — the real
+        // 9am/1pm/3pm slots are hours apart, well outside this window, so
+        // the intended schedule still fires normally either way.
+        if (!$dryRun) {
+            $lastRun = $pdo->query("SELECT setting_value FROM settings WHERE setting_key='daily_check_last_run'")->fetchColumn();
+            if ($lastRun && (time() - strtotime($lastRun)) < 300) {
+                sendResponse('success','Skipped — daily check already ran within the last 5 minutes', ['skipped'=>true]);
+            }
+            $now = date('Y-m-d H:i:s');
+            $pdo->prepare("INSERT INTO settings (setting_key,setting_value) VALUES ('daily_check_last_run',?) ON DUPLICATE KEY UPDATE setting_value=?")
+                ->execute([$now, $now]);
+        }
+
         $result = sendTaskDueReminders($pdo, $dryRun);
         $overdue = $result['overdue']; $dueToday = $result['due_today'];
 
