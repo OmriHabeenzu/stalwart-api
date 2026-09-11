@@ -2639,6 +2639,99 @@ if ($path === '/loans/admin/accounts/sync-calendar' && $method === 'POST') {
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
+// One-time bulk import, distinct from the daily sync-calendar job above.
+// singleEvents=false so a client's recurring payment-reminder series comes
+// back as ONE master event instead of being expanded into potentially
+// thousands of daily/weekly instances — the daily job needs every day's
+// occurrences, this one only needs to discover each distinct client once.
+// Reuses the same fuzzy-match create-or-update logic, so it's safe to run
+// repeatedly (e.g. after adding more history to the calendar) without
+// duplicating clients already imported.
+if ($path === '/loans/admin/accounts/import-calendar-all' && $method === 'POST') {
+    requireAdmin($pdo);
+    set_time_limit(300);
+    try {
+        $cfg = getGCalSettings($pdo);
+        $calendarId = $cfg['google_calendar_id'] ?? '';
+        $sa = json_decode($cfg['google_service_account_json'] ?? '', true);
+        if (!$sa || !$calendarId) sendResponse('error','Calendar not configured',null,400);
+        $token = getGCalToken($sa);
+        if (!$token) sendResponse('error','Could not authenticate with Google Calendar',null,500);
+
+        $timeMin = urlencode('2015-01-01T00:00:00Z');
+        $timeMax = urlencode(date('Y-m-d', strtotime('+1 year')).'T00:00:00Z');
+        $baseUrl = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events?timeMin={$timeMin}&timeMax={$timeMax}&singleEvents=false&maxResults=2500";
+
+        // Google caps each page at maxResults — follow nextPageToken until
+        // exhausted rather than assuming one page covers everything.
+        $items = [];
+        $pageToken = null;
+        do {
+            $url = $baseUrl . ($pageToken ? '&pageToken='.urlencode($pageToken) : '');
+            $evData = curlGetGCalRetry($url, $token);
+            if ($evData === null) sendResponse('error','Could not reach Google Calendar. Please try again.',null,502);
+            foreach ($evData['items'] ?? [] as $e) $items[] = $e;
+            $pageToken = $evData['nextPageToken'] ?? null;
+        } while ($pageToken);
+
+        $existing = $pdo->query("SELECT id, customer_name, customer_email, next_payment_date, maturity_date FROM loan_accounts")->fetchAll();
+
+        $created = 0; $updated = 0; $unchanged = 0; $scanned = 0;
+        foreach ($items as $e) {
+            $name = trim($e['summary'] ?? '');
+            if (!$name || stripos($name, 'busy') !== false) continue;
+            $scanned++;
+
+            $desc = $e['description'] ?? '';
+            $balance = parseKBalance($desc) ?? 0;
+            $dueDate = parseDueDateFromDesc($desc);
+            $maturityDate = parseMaturityDateFromDesc($desc);
+            $guestEmail = null;
+            foreach ($e['attendees'] ?? [] as $a) {
+                if (empty($a['organizer']) && empty($a['self']) && !empty($a['email'])) { $guestEmail = $a['email']; break; }
+            }
+
+            $best = null; $bestScore = 0;
+            foreach ($existing as $c) {
+                $score = loanClientNameSimilarity($c['customer_name'], $name);
+                if ($score > $bestScore) { $bestScore = $score; $best = $c; }
+            }
+
+            if ($best && $bestScore >= 70) {
+                $fields = []; $vals = [];
+                if ($guestEmail && empty($best['customer_email'])) { $fields[] = 'customer_email=?'; $vals[] = $guestEmail; }
+                if ($dueDate && empty($best['next_payment_date'])) { $fields[] = 'next_payment_date=?'; $vals[] = $dueDate; }
+                if ($maturityDate && empty($best['maturity_date'])) { $fields[] = 'maturity_date=?'; $vals[] = $maturityDate; }
+                if (!empty($fields)) {
+                    $vals[] = $best['id'];
+                    $pdo->prepare("UPDATE loan_accounts SET ".implode(',', $fields)." WHERE id=?")->execute($vals);
+                    $updated++;
+                } else {
+                    $unchanged++;
+                }
+                continue;
+            }
+
+            $loanReference = null;
+            for ($i = 0; $i < 5; $i++) {
+                $candidate = 'STW-'.date('Y').'-'.str_pad((string)random_int(0, 99999), 5, '0', STR_PAD_LEFT);
+                $refCheck = $pdo->prepare("SELECT id FROM loan_accounts WHERE loan_reference=?");
+                $refCheck->execute([$candidate]);
+                if (!$refCheck->fetch()) { $loanReference = $candidate; break; }
+            }
+            if (!$loanReference) continue;
+            // Phone/national ID/disbursement date are never present in a
+            // calendar reminder's text — left NULL rather than guessed.
+            $pdo->prepare("INSERT INTO loan_accounts (loan_reference,customer_name,customer_phone,customer_email,national_id_last4,loan_amount,total_repayable,amount_paid,outstanding_balance,monthly_installment,next_payment_date,loan_status,disbursement_date,maturity_date) VALUES (?,?,NULL,?,NULL,?,?,0,?,?,?,?,NULL,?)")
+                ->execute([$loanReference, $name, $guestEmail, $balance, $balance, $balance, 0, $dueDate, 'pending', $maturityDate]);
+            $existing[] = ['id' => $pdo->lastInsertId(), 'customer_name' => $name, 'customer_email' => $guestEmail, 'next_payment_date' => $dueDate, 'maturity_date' => $maturityDate];
+            $created++;
+        }
+
+        sendResponse('success','Full calendar import complete', ['created'=>$created,'updated'=>$updated,'unchanged'=>$unchanged,'scanned'=>$scanned,'events_fetched'=>count($items)]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
 if (preg_match('#^/loans/admin/payments/(\d+)/confirm$#',$path,$m) && $method === 'PUT') {
     requireAdmin($pdo);
     try {
