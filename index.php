@@ -907,6 +907,16 @@ if ($path === '/call-reports/mark' && $method === 'POST') {
             // silently swallowed and left to fail confusingly on the
             // SELECT below.
             if ($e->getCode() != 23000) throw $e;
+
+            // "Unanswered" isn't a final status — admins run follow-up
+            // later in the day and need to be able to correct/update a
+            // mark once they actually reach a client someone else
+            // couldn't. Regular staff still can't touch an existing mark
+            // (first write wins for them), only admins can override it.
+            if (($user['role'] ?? '') === 'admin') {
+                $pdo->prepare("UPDATE call_report_marks SET status=?, marked_by_user_id=?, marked_by_name=?, created_at=NOW() WHERE report_date=? AND customer_name_key=?")
+                    ->execute([$status, $user['id'] ?? null, $myName, $date, $key]);
+            }
         }
 
         $stmt = $pdo->prepare("SELECT customer_name, status, marked_by_name, created_at FROM call_report_marks WHERE report_date=? AND customer_name_key=?");
