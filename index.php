@@ -2514,6 +2514,22 @@ if ($path === '/loans/apply' && $method === 'POST') {
     }
 }
 
+// Lightweight, all-staff client search — used by Call Report's "Add
+// Clients" step so any staff member (not just admins, who own the full
+// /loans/admin/accounts CRUD below) can look a client up by name/phone
+// without exposing full loan financials to everyone.
+if ($path === '/clients/quick-search' && $method === 'GET') {
+    requireAuth($pdo);
+    try {
+        $q = trim($_GET['q'] ?? '');
+        if ($q === '') sendResponse('success','No query',['clients'=>[]]);
+        $like = '%'.$q.'%';
+        $stmt = $pdo->prepare("SELECT id, customer_name, customer_phone, loan_status FROM loan_accounts WHERE customer_name LIKE ? OR customer_phone LIKE ? ORDER BY customer_name ASC LIMIT 20");
+        $stmt->execute([$like, $like]);
+        sendResponse('success','Clients found', ['clients'=>$stmt->fetchAll()]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
 // Admin loan routes
 if ($path === '/loans/admin/accounts' && $method === 'GET') {
     requireAdmin($pdo);
