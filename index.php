@@ -171,6 +171,13 @@ try {
     try { $pdo->exec("ALTER TABLE task_attachments ADD COLUMN uploaded_by_name VARCHAR(255) DEFAULT NULL"); } catch (\Throwable $e) {}
     $pdo->exec("CREATE TABLE IF NOT EXISTS job_listings (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255) NOT NULL, department VARCHAR(100) DEFAULT NULL, location VARCHAR(100) DEFAULT NULL, type VARCHAR(50) DEFAULT 'full-time', description TEXT, requirements TEXT, salary_range VARCHAR(100) DEFAULT NULL, is_active TINYINT DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
     $pdo->exec("CREATE TABLE IF NOT EXISTS job_applications (id INT AUTO_INCREMENT PRIMARY KEY, job_id INT DEFAULT NULL, name VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL, phone VARCHAR(50) DEFAULT NULL, cover_letter TEXT, status VARCHAR(50) DEFAULT 'pending', notes TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    // Cross-staff real-time lock for Call Report: the FIRST staff member to
+    // mark a name answered/unanswered on a given day wins the unique key
+    // below, so every other session (polling this) sees it locked and
+    // can't also mark it — prevents double-calling/conflicting marks when
+    // multiple staff load overlapping name lists (e.g. follow-up callers
+    // all pulling today's unanswered list).
+    $pdo->exec("CREATE TABLE IF NOT EXISTS call_report_marks (id INT AUTO_INCREMENT PRIMARY KEY, report_date DATE NOT NULL, customer_name_key VARCHAR(255) NOT NULL, customer_name VARCHAR(255) NOT NULL, status ENUM('answered','unanswered') NOT NULL, marked_by_user_id INT DEFAULT NULL, marked_by_name VARCHAR(255) DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uniq_date_name (report_date, customer_name_key), INDEX idx_date (report_date))");
 } catch (\Throwable $e) {}
 } // end migration guard
 
@@ -855,6 +862,55 @@ if ($path === '/call-reports/today-names' && $method === 'GET') {
         $unanswered = array_values(array_map(fn($r)=>$r['customer_name'], array_filter($rows, fn($r)=>$r['status']==='unanswered')));
         $answered   = array_values(array_map(fn($r)=>$r['customer_name'], array_filter($rows, fn($r)=>$r['status']==='answered')));
         sendResponse('success','Names retrieved',['unanswered'=>$unanswered,'answered'=>$answered,'total'=>count($rows)]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+// Cross-staff real-time lock: any staff member marking a name
+// answered/unanswered writes here immediately (not just to their own
+// draft report), and every other session polling GET .../marks sees it
+// within a few seconds and greys the entry out. First write for a given
+// (date, name) wins via the UNIQUE KEY — later attempts just return the
+// already-locked row instead of overwriting it, so two staff clicking at
+// the same moment can't both "win" or double-mark the same client.
+if ($path === '/call-reports/mark' && $method === 'POST') {
+    $user = requireAuth($pdo);
+    try {
+        $data = getRequestData();
+        $date = $data['report_date'] ?? date('Y-m-d');
+        $name = trim($data['customer_name'] ?? '');
+        $status = $data['status'] ?? '';
+        if (!$name || !in_array($status, ['answered','unanswered'], true)) sendResponse('error','customer_name and a valid status are required',null,400);
+        $key = strtolower(preg_replace('/\s+/', ' ', trim($name)));
+
+        $myName = $user['email'] ?? 'Unknown';
+        if (!empty($user['id'])) {
+            $nStmt = $pdo->prepare("SELECT name FROM users WHERE id=?");
+            $nStmt->execute([$user['id']]);
+            $myName = $nStmt->fetchColumn() ?: $myName;
+        }
+
+        try {
+            $pdo->prepare("INSERT INTO call_report_marks (report_date,customer_name_key,customer_name,status,marked_by_user_id,marked_by_name) VALUES (?,?,?,?,?,?)")
+                ->execute([$date, $key, $name, $status, $user['id'] ?? null, $myName]);
+        } catch (\Throwable $e) {
+            // UNIQUE KEY collision — someone already marked this name for
+            // this date. Not an error: fall through and return their mark.
+        }
+
+        $stmt = $pdo->prepare("SELECT customer_name, status, marked_by_name, created_at FROM call_report_marks WHERE report_date=? AND customer_name_key=?");
+        $stmt->execute([$date, $key]);
+        $row = $stmt->fetch();
+        sendResponse('success', 'Marked', ['mark' => $row, 'won' => ($row && $row['marked_by_name'] === $myName && $row['status'] === $status)]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if ($path === '/call-reports/marks' && $method === 'GET') {
+    requireAuth($pdo);
+    try {
+        $date = $_GET['date'] ?? date('Y-m-d');
+        $stmt = $pdo->prepare("SELECT customer_name_key, customer_name, status, marked_by_name FROM call_report_marks WHERE report_date=?");
+        $stmt->execute([$date]);
+        sendResponse('success','Marks retrieved', ['marks' => $stmt->fetchAll()]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
