@@ -875,6 +875,14 @@ if ($path === '/call-reports/today-names' && $method === 'GET') {
 if ($path === '/call-reports/mark' && $method === 'POST') {
     $user = requireAuth($pdo);
     try {
+        // Belt-and-suspenders: the hourly schema-migration guard above may
+        // not have run yet this hour on a fresh deploy, which would make
+        // the INSERT below fail with "table doesn't exist" — indistinguishable
+        // from a real error unless we check the SQLSTATE specifically (see
+        // below). Creating it here too (cheap, IF NOT EXISTS) means this
+        // endpoint never depends on migration timing at all.
+        $pdo->exec("CREATE TABLE IF NOT EXISTS call_report_marks (id INT AUTO_INCREMENT PRIMARY KEY, report_date DATE NOT NULL, customer_name_key VARCHAR(255) NOT NULL, customer_name VARCHAR(255) NOT NULL, status ENUM('answered','unanswered') NOT NULL, marked_by_user_id INT DEFAULT NULL, marked_by_name VARCHAR(255) DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uniq_date_name (report_date, customer_name_key), INDEX idx_date (report_date))");
+
         $data = getRequestData();
         $date = $data['report_date'] ?? date('Y-m-d');
         $name = trim($data['customer_name'] ?? '');
@@ -893,8 +901,12 @@ if ($path === '/call-reports/mark' && $method === 'POST') {
             $pdo->prepare("INSERT INTO call_report_marks (report_date,customer_name_key,customer_name,status,marked_by_user_id,marked_by_name) VALUES (?,?,?,?,?,?)")
                 ->execute([$date, $key, $name, $status, $user['id'] ?? null, $myName]);
         } catch (\Throwable $e) {
-            // UNIQUE KEY collision — someone already marked this name for
-            // this date. Not an error: fall through and return their mark.
+            // Only a UNIQUE KEY collision (someone already marked this name
+            // today) is expected here — anything else (e.g. a genuinely
+            // missing table) should surface as a real error, not be
+            // silently swallowed and left to fail confusingly on the
+            // SELECT below.
+            if ($e->getCode() != 23000) throw $e;
         }
 
         $stmt = $pdo->prepare("SELECT customer_name, status, marked_by_name, created_at FROM call_report_marks WHERE report_date=? AND customer_name_key=?");
@@ -907,6 +919,7 @@ if ($path === '/call-reports/mark' && $method === 'POST') {
 if ($path === '/call-reports/marks' && $method === 'GET') {
     requireAuth($pdo);
     try {
+        $pdo->exec("CREATE TABLE IF NOT EXISTS call_report_marks (id INT AUTO_INCREMENT PRIMARY KEY, report_date DATE NOT NULL, customer_name_key VARCHAR(255) NOT NULL, customer_name VARCHAR(255) NOT NULL, status ENUM('answered','unanswered') NOT NULL, marked_by_user_id INT DEFAULT NULL, marked_by_name VARCHAR(255) DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uniq_date_name (report_date, customer_name_key), INDEX idx_date (report_date))");
         $date = $_GET['date'] ?? date('Y-m-d');
         $stmt = $pdo->prepare("SELECT customer_name_key, customer_name, status, marked_by_name FROM call_report_marks WHERE report_date=?");
         $stmt->execute([$date]);
