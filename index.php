@@ -2732,6 +2732,123 @@ if ($path === '/loans/admin/accounts/import-calendar-all' && $method === 'POST')
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
+// One-time bulk import from a LoanDisk borrower-export CSV — a second,
+// larger client source alongside the calendar (LoanDisk retains the full
+// historical record including paid-off/denied loans that a calendar
+// reminder would never have, since reminders only ever cover currently-
+// active payment-due loans). Same fuzzy-match create-or-update safety as
+// the calendar imports: existing clients only get blank contact fields
+// filled in, never overwritten; only genuinely new names get a new row.
+if ($path === '/loans/admin/accounts/import-loandisk-csv' && $method === 'POST') {
+    requireAdmin($pdo);
+    set_time_limit(300);
+    try {
+        if (empty($_FILES['file']['tmp_name'])) sendResponse('error','No file uploaded',null,400);
+        $fh = fopen($_FILES['file']['tmp_name'], 'r');
+        if (!$fh) sendResponse('error','Could not read uploaded file',null,400);
+
+        // LoanDisk exports sometimes carry a UTF-8 BOM on the header line,
+        // which would otherwise corrupt the first column name.
+        $bom = fread($fh, 3);
+        if ($bom !== "\xEF\xBB\xBF") rewind($fh);
+        $header = fgetcsv($fh);
+        if (!$header) sendResponse('error','CSV has no header row',null,400);
+
+        // LoanDisk's own vocabulary is richer than this app's loan_status
+        // enum (pending/active/rejected/paid_off/defaulted/suspended) —
+        // collapse the extra nuance onto the closest equivalent rather
+        // than rejecting rows with an unrecognized status.
+        $statusMap = [
+            'Fully Paid' => 'paid_off',
+            'Defaulted' => 'defaulted',
+            'Write-Off' => 'defaulted',
+            'Current' => 'active',
+            'Due Today' => 'active',
+            'Missed Repayment' => 'active',
+            'Arrears' => 'active',
+            'Past Maturity' => 'active',
+            'Denied' => 'rejected',
+            'Not Taken Up' => 'rejected',
+            'Fraud' => 'rejected',
+            'Processing' => 'pending',
+        ];
+
+        $existing = $pdo->query("SELECT id, customer_name, customer_phone, customer_email, national_id_last4 FROM loan_accounts")->fetchAll();
+
+        $parseAmount = function($v) {
+            $v = trim((string)($v ?? ''));
+            if ($v === '') return 0.0;
+            return (float)str_replace(',', '', $v);
+        };
+        $parseCsvDate = function($v) {
+            $v = trim((string)($v ?? ''));
+            if ($v === '') return null;
+            $d = DateTime::createFromFormat('d/m/Y', $v);
+            return $d ? $d->format('Y-m-d') : null;
+        };
+
+        $created = 0; $updated = 0; $unchanged = 0; $scanned = 0; $skippedBlankStatus = 0;
+        while (($row = fgetcsv($fh)) !== false) {
+            if (count($row) < count($header)) $row = array_pad($row, count($header), null);
+            $r = array_combine($header, array_slice($row, 0, count($header)));
+
+            $statusRaw = trim($r['Borrower Status Name'] ?? '');
+            if ($statusRaw === '') { $skippedBlankStatus++; continue; }
+
+            $name = trim($r['Full Name'] ?? '');
+            if (!$name) continue;
+            $scanned++;
+
+            $phone = trim($r['Mobile'] ?? '') ?: trim($r['Landline'] ?? '') ?: null;
+            $email = trim($r['Email'] ?? '') ?: null;
+            $uniqueNumber = preg_replace('/[^A-Za-z0-9]/', '', $r['Unique Number'] ?? '');
+            $idLast4 = $uniqueNumber ? substr($uniqueNumber, -4) : null;
+            $status = $statusMap[$statusRaw] ?? 'active';
+            $outstanding = $parseAmount($r['Open Loans Balance'] ?? 0);
+            $paid = $parseAmount($r['Total Paid Amount'] ?? 0);
+            $disbursementDate = $parseCsvDate($r['Created Date'] ?? null);
+
+            $best = null; $bestScore = 0;
+            foreach ($existing as $c) {
+                $score = loanClientNameSimilarity($c['customer_name'], $name);
+                if ($score > $bestScore) { $bestScore = $score; $best = $c; }
+            }
+
+            if ($best && $bestScore >= 70) {
+                $fields = []; $vals = [];
+                if ($phone && empty($best['customer_phone'])) { $fields[] = 'customer_phone=?'; $vals[] = $phone; }
+                if ($email && empty($best['customer_email'])) { $fields[] = 'customer_email=?'; $vals[] = $email; }
+                if ($idLast4 && empty($best['national_id_last4'])) { $fields[] = 'national_id_last4=?'; $vals[] = $idLast4; }
+                if (!empty($fields)) {
+                    $vals[] = $best['id'];
+                    $pdo->prepare("UPDATE loan_accounts SET ".implode(',', $fields)." WHERE id=?")->execute($vals);
+                    $updated++;
+                } else {
+                    $unchanged++;
+                }
+                continue;
+            }
+
+            $loanReference = null;
+            for ($i = 0; $i < 5; $i++) {
+                $candidate = 'STW-'.date('Y').'-'.str_pad((string)random_int(0, 99999), 5, '0', STR_PAD_LEFT);
+                $refCheck = $pdo->prepare("SELECT id FROM loan_accounts WHERE loan_reference=?");
+                $refCheck->execute([$candidate]);
+                if (!$refCheck->fetch()) { $loanReference = $candidate; break; }
+            }
+            if (!$loanReference) continue;
+            $loanAmount = $outstanding > 0 ? $outstanding + $paid : $paid;
+            $pdo->prepare("INSERT INTO loan_accounts (loan_reference,customer_name,customer_phone,customer_email,national_id_last4,loan_amount,total_repayable,amount_paid,outstanding_balance,monthly_installment,next_payment_date,loan_status,disbursement_date,maturity_date) VALUES (?,?,?,?,?,?,?,?,?,0,NULL,?,?,NULL)")
+                ->execute([$loanReference, $name, $phone, $email, $idLast4, $loanAmount, $loanAmount, $paid, $outstanding, $status, $disbursementDate]);
+            $existing[] = ['id' => $pdo->lastInsertId(), 'customer_name' => $name, 'customer_phone' => $phone, 'customer_email' => $email, 'national_id_last4' => $idLast4];
+            $created++;
+        }
+        fclose($fh);
+
+        sendResponse('success','LoanDisk import complete', ['created'=>$created,'updated'=>$updated,'unchanged'=>$unchanged,'scanned'=>$scanned,'skipped_blank_status'=>$skippedBlankStatus]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
 if (preg_match('#^/loans/admin/payments/(\d+)/confirm$#',$path,$m) && $method === 'PUT') {
     requireAdmin($pdo);
     try {
