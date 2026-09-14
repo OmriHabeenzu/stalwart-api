@@ -1411,6 +1411,17 @@ if ($path === '/planner/loans/update' && $method === 'POST') {
         $success = 0; $failed = [];
         $baseUrl = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events/";
 
+        // Run all PATCH requests CONCURRENTLY via curl_multi instead of one
+        // after another. Previously, N loans meant N sequential round-trips
+        // to Google (each up to ~15s worst case) plus a 0.2s pause between
+        // — on this server's network path to Google that adds up fast
+        // enough to hit a reverse-proxy timeout (outside PHP's own
+        // set_time_limit) before the response ever gets sent, which looks
+        // identical to a plain network failure client-side. Concurrently,
+        // the whole batch takes roughly as long as the SLOWEST single
+        // request, not the sum of all of them.
+        $mh = curl_multi_init();
+        $handles = []; // eventId => ['ch' => handle, 'name' => label]
         foreach ($updates as $u) {
             $eventId    = $u['event_id']    ?? '';
             $newBalance = floatval($u['new_balance'] ?? 0);
@@ -1421,30 +1432,39 @@ if ($path === '/planner/loans/update' && $method === 'POST') {
             $payload = json_encode(['description'=>$newDesc]);
 
             $ch = curl_init($baseUrl.urlencode($eventId).'?sendUpdates=none');
-            // CONNECTTIMEOUT set explicitly (was missing — relied on curl's
-            // own, much longer default) so a stalled outbound connection to
-            // Google fails fast and visibly instead of silently eating into
-            // the overall request's time budget across every loan in the batch.
-            curl_setopt_array($ch,[CURLOPT_CUSTOMREQUEST=>'PATCH',CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}","Content-Type: application/json"],CURLOPT_TIMEOUT=>15,CURLOPT_CONNECTTIMEOUT=>8]);
-            $raw = curl_exec($ch);
-            $curlErr = curl_error($ch);
-            $curlErrno = curl_errno($ch);
-            $res = json_decode($raw,true);
-            $code = curl_getinfo($ch,CURLINFO_HTTP_CODE); curl_close($ch);
-
-            if ($code===200 && isset($res['id'])) {
-                $success++;
-            } elseif ($curlErrno !== 0) {
-                // A genuine connection failure (timeout, DNS, TLS, etc.) —
-                // surface the actual curl error instead of a blank "HTTP 0",
-                // which is what previously made this indistinguishable from
-                // a plain rejection by Google's API.
-                $failed[] = ($u['name']??$eventId).": Connection failed — {$curlErr} (errno {$curlErrno})";
-            } else {
-                $failed[] = ($u['name']??$eventId).': '.($res['error']['message']??"HTTP $code");
-            }
-            usleep(200000); // 0.2s — no notifications, so fast is fine
+            curl_setopt_array($ch,[CURLOPT_CUSTOMREQUEST=>'PATCH',CURLOPT_RETURNTRANSFER=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}","Content-Type: application/json"],CURLOPT_TIMEOUT=>20,CURLOPT_CONNECTTIMEOUT=>8]);
+            curl_multi_add_handle($mh, $ch);
+            $handles[(int)$ch] = ['ch' => $ch, 'name' => $u['name'] ?? $eventId];
         }
+
+        if (!empty($handles)) {
+            $running = null;
+            do { curl_multi_exec($mh, $running); curl_multi_select($mh, 1); } while ($running > 0);
+
+            foreach ($handles as $h) {
+                $ch = $h['ch'];
+                $raw = curl_multi_getcontent($ch);
+                $curlErr = curl_error($ch);
+                $curlErrno = curl_errno($ch);
+                $res = json_decode($raw, true);
+                $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+                if ($code===200 && isset($res['id'])) {
+                    $success++;
+                } elseif ($curlErrno !== 0) {
+                    // A genuine connection failure (timeout, DNS, TLS, etc.) —
+                    // surface the actual curl error instead of a blank "HTTP 0",
+                    // which previously made this indistinguishable from a
+                    // plain rejection by Google's API.
+                    $failed[] = "{$h['name']}: Connection failed — {$curlErr} (errno {$curlErrno})";
+                } else {
+                    $failed[] = "{$h['name']}: ".($res['error']['message']??"HTTP $code");
+                }
+                curl_multi_remove_handle($mh, $ch);
+                curl_close($ch);
+            }
+        }
+        curl_multi_close($mh);
 
         sendResponse('success','Balances updated',['success'=>$success,'failed'=>$failed,'total'=>count($updates)]);
     } catch (\Throwable $e) { sendResponse('error',$e->getMessage(),null,500); }
