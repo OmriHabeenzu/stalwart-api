@@ -12,25 +12,6 @@ header('Content-Type: application/json; charset=UTF-8');
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(0); }
 
 require_once __DIR__ . '/vendor/autoload.php';
-// Fallback if Composer's autoloader can't find PHPMailer (e.g. a web file
-// manager's ZIP extraction dropping files from vendor/phpmailer's ~65-file
-// tree, autoloader classmap intact but the actual source files missing) —
-// require the 3 files PHPMailer actually needs directly by path. Checks
-// __DIR__/phpmailer-lib/ FIRST (a plain top-level folder, easy to create
-// on hosts where the nested vendor/phpmailer/phpmailer/ path itself is
-// somehow unwritable/uncreatable) before falling back to the normal
-// vendor location. Same "don't trust require_once through a fragile
-// deploy path" reasoning as the inlined JWT class below.
-if (!class_exists('PHPMailer\PHPMailer\PHPMailer', false)) {
-    foreach ([__DIR__ . '/phpmailer-lib/', __DIR__ . '/vendor/phpmailer/phpmailer/src/'] as $dir) {
-        if (!file_exists($dir . 'PHPMailer.php')) continue;
-        foreach (['Exception.php', 'PHPMailer.php', 'SMTP.php'] as $f) {
-            $p = $dir . $f;
-            if (file_exists($p)) require_once $p;
-        }
-        break;
-    }
-}
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\Exception as PHPMailerException;
 
