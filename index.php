@@ -21,7 +21,7 @@ require_once __DIR__ . '/vendor/autoload.php';
 // somehow unwritable/uncreatable) before falling back to the normal
 // vendor location. Same "don't trust require_once through a fragile
 // deploy path" reasoning as the inlined JWT class below.
-if (!class_exists('PHPMailer\PHPMailer\PHPMailer')) {
+if (!class_exists('PHPMailer\PHPMailer\PHPMailer', false)) {
     foreach ([__DIR__ . '/phpmailer-lib/', __DIR__ . '/vendor/phpmailer/phpmailer/src/'] as $dir) {
         if (!file_exists($dir . 'PHPMailer.php')) continue;
         foreach (['Exception.php', 'PHPMailer.php', 'SMTP.php'] as $f) {
