@@ -2752,6 +2752,13 @@ if ($path === '/loans/admin/accounts/sync-calendar' && $method === 'POST') {
                 continue;
             }
 
+            // Don't create a new client for internal/admin/business calendar
+            // noise sharing this same calendar (subscriptions, trainings,
+            // compliance tasks, meeting reminders, birthdays...) — a genuine
+            // loan reminder always states both what's owed and when it's due,
+            // so require both to be present before treating this as a client.
+            if (!$dueDate || $balance <= 0) { continue; }
+
             $loanReference = null;
             for ($i = 0; $i < 5; $i++) {
                 $candidate = 'STW-'.date('Y').'-'.str_pad((string)random_int(0, 99999), 5, '0', STR_PAD_LEFT);
@@ -2846,6 +2853,13 @@ if ($path === '/loans/admin/accounts/import-calendar-all' && $method === 'POST')
                 }
                 continue;
             }
+
+            // Don't create a new client for internal/admin/business calendar
+            // noise sharing this same calendar (subscriptions, trainings,
+            // compliance tasks, meeting reminders, birthdays...) — a genuine
+            // loan reminder always states both what's owed and when it's due,
+            // so require both to be present before treating this as a client.
+            if (!$dueDate || $balance <= 0) { continue; }
 
             $loanReference = null;
             for ($i = 0; $i < 5; $i++) {
