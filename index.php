@@ -2957,13 +2957,29 @@ if ($path === '/loans/admin/accounts/import-loandisk-csv' && $method === 'POST')
             $paid = $parseAmount($r['Total Paid Amount'] ?? 0);
             $disbursementDate = $parseCsvDate($r['Created Date'] ?? null);
 
-            $best = null; $bestScore = 0;
+            // This export is one row per CLIENT (confirmed — not one row per
+            // loan), so unlike the calendar imports there's no legitimate
+            // case of the same name recurring for a distinct new record.
+            // The fuzzy word/substring matcher used there was collapsing
+            // unrelated clients who share a common Zambian surname or a
+            // short first name that happens to substring-match a longer one
+            // (e.g. "Ann" inside "Anna Mwansa") — silently dropping ~1/3 of
+            // the import. Require an exact normalized name match instead,
+            // and only treat it as the same person if any phone/ID present
+            // on both sides actually agrees (so two different people who
+            // happen to share the exact same full name still both get in
+            // when we have a phone or ID number to tell them apart).
+            $normName = strtolower(preg_replace('/\s+/', ' ', trim($name)));
+            $best = null;
             foreach ($existing as $c) {
-                $score = loanClientNameSimilarity($c['customer_name'], $name);
-                if ($score > $bestScore) { $bestScore = $score; $best = $c; }
+                if (strtolower(preg_replace('/\s+/', ' ', trim($c['customer_name']))) !== $normName) continue;
+                $phoneConflict = $phone && !empty($c['customer_phone']) && $c['customer_phone'] !== $phone;
+                $idConflict = $idLast4 && !empty($c['national_id_last4']) && $c['national_id_last4'] !== $idLast4;
+                if ($phoneConflict || $idConflict) continue;
+                $best = $c; break;
             }
 
-            if ($best && $bestScore >= 70) {
+            if ($best) {
                 $fields = []; $vals = [];
                 if ($phone && empty($best['customer_phone'])) { $fields[] = 'customer_phone=?'; $vals[] = $phone; }
                 if ($email && empty($best['customer_email'])) { $fields[] = 'customer_email=?'; $vals[] = $email; }
