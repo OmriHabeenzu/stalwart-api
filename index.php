@@ -3314,11 +3314,11 @@ if ($path === '/analytics/calls' && $method === 'GET') {
     requireAdmin($pdo);
     $month=$_GET['month']??date('Y-m'); [$year,$mon]=explode('-',$month);
     try {
-        $summary=$pdo->prepare("SELECT COUNT(*) AS total_reports,COALESCE(SUM(total_count),0) AS total_calls,COALESCE(SUM(answered_count),0) AS answered_calls,COALESCE(SUM(unanswered_count),0) AS unanswered_calls FROM call_reports WHERE YEAR(report_date)=? AND MONTH(report_date)=?");
+        $summary=$pdo->prepare("SELECT COUNT(*) AS total_reports,COALESCE(SUM(total_count),0) AS total_calls,COALESCE(SUM(answered_count),0) AS answered_calls,COALESCE(SUM(unanswered_count),0) AS unanswered_calls,COALESCE(SUM(phone_off_count),0) AS phone_off_calls FROM call_reports WHERE YEAR(report_date)=? AND MONTH(report_date)=?");
         $summary->execute([$year,$mon]); $summaryData=$summary->fetch();
-        $byStaff=$pdo->prepare("SELECT staff_name,COUNT(*) AS report_days,COALESCE(SUM(total_count),0) AS total_calls,COALESCE(SUM(answered_count),0) AS answered_calls,ROUND(COALESCE(SUM(answered_count),0)/NULLIF(SUM(total_count),0)*100,1) AS answer_rate FROM call_reports WHERE YEAR(report_date)=? AND MONTH(report_date)=? GROUP BY staff_name ORDER BY total_calls DESC");
+        $byStaff=$pdo->prepare("SELECT staff_name,COUNT(*) AS report_days,COALESCE(SUM(total_count),0) AS total_calls,COALESCE(SUM(answered_count),0) AS answered_calls,COALESCE(SUM(unanswered_count),0) AS unanswered_calls,COALESCE(SUM(phone_off_count),0) AS phone_off_calls,ROUND(COALESCE(SUM(answered_count),0)/NULLIF(SUM(total_count),0)*100,1) AS answer_rate FROM call_reports WHERE YEAR(report_date)=? AND MONTH(report_date)=? GROUP BY staff_name ORDER BY total_calls DESC");
         $byStaff->execute([$year,$mon]);
-        $byDay=$pdo->prepare("SELECT report_date,SUM(total_count) AS total_calls,SUM(answered_count) AS answered_calls FROM call_reports WHERE YEAR(report_date)=? AND MONTH(report_date)=? GROUP BY report_date ORDER BY report_date ASC");
+        $byDay=$pdo->prepare("SELECT report_date,SUM(total_count) AS total_calls,SUM(answered_count) AS answered_calls,SUM(unanswered_count) AS unanswered_calls,SUM(phone_off_count) AS phone_off_calls FROM call_reports WHERE YEAR(report_date)=? AND MONTH(report_date)=? GROUP BY report_date ORDER BY report_date ASC");
         $byDay->execute([$year,$mon]);
         $months=$pdo->query("SELECT DISTINCT DATE_FORMAT(report_date,'%Y-%m') AS month FROM call_reports ORDER BY month DESC LIMIT 24")->fetchAll(PDO::FETCH_COLUMN);
         sendResponse('success','Call analytics retrieved',['month'=>$month,'summary'=>$summaryData,'by_staff'=>$byStaff->fetchAll(),'by_day'=>$byDay->fetchAll(),'available_months'=>$months]);
@@ -3342,7 +3342,7 @@ if ($path === '/analytics/staff' && $method === 'GET') {
             $recurStmt->execute([$year,$mon,$u['id']]); $recurData=$recurStmt->fetch();
             $taskData['total_completed'] = (int)($taskData['total_completed'] ?? 0) + (int)($recurData['recurring_total'] ?? 0);
             $taskData['completed_this_month'] = (int)($taskData['completed_this_month'] ?? 0) + (int)($recurData['recurring_this_month'] ?? 0);
-            $callStmt=$pdo->prepare("SELECT COUNT(*) AS report_days,COALESCE(SUM(total_count),0) AS total_calls,COALESCE(SUM(answered_count),0) AS answered_calls,COALESCE(SUM(unanswered_count),0) AS unanswered_calls,ROUND(COALESCE(SUM(answered_count),0)/NULLIF(SUM(total_count),0)*100,1) AS answer_rate FROM call_reports WHERE (staff_id=? OR (staff_id IS NULL AND staff_name=?)) AND YEAR(report_date)=? AND MONTH(report_date)=?");
+            $callStmt=$pdo->prepare("SELECT COUNT(*) AS report_days,COALESCE(SUM(total_count),0) AS total_calls,COALESCE(SUM(answered_count),0) AS answered_calls,COALESCE(SUM(unanswered_count),0) AS unanswered_calls,COALESCE(SUM(phone_off_count),0) AS phone_off_calls,ROUND(COALESCE(SUM(answered_count),0)/NULLIF(SUM(total_count),0)*100,1) AS answer_rate FROM call_reports WHERE (staff_id=? OR (staff_id IS NULL AND staff_name=?)) AND YEAR(report_date)=? AND MONTH(report_date)=?");
             $callStmt->execute([$u['id'],$u['name'],$year,$mon]); $callData=$callStmt->fetch();
             $performance[]=['id'=>$u['id'],'name'=>$u['name'],'email'=>$u['email'],'role'=>$u['role'],'tasks'=>$taskData,'calls'=>$callData];
         }
