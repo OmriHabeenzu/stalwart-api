@@ -177,7 +177,13 @@ try {
     // can't also mark it — prevents double-calling/conflicting marks when
     // multiple staff load overlapping name lists (e.g. follow-up callers
     // all pulling today's unanswered list).
-    $pdo->exec("CREATE TABLE IF NOT EXISTS call_report_marks (id INT AUTO_INCREMENT PRIMARY KEY, report_date DATE NOT NULL, customer_name_key VARCHAR(255) NOT NULL, customer_name VARCHAR(255) NOT NULL, status ENUM('answered','unanswered') NOT NULL, marked_by_user_id INT DEFAULT NULL, marked_by_name VARCHAR(255) DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uniq_date_name (report_date, customer_name_key), INDEX idx_date (report_date))");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS call_report_marks (id INT AUTO_INCREMENT PRIMARY KEY, report_date DATE NOT NULL, customer_name_key VARCHAR(255) NOT NULL, customer_name VARCHAR(255) NOT NULL, status ENUM('answered','unanswered','phone_off') NOT NULL, marked_by_user_id INT DEFAULT NULL, marked_by_name VARCHAR(255) DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uniq_date_name (report_date, customer_name_key), INDEX idx_date (report_date))");
+    // Widen existing installs' enums to add the "phone off" outcome
+    // alongside answered/unanswered, and track it as its own count on
+    // saved reports for the WhatsApp report's dedicated section.
+    try { $pdo->exec("ALTER TABLE call_report_marks MODIFY status ENUM('answered','unanswered','phone_off') NOT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE call_report_entries MODIFY status ENUM('answered','unanswered','phone_off') NOT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE call_reports ADD COLUMN phone_off_count INT DEFAULT 0 AFTER unanswered_count"); } catch (\Throwable $e) {}
 } catch (\Throwable $e) {}
 } // end migration guard
 
@@ -804,24 +810,25 @@ if ($path === '/call-reports' && $method === 'POST') {
     $notes        = $data['notes'] ?? '';
     $totalCount   = count($entries);
     $answeredCount = count(array_filter($entries, fn($e) => ($e['status']??'') === 'answered'));
-    $unansweredCount = $totalCount - $answeredCount;
+    $phoneOffCount = count(array_filter($entries, fn($e) => ($e['status']??'') === 'phone_off'));
+    $unansweredCount = $totalCount - $answeredCount - $phoneOffCount;
     try {
         $existing = $pdo->prepare("SELECT id FROM call_reports WHERE staff_id=? AND report_date=?");
         $existing->execute([$user['id'],$reportDate]);
         $existingRow = $existing->fetch();
         if ($existingRow) {
             $reportId = $existingRow['id'];
-            $pdo->prepare("UPDATE call_reports SET staff_name=?,total_count=?,answered_count=?,unanswered_count=?,notes=?,updated_at=NOW() WHERE id=?")
-                ->execute([$staffName,$totalCount,$answeredCount,$unansweredCount,$notes,$reportId]);
+            $pdo->prepare("UPDATE call_reports SET staff_name=?,total_count=?,answered_count=?,unanswered_count=?,phone_off_count=?,notes=?,updated_at=NOW() WHERE id=?")
+                ->execute([$staffName,$totalCount,$answeredCount,$unansweredCount,$phoneOffCount,$notes,$reportId]);
             $pdo->prepare("DELETE FROM call_report_entries WHERE report_id=?")->execute([$reportId]);
         } else {
-            $pdo->prepare("INSERT INTO call_reports (report_date,staff_id,staff_name,total_count,answered_count,unanswered_count,notes) VALUES (?,?,?,?,?,?,?)")
-                ->execute([$reportDate,$user['id'],$staffName,$totalCount,$answeredCount,$unansweredCount,$notes]);
+            $pdo->prepare("INSERT INTO call_reports (report_date,staff_id,staff_name,total_count,answered_count,unanswered_count,phone_off_count,notes) VALUES (?,?,?,?,?,?,?,?)")
+                ->execute([$reportDate,$user['id'],$staffName,$totalCount,$answeredCount,$unansweredCount,$phoneOffCount,$notes]);
             $reportId = $pdo->lastInsertId();
         }
         $entryStmt = $pdo->prepare("INSERT INTO call_report_entries (report_id,customer_name,customer_phone,status,notes,sort_order) VALUES (?,?,?,?,?,?)");
         foreach ($entries as $i => $entry) {
-            $status = in_array($entry['status']??'',['answered','unanswered']) ? $entry['status'] : 'unanswered';
+            $status = in_array($entry['status']??'',['answered','unanswered','phone_off']) ? $entry['status'] : 'unanswered';
             $entryStmt->execute([$reportId,trim($entry['customer_name']??''),trim($entry['customer_phone']??'')?:null,$status,trim($entry['notes']??'')?:null,$i]);
         }
         logActivity($pdo,$user['id'],$user['email'],'call_report_created',"Call report saved for {$reportDate}");
@@ -845,7 +852,10 @@ if ($path === '/call-reports/today-unanswered' && $method === 'GET') {
     requireAuth($pdo);
     try {
         $date = $_GET['date'] ?? date('Y-m-d');
-        $stmt = $pdo->prepare("SELECT cre.customer_name, cre.customer_phone, cre.notes FROM call_report_entries cre JOIN call_reports cr ON cre.report_id = cr.id WHERE cr.report_date = ? AND cre.status = 'unanswered' ORDER BY cre.sort_order");
+        // Phone-off is treated the same as unanswered here — follow-up staff
+        // still need to retry these clients, the outcome just wasn't a plain
+        // no-answer.
+        $stmt = $pdo->prepare("SELECT cre.customer_name, cre.customer_phone, cre.notes FROM call_report_entries cre JOIN call_reports cr ON cre.report_id = cr.id WHERE cr.report_date = ? AND cre.status IN ('unanswered','phone_off') ORDER BY cre.sort_order");
         $stmt->execute([$date]);
         sendResponse('success','Unanswered calls retrieved',['entries'=>$stmt->fetchAll()]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
@@ -859,7 +869,9 @@ if ($path === '/call-reports/today-names' && $method === 'GET') {
         $stmt = $pdo->prepare("SELECT cre.customer_name, cre.status FROM call_report_entries cre JOIN call_reports cr ON cre.report_id = cr.id WHERE cr.report_date = ? ORDER BY cre.sort_order");
         $stmt->execute([$date]);
         $rows = $stmt->fetchAll();
-        $unanswered = array_values(array_map(fn($r)=>$r['customer_name'], array_filter($rows, fn($r)=>$r['status']==='unanswered')));
+        // Phone-off is folded into "unanswered" for this endpoint's consumer
+        // (the reschedule-import tool) — both mean the client wasn't reached.
+        $unanswered = array_values(array_map(fn($r)=>$r['customer_name'], array_filter($rows, fn($r)=>in_array($r['status'],['unanswered','phone_off'],true))));
         $answered   = array_values(array_map(fn($r)=>$r['customer_name'], array_filter($rows, fn($r)=>$r['status']==='answered')));
         sendResponse('success','Names retrieved',['unanswered'=>$unanswered,'answered'=>$answered,'total'=>count($rows)]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
@@ -881,13 +893,13 @@ if ($path === '/call-reports/mark' && $method === 'POST') {
         // from a real error unless we check the SQLSTATE specifically (see
         // below). Creating it here too (cheap, IF NOT EXISTS) means this
         // endpoint never depends on migration timing at all.
-        $pdo->exec("CREATE TABLE IF NOT EXISTS call_report_marks (id INT AUTO_INCREMENT PRIMARY KEY, report_date DATE NOT NULL, customer_name_key VARCHAR(255) NOT NULL, customer_name VARCHAR(255) NOT NULL, status ENUM('answered','unanswered') NOT NULL, marked_by_user_id INT DEFAULT NULL, marked_by_name VARCHAR(255) DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uniq_date_name (report_date, customer_name_key), INDEX idx_date (report_date))");
+        $pdo->exec("CREATE TABLE IF NOT EXISTS call_report_marks (id INT AUTO_INCREMENT PRIMARY KEY, report_date DATE NOT NULL, customer_name_key VARCHAR(255) NOT NULL, customer_name VARCHAR(255) NOT NULL, status ENUM('answered','unanswered','phone_off') NOT NULL, marked_by_user_id INT DEFAULT NULL, marked_by_name VARCHAR(255) DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uniq_date_name (report_date, customer_name_key), INDEX idx_date (report_date))");
 
         $data = getRequestData();
         $date = $data['report_date'] ?? date('Y-m-d');
         $name = trim($data['customer_name'] ?? '');
         $status = $data['status'] ?? '';
-        if (!$name || !in_array($status, ['answered','unanswered'], true)) sendResponse('error','customer_name and a valid status are required',null,400);
+        if (!$name || !in_array($status, ['answered','unanswered','phone_off'], true)) sendResponse('error','customer_name and a valid status are required',null,400);
         $key = strtolower(preg_replace('/\s+/', ' ', trim($name)));
 
         $myName = $user['email'] ?? 'Unknown';
@@ -929,7 +941,7 @@ if ($path === '/call-reports/mark' && $method === 'POST') {
 if ($path === '/call-reports/marks' && $method === 'GET') {
     requireAuth($pdo);
     try {
-        $pdo->exec("CREATE TABLE IF NOT EXISTS call_report_marks (id INT AUTO_INCREMENT PRIMARY KEY, report_date DATE NOT NULL, customer_name_key VARCHAR(255) NOT NULL, customer_name VARCHAR(255) NOT NULL, status ENUM('answered','unanswered') NOT NULL, marked_by_user_id INT DEFAULT NULL, marked_by_name VARCHAR(255) DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uniq_date_name (report_date, customer_name_key), INDEX idx_date (report_date))");
+        $pdo->exec("CREATE TABLE IF NOT EXISTS call_report_marks (id INT AUTO_INCREMENT PRIMARY KEY, report_date DATE NOT NULL, customer_name_key VARCHAR(255) NOT NULL, customer_name VARCHAR(255) NOT NULL, status ENUM('answered','unanswered','phone_off') NOT NULL, marked_by_user_id INT DEFAULT NULL, marked_by_name VARCHAR(255) DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uniq_date_name (report_date, customer_name_key), INDEX idx_date (report_date))");
         $date = $_GET['date'] ?? date('Y-m-d');
         $stmt = $pdo->prepare("SELECT customer_name_key, customer_name, status, marked_by_name FROM call_report_marks WHERE report_date=?");
         $stmt->execute([$date]);
