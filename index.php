@@ -939,17 +939,26 @@ if ($path === '/call-reports/mark' && $method === 'POST') {
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
-// Fully clears a mark back to "nobody has marked this yet" — admin-only,
-// same as overriding/correcting an existing mark above.
+// Fully clears a mark back to "nobody has marked this yet". Unlike
+// correcting/overriding a mark to a DIFFERENT status (admin-only above),
+// unmarking is also open to the person who made the mark — it's pure
+// self-correction of your own mis-click, not touching anyone else's work.
 if ($path === '/call-reports/unmark' && $method === 'POST') {
     $user = requireAuth($pdo);
-    if (($user['role'] ?? '') !== 'admin') sendResponse('error','Only an admin can unmark this',null,403);
     try {
         $data = getRequestData();
         $date = $data['report_date'] ?? date('Y-m-d');
         $name = trim($data['customer_name'] ?? '');
         if (!$name) sendResponse('error','customer_name is required',null,400);
         $key = strtolower(preg_replace('/\s+/', ' ', trim($name)));
+
+        $stmt = $pdo->prepare("SELECT marked_by_user_id FROM call_report_marks WHERE report_date=? AND customer_name_key=?");
+        $stmt->execute([$date, $key]);
+        $existingMark = $stmt->fetch();
+        if (!$existingMark) sendResponse('success', 'Already unmarked');
+
+        $isOwner = !empty($user['id']) && (int)$existingMark['marked_by_user_id'] === (int)$user['id'];
+        if (($user['role'] ?? '') !== 'admin' && !$isOwner) sendResponse('error','Only the person who marked this (or an admin) can unmark it',null,403);
 
         $pdo->prepare("DELETE FROM call_report_marks WHERE report_date=? AND customer_name_key=?")->execute([$date, $key]);
         sendResponse('success', 'Unmarked');
