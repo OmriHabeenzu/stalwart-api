@@ -923,9 +923,16 @@ if ($path === '/call-reports/mark' && $method === 'POST') {
             // "Unanswered" isn't a final status — admins run follow-up
             // later in the day and need to be able to correct/update a
             // mark once they actually reach a client someone else
-            // couldn't. Regular staff still can't touch an existing mark
-            // (first write wins for them), only admins can override it.
-            if (($user['role'] ?? '') === 'admin') {
+            // couldn't. Regular staff still can't touch someone ELSE's
+            // mark (first write wins between different staff), but they
+            // CAN correct their own mis-click — that's a self-correction,
+            // not the double-calling/conflicting-mark scenario this lock
+            // exists to prevent.
+            $ownerCheck = $pdo->prepare("SELECT marked_by_user_id FROM call_report_marks WHERE report_date=? AND customer_name_key=?");
+            $ownerCheck->execute([$date, $key]);
+            $existingMark = $ownerCheck->fetch();
+            $isOwner = $existingMark && !empty($user['id']) && (int)$existingMark['marked_by_user_id'] === (int)$user['id'];
+            if (($user['role'] ?? '') === 'admin' || $isOwner) {
                 $pdo->prepare("UPDATE call_report_marks SET status=?, marked_by_user_id=?, marked_by_name=?, created_at=NOW() WHERE report_date=? AND customer_name_key=?")
                     ->execute([$status, $user['id'] ?? null, $myName, $date, $key]);
             }
@@ -935,6 +942,31 @@ if ($path === '/call-reports/mark' && $method === 'POST') {
         $stmt->execute([$date, $key]);
         $row = $stmt->fetch();
         sendResponse('success', 'Marked', ['mark' => $row, 'won' => ($row && $row['marked_by_name'] === $myName && $row['status'] === $status)]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+// Fully clears a mark back to "nobody has marked this yet" — same
+// self-or-admin ownership rule as the update path above, so a staff
+// member can undo their own mis-click but not someone else's mark.
+if ($path === '/call-reports/unmark' && $method === 'POST') {
+    $user = requireAuth($pdo);
+    try {
+        $data = getRequestData();
+        $date = $data['report_date'] ?? date('Y-m-d');
+        $name = trim($data['customer_name'] ?? '');
+        if (!$name) sendResponse('error','customer_name is required',null,400);
+        $key = strtolower(preg_replace('/\s+/', ' ', trim($name)));
+
+        $stmt = $pdo->prepare("SELECT marked_by_user_id FROM call_report_marks WHERE report_date=? AND customer_name_key=?");
+        $stmt->execute([$date, $key]);
+        $existingMark = $stmt->fetch();
+        if (!$existingMark) sendResponse('success', 'Already unmarked');
+
+        $isOwner = !empty($user['id']) && (int)$existingMark['marked_by_user_id'] === (int)$user['id'];
+        if (($user['role'] ?? '') !== 'admin' && !$isOwner) sendResponse('error','Only the person who marked this (or an admin) can unmark it',null,403);
+
+        $pdo->prepare("DELETE FROM call_report_marks WHERE report_date=? AND customer_name_key=?")->execute([$date, $key]);
+        sendResponse('success', 'Unmarked');
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
