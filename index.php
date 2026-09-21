@@ -3391,6 +3391,25 @@ if ($path === '/analytics/staff' && $method === 'GET') {
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
+if ($path === '/analytics/staff/archive' && $method === 'GET') {
+    requireAdmin($pdo);
+    try {
+        $months=$pdo->query("SELECT DISTINCT DATE_FORMAT(report_date,'%Y-%m') AS month FROM call_reports ORDER BY month ASC")->fetchAll(PDO::FETCH_COLUMN);
+        $users=$pdo->query("SELECT id,name,email,role FROM users WHERE is_active=1 ORDER BY name")->fetchAll();
+        $staff=[];
+        foreach ($users as $u) {
+            $stmt=$pdo->prepare("SELECT DATE_FORMAT(report_date,'%Y-%m') AS month,COALESCE(SUM(answered_count),0) AS answered_calls,COALESCE(SUM(unanswered_count),0) AS unanswered_calls FROM call_reports WHERE (staff_id=? OR (staff_id IS NULL AND staff_name=?)) GROUP BY month");
+            $stmt->execute([$u['id'],$u['name']]);
+            $monthly=[];
+            foreach ($stmt->fetchAll() as $row) {
+                $monthly[$row['month']]=['answered_calls'=>(int)$row['answered_calls'],'unanswered_calls'=>(int)$row['unanswered_calls']];
+            }
+            $staff[]=['id'=>$u['id'],'name'=>$u['name'],'email'=>$u['email'],'role'=>$u['role'],'monthly'=>$monthly];
+        }
+        sendResponse('success','Staff call archive retrieved',['months'=>$months,'staff'=>$staff]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
 // ==========================================
 // GOOGLE ANALYTICS
 // ==========================================
@@ -3399,11 +3418,16 @@ if ($path === '/analytics/google' && $method === 'GET') {
     $startDate=$_GET['start_date']??date('Y-m-d',strtotime('-30 days'));
     $endDate=$_GET['end_date']??date('Y-m-d');
     try {
-        $rows=$pdo->query("SELECT setting_key,setting_value FROM settings WHERE setting_key IN ('ga_property_id','ga_credentials_path')")->fetchAll(PDO::FETCH_KEY_PAIR);
-        $propertyId=$rows['ga_property_id']??''; $credPath=$rows['ga_credentials_path']??__DIR__.'/config/ga-credentials.json';
+        $rows=$pdo->query("SELECT setting_key,setting_value FROM settings WHERE setting_key IN ('ga_property_id','ga_credentials_json','ga_credentials_path')")->fetchAll(PDO::FETCH_KEY_PAIR);
+        $propertyId=$rows['ga_property_id']??'';
         if (empty($propertyId)) sendResponse('error','Google Analytics not configured.',null,400);
-        if (!file_exists($credPath)) sendResponse('error','Credentials file not found.',null,400);
-        $credentials=json_decode(file_get_contents($credPath),true);
+        if (!empty($rows['ga_credentials_json'])) {
+            $credentials=json_decode($rows['ga_credentials_json'],true);
+        } elseif (!empty($rows['ga_credentials_path']) && file_exists($rows['ga_credentials_path'])) {
+            $credentials=json_decode(file_get_contents($rows['ga_credentials_path']),true);
+        } else {
+            sendResponse('error','Credentials file not found.',null,400);
+        }
         if (!$credentials||empty($credentials['client_email'])||empty($credentials['private_key'])) sendResponse('error','Invalid credentials file.',null,400);
         $b64u=fn($d)=>rtrim(strtr(base64_encode($d),'+/','-_'),'=');
         $header=$b64u(json_encode(['alg'=>'RS256','typ'=>'JWT'])); $now=time();
@@ -3453,9 +3477,11 @@ if ($path === '/analytics/google/credentials' && $method === 'POST') {
     $content=file_get_contents($_FILES['credentials']['tmp_name']);
     $json=json_decode($content,true);
     if (!$json||empty($json['client_email'])||empty($json['private_key'])) sendResponse('error','Invalid service account JSON',null,400);
-    $targetPath=__DIR__.'/config/ga-credentials.json';
-    if (!move_uploaded_file($_FILES['credentials']['tmp_name'],$targetPath)) sendResponse('error','Failed to save file',null,500);
-    try { $pdo->prepare("INSERT INTO settings (setting_key,setting_value) VALUES ('ga_credentials_path',?) ON DUPLICATE KEY UPDATE setting_value=?")->execute([$targetPath,$targetPath]); sendResponse('success','Credentials uploaded'); }
+    try {
+        $pdo->prepare("INSERT INTO settings (setting_key,setting_value) VALUES ('ga_credentials_json',?) ON DUPLICATE KEY UPDATE setting_value=?")->execute([$content,$content]);
+        $pdo->prepare("DELETE FROM settings WHERE setting_key='ga_credentials_path'")->execute();
+        sendResponse('success','Credentials uploaded');
+    }
     catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 

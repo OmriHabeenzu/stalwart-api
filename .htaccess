@@ -7,7 +7,7 @@ RewriteCond %{REQUEST_FILENAME} !-d
 RewriteRule ^ index.php [L]
 
 # Block direct access to sensitive directories
-RewriteRule ^(logs|migrations)(/|$) - [F,L]
+RewriteRule ^(logs|migrations|config)(/|$) - [F,L]
 
 # Block direct access to sensitive files
 <FilesMatch "\.(env|log|sql|sh|txt|bak)$">
