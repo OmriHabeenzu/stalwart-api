@@ -3846,14 +3846,28 @@ if ($path === '/deploy-frontend' && $method === 'POST') {
         echo json_encode(['error'=>'No archive uploaded or upload error','code'=>($_FILES['archive']['error'] ?? 'missing')]); exit;
     }
     $tmp = $_FILES['archive']['tmp_name'];
-    $output = [];
-    $exitCode = 0;
-    exec('tar -xzf ' . escapeshellarg($tmp) . ' -C ' . escapeshellarg(realpath($frontendDir)) . ' 2>&1', $output, $exitCode);
-    if (!is_dir(__DIR__.'/logs')) mkdir(__DIR__.'/logs', 0755, true);
-    file_put_contents(__DIR__.'/logs/deploy-frontend.log', date('Y-m-d H:i:s')."\nexitCode=$exitCode\n".implode("\n",$output)."\n---\n", FILE_APPEND);
-    if ($exitCode !== 0) {
-        echo json_encode(['error'=>'Extract failed','output'=>$output,'exitCode'=>$exitCode]); exit;
+    // Extract natively via PharData instead of shelling out to `tar` —
+    // exec() is disabled on this host, so the old exec('tar -xzf ...')
+    // approach always failed with a bare 500.
+    $tarPath = $tmp . '.tar';
+    try {
+        $gz = gzopen($tmp, 'rb');
+        if (!$gz) throw new \Exception('Could not open uploaded archive');
+        $out = fopen($tarPath, 'wb');
+        while (!gzeof($gz)) { fwrite($out, gzread($gz, 524288)); }
+        fclose($out); gzclose($gz);
+
+        $phar = new PharData($tarPath);
+        $phar->extractTo(realpath($frontendDir), null, true);
+        @unlink($tarPath);
+    } catch (\Throwable $e) {
+        @unlink($tarPath);
+        if (!is_dir(__DIR__.'/logs')) mkdir(__DIR__.'/logs', 0755, true);
+        file_put_contents(__DIR__.'/logs/deploy-frontend.log', date('Y-m-d H:i:s')." FAILED: ".$e->getMessage()."\n", FILE_APPEND);
+        echo json_encode(['error'=>'Extract failed','message'=>$e->getMessage()]); exit;
     }
+    if (!is_dir(__DIR__.'/logs')) mkdir(__DIR__.'/logs', 0755, true);
+    file_put_contents(__DIR__.'/logs/deploy-frontend.log', date('Y-m-d H:i:s')." OK\n", FILE_APPEND);
     echo json_encode(['success'=>true,'time'=>date('Y-m-d H:i:s')]); exit;
 }
 
