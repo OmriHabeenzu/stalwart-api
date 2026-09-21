@@ -3375,6 +3375,16 @@ if ($path === '/analytics/staff' && $method === 'GET') {
         }
         $months=$pdo->query("SELECT DISTINCT DATE_FORMAT(report_date,'%Y-%m') AS month FROM call_reports ORDER BY month DESC LIMIT 24")->fetchAll(PDO::FETCH_COLUMN);
 
+        // Working days (Mon-Fri) elapsed so far this month, so "report_days"
+        // can be judged against a realistic denominator instead of the raw
+        // calendar date — weekends aren't expected call-report days.
+        $monthStart = new DateTime("{$year}-{$mon}-01");
+        $monthEnd = ($month === date('Y-m')) ? new DateTime('today') : (clone $monthStart)->modify('last day of this month');
+        $workingDays = 0;
+        for ($d = clone $monthStart; $d <= $monthEnd; $d->modify('+1 day')) {
+            if ((int)$d->format('N') <= 5) $workingDays++;
+        }
+
         // Team-wide totals must count DISTINCT tasks/completion-events, not sum
         // each staff member's individual credit — a task with 4 assignees
         // credits all 4 (correct for their own cards) but is still only ONE
@@ -3387,7 +3397,7 @@ if ($path === '/analytics/staff' && $method === 'GET') {
         $teamStmt->execute([$year,$mon,$year,$mon]);
         $teamTotals = $teamStmt->fetch();
 
-        sendResponse('success','Staff performance retrieved',['month'=>$month,'staff'=>$performance,'available_months'=>$months,'team_totals'=>$teamTotals]);
+        sendResponse('success','Staff performance retrieved',['month'=>$month,'staff'=>$performance,'available_months'=>$months,'team_totals'=>$teamTotals,'working_days'=>$workingDays]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
