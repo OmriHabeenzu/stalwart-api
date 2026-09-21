@@ -341,7 +341,43 @@ if ($path === '/ops/diag-dirs' && $method === 'GET') {
     $out = ['__DIR__'=>__DIR__, 'realpath_parent'=>realpath(__DIR__.'/..'), 'realpath_public_html'=>realpath(__DIR__.'/../public_html')];
     $out['siblings'] = is_dir(__DIR__.'/..') ? array_values(array_diff(scandir(__DIR__.'/..'), ['.','..'])) : null;
     $out['own_dir_listing'] = array_values(array_diff(scandir(__DIR__), ['.','..']));
+    $guess = '/home/Stalwart/web/stalwartzm.com/public_html';
+    $out['guess_path'] = $guess;
+    $out['guess_is_dir'] = is_dir($guess);
+    $out['guess_listing'] = is_dir($guess) ? array_values(array_diff(scandir($guess), ['.','..'])) : null;
+    $out['open_basedir'] = ini_get('open_basedir');
+    $webRoot = '/home/Stalwart/web';
+    $out['web_root_listing'] = is_dir($webRoot) ? array_values(array_diff(scandir($webRoot), ['.','..'])) : ('not readable: '.$webRoot);
     exit(json_encode($out, JSON_PRETTY_PRINT));
+}
+
+// One-time cleanup: delete stray files sitting in the public web root that
+// OLS serves directly as static content regardless of .htaccess — leftover
+// index.php.bak-* snapshots (raw source disclosure), a stray vendor zip, and
+// the frontend build files a bad /deploy-frontend run dumped in here since
+// its target path resolved back onto this app's own root. Remove after use.
+if ($path === '/ops/cleanup-stray-files' && $method === 'GET') {
+    if (($_GET['token'] ?? '') !== 'stalwart2026') { http_response_code(403); exit(json_encode(['error'=>'Unauthorized'])); }
+    $targets = [
+        'index.php.bak-20260916','index.php.bak-20260916b','index.php.bak-20260916c',
+        'index.php.bak-20260918a','index.php.bak-20260918b','index.php.bak-20260918c',
+        'index.old.php','vendor-full-fix.zip',
+        'index.html','icon-192.png','icon-512.png','manifest.webmanifest','sw.js',
+    ];
+    $results = [];
+    foreach ($targets as $t) {
+        $p = __DIR__ . '/' . $t;
+        $results[$t] = file_exists($p) ? (@unlink($p) ? 'deleted' : 'FAILED') : 'not present';
+    }
+    $assetsDir = __DIR__ . '/assets';
+    if (is_dir($assetsDir)) {
+        $items = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($assetsDir, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST);
+        foreach ($items as $item) { $item->isDir() ? @rmdir($item->getPathname()) : @unlink($item->getPathname()); }
+        $results['assets/'] = @rmdir($assetsDir) ? 'deleted' : 'FAILED';
+    } else {
+        $results['assets/'] = 'not present';
+    }
+    exit(json_encode($results, JSON_PRETTY_PRINT));
 }
 
 // Serve static uploads directly (works around OLS not always honouring .htaccess !-f)
