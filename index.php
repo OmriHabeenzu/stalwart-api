@@ -335,6 +335,15 @@ $path   = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $path   = '/' . trim(str_replace('/stalwart-api', '', $path), '/');
 $method = $_SERVER['REQUEST_METHOD'];
 
+// One-time diagnostic: inspect directory layout around this app's root.
+if ($path === '/ops/diag-dirs' && $method === 'GET') {
+    if (($_GET['token'] ?? '') !== 'stalwart2026') { http_response_code(403); exit(json_encode(['error'=>'Unauthorized'])); }
+    $out = ['__DIR__'=>__DIR__, 'realpath_parent'=>realpath(__DIR__.'/..'), 'realpath_public_html'=>realpath(__DIR__.'/../public_html')];
+    $out['siblings'] = is_dir(__DIR__.'/..') ? array_values(array_diff(scandir(__DIR__.'/..'), ['.','..'])) : null;
+    $out['own_dir_listing'] = array_values(array_diff(scandir(__DIR__), ['.','..']));
+    exit(json_encode($out, JSON_PRETTY_PRINT));
+}
+
 // Serve static uploads directly (works around OLS not always honouring .htaccess !-f)
 if ($method === 'GET' && preg_match('#^/uploads/#', $path)) {
     $file = __DIR__ . $path;
