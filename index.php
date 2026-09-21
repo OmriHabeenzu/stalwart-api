@@ -335,6 +335,17 @@ $path   = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $path   = '/' . trim(str_replace('/stalwart-api', '', $path), '/');
 $method = $_SERVER['REQUEST_METHOD'];
 
+// One-time cleanup: delete the legacy publicly-exposed GA credentials file
+// (OLS serves it directly as a static file regardless of .htaccess rules —
+// credentials now live in the settings table instead). Remove after use.
+if ($path === '/ops/delete-legacy-ga-file' && $method === 'GET') {
+    if (($_GET['token'] ?? '') !== 'stalwart2026') { http_response_code(403); exit(json_encode(['error'=>'Unauthorized'])); }
+    $f = __DIR__ . '/config/ga-credentials.json';
+    $existed = file_exists($f);
+    $deleted = $existed ? @unlink($f) : false;
+    exit(json_encode(['existed'=>$existed,'deleted'=>$deleted]));
+}
+
 // Serve static uploads directly (works around OLS not always honouring .htaccess !-f)
 if ($method === 'GET' && preg_match('#^/uploads/#', $path)) {
     $file = __DIR__ . $path;
