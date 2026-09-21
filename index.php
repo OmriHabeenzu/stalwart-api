@@ -351,21 +351,31 @@ if ($path === '/ops/diag-dirs' && $method === 'GET') {
     exit(json_encode($out, JSON_PRETTY_PRINT));
 }
 
-// One-time cleanup: delete stray files sitting in the public web root that
-// OLS serves directly as static content regardless of .htaccess — leftover
-// index.php.bak-* snapshots (raw source disclosure), a stray vendor zip, and
-// the frontend build files a bad /deploy-frontend run dumped in here since
-// its target path resolved back onto this app's own root. Remove after use.
+// One-time cleanup: get stray files out of the public web root, which OLS
+// serves directly as static content regardless of .htaccess. Backups
+// (index.php.bak-*, index.old.php, vendor-full-fix.zip) are MOVED to
+// ../private/backups/ — kept, just no longer publicly downloadable. The
+// frontend build files a bad /deploy-frontend run dumped in here (its
+// target path resolved back onto this app's own root) are deleted outright
+// since they don't belong here at all. Remove this route after use.
 if ($path === '/ops/cleanup-stray-files' && $method === 'GET') {
     if (($_GET['token'] ?? '') !== 'stalwart2026') { http_response_code(403); exit(json_encode(['error'=>'Unauthorized'])); }
-    $targets = [
+    $results = [];
+
+    $backupDir = __DIR__ . '/../private/backups';
+    if (!is_dir($backupDir)) mkdir($backupDir, 0755, true);
+    $backups = [
         'index.php.bak-20260916','index.php.bak-20260916b','index.php.bak-20260916c',
         'index.php.bak-20260918a','index.php.bak-20260918b','index.php.bak-20260918c',
         'index.old.php','vendor-full-fix.zip',
-        'index.html','icon-192.png','icon-512.png','manifest.webmanifest','sw.js',
     ];
-    $results = [];
-    foreach ($targets as $t) {
+    foreach ($backups as $t) {
+        $p = __DIR__ . '/' . $t;
+        $results[$t] = file_exists($p) ? (rename($p, $backupDir.'/'.$t) ? 'moved to private/backups' : 'FAILED') : 'not present';
+    }
+
+    $toDelete = ['index.html','icon-192.png','icon-512.png','manifest.webmanifest','sw.js'];
+    foreach ($toDelete as $t) {
         $p = __DIR__ . '/' . $t;
         $results[$t] = file_exists($p) ? (@unlink($p) ? 'deleted' : 'FAILED') : 'not present';
     }
