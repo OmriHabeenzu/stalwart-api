@@ -335,27 +335,6 @@ $path   = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $path   = '/' . trim(str_replace('/stalwart-api', '', $path), '/');
 $method = $_SERVER['REQUEST_METHOD'];
 
-// One-time fix: report id=217 (2026-09-22) was saved correctly under
-// Mutinta's own account (staff_id=7) but with a stale "Raphael Mulangi"
-// staff_name label inherited from a shared-device localStorage draft —
-// correct the display label only, no other fields touched. Remove after use.
-if ($path === '/ops/fix-report-217-name' && $method === 'GET') {
-    if (($_GET['token'] ?? '') !== 'stalwart2026') { http_response_code(403); exit(json_encode(['error'=>'Unauthorized'])); }
-    try {
-        $check = $pdo->prepare("SELECT id,staff_id,staff_name FROM call_reports WHERE id=217");
-        $check->execute();
-        $before = $check->fetch();
-        if (!$before || (int)$before['staff_id'] !== 7 || $before['staff_name'] !== 'Raphael Mulangi') {
-            exit(json_encode(['error' => 'Row does not match expected state, not touching it', 'found' => $before]));
-        }
-        $pdo->prepare("UPDATE call_reports SET staff_name='Mutinta Namukamba' WHERE id=217")->execute();
-        $after = $pdo->query("SELECT id,staff_id,staff_name FROM call_reports WHERE id=217")->fetch();
-        exit(json_encode(['before' => $before, 'after' => $after]));
-    } catch (\Throwable $e) {
-        exit(json_encode(['error' => $e->getMessage()]));
-    }
-}
-
 // Serve static uploads directly (works around OLS not always honouring .htaccess !-f)
 if ($method === 'GET' && preg_match('#^/uploads/#', $path)) {
     $file = __DIR__ . $path;
