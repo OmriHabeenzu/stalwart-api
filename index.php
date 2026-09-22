@@ -340,28 +340,32 @@ $method = $_SERVER['REQUEST_METHOD'];
 // Remove after use.
 if ($path === '/ops/trace-call-reports' && $method === 'GET') {
     if (($_GET['token'] ?? '') !== 'stalwart2026') { http_response_code(403); exit(json_encode(['error'=>'Unauthorized'])); }
-    $email = $_GET['email'] ?? 'mutinta@stalwartzm.com';
-    $out = [];
-    $u = $pdo->prepare("SELECT id,name,email,role,can_manage_calls,is_active FROM users WHERE email=?");
-    $u->execute([$email]);
-    $out['user'] = $u->fetch();
+    try {
+        $email = $_GET['email'] ?? 'mutinta@stalwartzm.com';
+        $out = [];
+        $u = $pdo->prepare("SELECT id,name,email,role,can_manage_calls,is_active FROM users WHERE email=?");
+        $u->execute([$email]);
+        $out['user'] = $u->fetch();
 
-    $uid = $out['user']['id'] ?? null;
-    $name = $out['user']['name'] ?? '';
+        $uid = $out['user']['id'] ?? null;
+        $name = $out['user']['name'] ?? '';
 
-    $logs = $pdo->prepare("SELECT id,user_id,user_email,action,description,created_at FROM activity_logs WHERE action='call_report_created' AND (user_email=? OR user_id=?) ORDER BY created_at DESC LIMIT 20");
-    $logs->execute([$email, $uid]);
-    $out['activity_logs'] = $logs->fetchAll();
+        $logs = $pdo->prepare("SELECT id,user_id,username,action,description,created_at FROM activity_logs WHERE action='call_report_created' AND (username=? OR user_id=?) ORDER BY created_at DESC LIMIT 20");
+        $logs->execute([$email, $uid]);
+        $out['activity_logs'] = $logs->fetchAll();
 
-    $byId = $pdo->prepare("SELECT id,report_date,staff_id,staff_name,total_count,answered_count,unanswered_count,phone_off_count,created_at,updated_at FROM call_reports WHERE staff_id=? ORDER BY report_date DESC LIMIT 10");
-    $byId->execute([$uid]);
-    $out['reports_by_staff_id'] = $byId->fetchAll();
+        $byId = $pdo->prepare("SELECT id,report_date,staff_id,staff_name,total_count,answered_count,unanswered_count,phone_off_count,created_at,updated_at FROM call_reports WHERE staff_id=? ORDER BY report_date DESC LIMIT 10");
+        $byId->execute([$uid]);
+        $out['reports_by_staff_id'] = $byId->fetchAll();
 
-    $byName = $pdo->prepare("SELECT id,report_date,staff_id,staff_name,total_count,answered_count,unanswered_count,phone_off_count,created_at,updated_at FROM call_reports WHERE staff_name LIKE ? ORDER BY report_date DESC LIMIT 10");
-    $byName->execute(['%' . explode(' ', $name)[0] . '%']);
-    $out['reports_by_name_fuzzy'] = $byName->fetchAll();
+        $byName = $pdo->prepare("SELECT id,report_date,staff_id,staff_name,total_count,answered_count,unanswered_count,phone_off_count,created_at,updated_at FROM call_reports WHERE staff_name LIKE ? ORDER BY report_date DESC LIMIT 10");
+        $byName->execute(['%' . explode(' ', $name)[0] . '%']);
+        $out['reports_by_name_fuzzy'] = $byName->fetchAll();
 
-    exit(json_encode($out, JSON_PRETTY_PRINT));
+        exit(json_encode($out, JSON_PRETTY_PRINT));
+    } catch (\Throwable $e) {
+        exit(json_encode(['error' => $e->getMessage()]));
+    }
 }
 
 // Serve static uploads directly (works around OLS not always honouring .htaccess !-f)
