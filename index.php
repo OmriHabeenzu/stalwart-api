@@ -307,13 +307,13 @@ function sendTaskDueReminders($pdo, $dryRun = false) {
 
     return ['overdue' => $overdue, 'due_today' => $dueToday];
 }
-// End-of-business-week admin digest — every incomplete (non-completed,
+// Weekly Task Summary Report — every incomplete (non-completed,
 // non-subtask) task, split into Overdue vs Pending/In Progress, emailed to
 // the company inbox rather than individual assignees. Deliberately
 // separate from sendTaskDueReminders (which still emails each assignee
 // their own overdue/due-today reminders as before) — this is an
 // additional summary, not a replacement.
-function sendWeeklyIncompleteTasksReport($pdo) {
+function sendWeeklyTaskSummaryReport($pdo) {
     $tasks = $pdo->query("SELECT t.id, t.title, t.due_date, t.status,
         GROUP_CONCAT(DISTINCT u.name SEPARATOR ', ') AS assignees
         FROM tasks t
@@ -344,14 +344,14 @@ function sendWeeklyIncompleteTasksReport($pdo) {
         . '<th align="left" style="padding:6px 10px;border-bottom:2px solid #ddd;">Status</th>'
         . '</tr>';
 
-    $html = '<p>Weekly incomplete tasks report — ' . date('d M Y') . '</p>';
+    $html = '<p><strong>Weekly Task Summary Report</strong> — ' . date('d M Y') . '</p>';
     $html .= '<p><strong>' . count($tasks) . '</strong> task(s) are currently incomplete.</p>';
     if ($overdueRows) $html .= '<h3 style="color:#dc2626;margin-bottom:4px;">Overdue</h3>' . $tableHead . $overdueRows . '</table>';
     if ($pendingRows) $html .= '<h3 style="margin-top:24px;margin-bottom:4px;">Pending / In Progress</h3>' . $tableHead . $pendingRows . '</table>';
     if (!$tasks) $html .= '<p>No incomplete tasks — clean board this week.</p>';
     $html .= '<p style="margin-top:24px;color:#888;">— Stalwart Zambia (automated weekly report)</p>';
 
-    sendEmail('stalwartservicesltd@gmail.com', 'Stalwart Admin', 'Weekly Incomplete Tasks Report — ' . date('d M Y'), $html);
+    sendEmail('stalwartservicesltd@gmail.com', 'Stalwart Admin', 'Weekly Task Summary Report — ' . date('d M Y'), $html);
 }
 // Shared by POST /tasks and POST /tasks/{id}/subtasks — inserts a task row
 // (optionally as a child via $parentTaskId), assigns users, and emails them.
@@ -1958,13 +1958,13 @@ if ($path === '/tasks/daily-check' && $method === 'GET') {
         $result = sendTaskDueReminders($pdo, $dryRun);
         $overdue = $result['overdue']; $dueToday = $result['due_today'];
 
-        // End-of-business-week admin digest — Friday only, once per day
-        // regardless of how many times the daily cron fires that day.
-        if (!$dryRun && (int)date('N') === 5) {
+        // Weekly Task Summary Report — Monday only, once per day regardless
+        // of how many times the daily cron fires that day.
+        if (!$dryRun && (int)date('N') === 1) {
             $today = date('Y-m-d');
             $lastWeeklyReport = $pdo->query("SELECT setting_value FROM settings WHERE setting_key='weekly_report_last_sent'")->fetchColumn();
             if ($lastWeeklyReport !== $today) {
-                sendWeeklyIncompleteTasksReport($pdo);
+                sendWeeklyTaskSummaryReport($pdo);
                 $pdo->prepare("INSERT INTO settings (setting_key,setting_value) VALUES ('weekly_report_last_sent',?) ON DUPLICATE KEY UPDATE setting_value=?")
                     ->execute([$today, $today]);
             }
@@ -2213,15 +2213,15 @@ if ($path === '/admin/send-task-reminders' && $method === 'POST') {
     } catch (\Throwable $e) { sendResponse('error','Failed to send task reminders: '.$e->getMessage(),null,500); }
 }
 
-// Manual trigger for the admin weekly incomplete-tasks digest (normally
-// only fires automatically via /tasks/daily-check on Fridays) — lets an
-// admin test it or send an ad-hoc copy without waiting for Friday.
+// Manual trigger for the Weekly Task Summary Report (normally only fires
+// automatically via /tasks/daily-check on Mondays) — lets an admin send it
+// on the spot in case the cron job doesn't fire, without waiting for Monday.
 if ($path === '/admin/send-weekly-tasks-report' && $method === 'POST') {
     requireAdmin($pdo);
     try {
         $tasks = $pdo->query("SELECT COUNT(*) FROM tasks WHERE status != 'completed' AND parent_task_id IS NULL")->fetchColumn();
-        sendWeeklyIncompleteTasksReport($pdo);
-        sendResponse('success', "Weekly incomplete tasks report sent ({$tasks} incomplete task(s))", ['incomplete_tasks' => (int)$tasks]);
+        sendWeeklyTaskSummaryReport($pdo);
+        sendResponse('success', "Weekly Task Summary Report sent ({$tasks} incomplete task(s))", ['incomplete_tasks' => (int)$tasks]);
     } catch (\Throwable $e) { sendResponse('error','Failed to send weekly report: '.$e->getMessage(),null,500); }
 }
 
