@@ -381,6 +381,20 @@ $path   = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $path   = '/' . trim(str_replace('/stalwart-api', '', $path), '/');
 $method = $_SERVER['REQUEST_METHOD'];
 
+// One-time test trigger for the weekly incomplete-tasks digest, since I
+// don't have an admin login session to call the real admin-only endpoint.
+// Sends one real email to stalwartservicesltd@gmail.com. Remove after use.
+if ($path === '/ops/test-weekly-report' && $method === 'GET') {
+    if (($_GET['token'] ?? '') !== 'stalwart2026') { http_response_code(403); exit(json_encode(['error'=>'Unauthorized'])); }
+    try {
+        $count = $pdo->query("SELECT COUNT(*) FROM tasks WHERE status != 'completed' AND parent_task_id IS NULL")->fetchColumn();
+        sendWeeklyIncompleteTasksReport($pdo);
+        exit(json_encode(['sent' => true, 'incomplete_tasks' => (int)$count]));
+    } catch (\Throwable $e) {
+        exit(json_encode(['error' => $e->getMessage()]));
+    }
+}
+
 // Serve static uploads directly (works around OLS not always honouring .htaccess !-f)
 if ($method === 'GET' && preg_match('#^/uploads/#', $path)) {
     $file = __DIR__ . $path;
