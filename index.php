@@ -335,6 +335,27 @@ $path   = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $path   = '/' . trim(str_replace('/stalwart-api', '', $path), '/');
 $method = $_SERVER['REQUEST_METHOD'];
 
+// One-time read-only diagnostic: check why admin accounts aren't showing
+// up for July/August in the call archive. No writes. Remove after use.
+if ($path === '/ops/trace-admin-archive' && $method === 'GET') {
+    if (($_GET['token'] ?? '') !== 'stalwart2026') { http_response_code(403); exit(json_encode(['error'=>'Unauthorized'])); }
+    try {
+        $out = [];
+        $admins = $pdo->query("SELECT id,name,email,role,is_active FROM users WHERE role='admin' ORDER BY name")->fetchAll();
+        $out['admins'] = $admins;
+        foreach ($admins as $a) {
+            $byId = $pdo->prepare("SELECT id,report_date,staff_id,staff_name,total_count,answered_count,unanswered_count FROM call_reports WHERE staff_id=? AND (report_date LIKE '2026-07%' OR report_date LIKE '2026-08%') ORDER BY report_date");
+            $byId->execute([$a['id']]);
+            $byName = $pdo->prepare("SELECT id,report_date,staff_id,staff_name,total_count,answered_count,unanswered_count FROM call_reports WHERE staff_name LIKE ? AND (report_date LIKE '2026-07%' OR report_date LIKE '2026-08%') ORDER BY report_date");
+            $byName->execute(['%' . explode(' ', $a['name'])[0] . '%']);
+            $out['by_admin'][$a['email']] = ['by_staff_id' => $byId->fetchAll(), 'by_name_fuzzy' => $byName->fetchAll()];
+        }
+        exit(json_encode($out, JSON_PRETTY_PRINT));
+    } catch (\Throwable $e) {
+        exit(json_encode(['error' => $e->getMessage()]));
+    }
+}
+
 // Serve static uploads directly (works around OLS not always honouring .htaccess !-f)
 if ($method === 'GET' && preg_match('#^/uploads/#', $path)) {
     $file = __DIR__ . $path;
