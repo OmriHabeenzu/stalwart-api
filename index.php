@@ -307,6 +307,52 @@ function sendTaskDueReminders($pdo, $dryRun = false) {
 
     return ['overdue' => $overdue, 'due_today' => $dueToday];
 }
+// End-of-business-week admin digest — every incomplete (non-completed,
+// non-subtask) task, split into Overdue vs Pending/In Progress, emailed to
+// the company inbox rather than individual assignees. Deliberately
+// separate from sendTaskDueReminders (which still emails each assignee
+// their own overdue/due-today reminders as before) — this is an
+// additional summary, not a replacement.
+function sendWeeklyIncompleteTasksReport($pdo) {
+    $tasks = $pdo->query("SELECT t.id, t.title, t.due_date, t.status,
+        GROUP_CONCAT(DISTINCT u.name SEPARATOR ', ') AS assignees
+        FROM tasks t
+        LEFT JOIN task_assignees ta ON ta.task_id = t.id
+        LEFT JOIN users u ON u.id = ta.user_id
+        WHERE t.status != 'completed' AND t.parent_task_id IS NULL
+        GROUP BY t.id
+        ORDER BY (t.due_date IS NULL), t.due_date ASC")->fetchAll();
+
+    $today = date('Y-m-d');
+    $rowHtml = fn($t) => '<tr>'
+        . '<td style="padding:6px 10px;border-bottom:1px solid #eee;">' . htmlspecialchars($t['title']) . '</td>'
+        . '<td style="padding:6px 10px;border-bottom:1px solid #eee;">' . htmlspecialchars($t['assignees'] ?: '—') . '</td>'
+        . '<td style="padding:6px 10px;border-bottom:1px solid #eee;">' . ($t['due_date'] ? date('d M Y', strtotime($t['due_date'])) : 'No due date') . '</td>'
+        . '<td style="padding:6px 10px;border-bottom:1px solid #eee;">' . htmlspecialchars(ucwords(str_replace('_',' ',$t['status']))) . '</td>'
+        . '</tr>';
+
+    $overdueRows = ''; $pendingRows = '';
+    foreach ($tasks as $t) {
+        if ($t['due_date'] && $t['due_date'] < $today) $overdueRows .= $rowHtml($t);
+        else $pendingRows .= $rowHtml($t);
+    }
+
+    $tableHead = '<table style="border-collapse:collapse;width:100%;font-size:14px;"><tr>'
+        . '<th align="left" style="padding:6px 10px;border-bottom:2px solid #ddd;">Task</th>'
+        . '<th align="left" style="padding:6px 10px;border-bottom:2px solid #ddd;">Assignees</th>'
+        . '<th align="left" style="padding:6px 10px;border-bottom:2px solid #ddd;">Due</th>'
+        . '<th align="left" style="padding:6px 10px;border-bottom:2px solid #ddd;">Status</th>'
+        . '</tr>';
+
+    $html = '<p>Weekly incomplete tasks report — ' . date('d M Y') . '</p>';
+    $html .= '<p><strong>' . count($tasks) . '</strong> task(s) are currently incomplete.</p>';
+    if ($overdueRows) $html .= '<h3 style="color:#dc2626;margin-bottom:4px;">Overdue</h3>' . $tableHead . $overdueRows . '</table>';
+    if ($pendingRows) $html .= '<h3 style="margin-top:24px;margin-bottom:4px;">Pending / In Progress</h3>' . $tableHead . $pendingRows . '</table>';
+    if (!$tasks) $html .= '<p>No incomplete tasks — clean board this week.</p>';
+    $html .= '<p style="margin-top:24px;color:#888;">— Stalwart Zambia (automated weekly report)</p>';
+
+    sendEmail('stalwartservicesltd@gmail.com', 'Stalwart Admin', 'Weekly Incomplete Tasks Report — ' . date('d M Y'), $html);
+}
 // Shared by POST /tasks and POST /tasks/{id}/subtasks — inserts a task row
 // (optionally as a child via $parentTaskId), assigns users, and emails them.
 // Returns the new task id, or null if title is blank.
@@ -334,27 +380,6 @@ function base64url_enc($d) { return rtrim(strtr(base64_encode($d),'+/','-_'),'='
 $path   = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $path   = '/' . trim(str_replace('/stalwart-api', '', $path), '/');
 $method = $_SERVER['REQUEST_METHOD'];
-
-// One-time read-only diagnostic: check why admin accounts aren't showing
-// up for July/August in the call archive. No writes. Remove after use.
-if ($path === '/ops/trace-admin-archive' && $method === 'GET') {
-    if (($_GET['token'] ?? '') !== 'stalwart2026') { http_response_code(403); exit(json_encode(['error'=>'Unauthorized'])); }
-    try {
-        $out = [];
-        $admins = $pdo->query("SELECT id,name,email,role,is_active FROM users WHERE role='admin' ORDER BY name")->fetchAll();
-        $out['admins'] = $admins;
-        foreach ($admins as $a) {
-            $byId = $pdo->prepare("SELECT id,report_date,staff_id,staff_name,total_count,answered_count,unanswered_count FROM call_reports WHERE staff_id=? AND (report_date LIKE '2026-07%' OR report_date LIKE '2026-08%') ORDER BY report_date");
-            $byId->execute([$a['id']]);
-            $byName = $pdo->prepare("SELECT id,report_date,staff_id,staff_name,total_count,answered_count,unanswered_count FROM call_reports WHERE staff_name LIKE ? AND (report_date LIKE '2026-07%' OR report_date LIKE '2026-08%') ORDER BY report_date");
-            $byName->execute(['%' . explode(' ', $a['name'])[0] . '%']);
-            $out['by_admin'][$a['email']] = ['by_staff_id' => $byId->fetchAll(), 'by_name_fuzzy' => $byName->fetchAll()];
-        }
-        exit(json_encode($out, JSON_PRETTY_PRINT));
-    } catch (\Throwable $e) {
-        exit(json_encode(['error' => $e->getMessage()]));
-    }
-}
 
 // Serve static uploads directly (works around OLS not always honouring .htaccess !-f)
 if ($method === 'GET' && preg_match('#^/uploads/#', $path)) {
@@ -1933,6 +1958,18 @@ if ($path === '/tasks/daily-check' && $method === 'GET') {
         $result = sendTaskDueReminders($pdo, $dryRun);
         $overdue = $result['overdue']; $dueToday = $result['due_today'];
 
+        // End-of-business-week admin digest — Friday only, once per day
+        // regardless of how many times the daily cron fires that day.
+        if (!$dryRun && (int)date('N') === 5) {
+            $today = date('Y-m-d');
+            $lastWeeklyReport = $pdo->query("SELECT setting_value FROM settings WHERE setting_key='weekly_report_last_sent'")->fetchColumn();
+            if ($lastWeeklyReport !== $today) {
+                sendWeeklyIncompleteTasksReport($pdo);
+                $pdo->prepare("INSERT INTO settings (setting_key,setting_value) VALUES ('weekly_report_last_sent',?) ON DUPLICATE KEY UPDATE setting_value=?")
+                    ->execute([$today, $today]);
+            }
+        }
+
         if ($dryRun) {
             sendResponse('success','Dry run — nothing was changed', [
                 'would_remind' => count($overdue),
@@ -2174,6 +2211,18 @@ if ($path === '/admin/send-task-reminders' && $method === 'POST') {
             'due_tasks'=>$dueTodayTasks,
         ]);
     } catch (\Throwable $e) { sendResponse('error','Failed to send task reminders: '.$e->getMessage(),null,500); }
+}
+
+// Manual trigger for the admin weekly incomplete-tasks digest (normally
+// only fires automatically via /tasks/daily-check on Fridays) — lets an
+// admin test it or send an ad-hoc copy without waiting for Friday.
+if ($path === '/admin/send-weekly-tasks-report' && $method === 'POST') {
+    requireAdmin($pdo);
+    try {
+        $tasks = $pdo->query("SELECT COUNT(*) FROM tasks WHERE status != 'completed' AND parent_task_id IS NULL")->fetchColumn();
+        sendWeeklyIncompleteTasksReport($pdo);
+        sendResponse('success', "Weekly incomplete tasks report sent ({$tasks} incomplete task(s))", ['incomplete_tasks' => (int)$tasks]);
+    } catch (\Throwable $e) { sendResponse('error','Failed to send weekly report: '.$e->getMessage(),null,500); }
 }
 
 // ==========================================
