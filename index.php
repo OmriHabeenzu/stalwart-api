@@ -1074,7 +1074,14 @@ if ($path === '/calendar/today' && $method === 'GET') {
 
         $totalEventsInCalendar = count($events); // for debug
 
-        if (!$isAdmin) {
+        // The Call Report keeps giving admins the full list (they compile the
+        // whole team's report), but the Call List (?phones=1) is for dialling,
+        // so an admin who is on the Call Schedule as a caller that day gets
+        // their own share there just like any other caller. Admins who aren't
+        // scheduled still see everyone (the split only applies to scheduled callers).
+        $isCallList = ($_GET['phones'] ?? '') === '1';
+
+        if (!$isAdmin || $isCallList) {
             // Find ordered list of callers scheduled for this specific date
             $stmt = $pdo->prepare(
                 "SELECT user_id FROM call_schedule WHERE schedule_date=? AND role='caller' ORDER BY id ASC"
