@@ -1104,7 +1104,7 @@ if ($path === '/calendar/today' && $method === 'GET') {
         }
 
         // ?phones=1 (Call List page) — attach a dialable number per client.
-        if (($_GET['phones'] ?? '') === '1') $events = attachClientPhones($pdo, $events);
+        if (($_GET['phones'] ?? '') === '1') { gcMaybeAutoSync($pdo); $events = attachClientPhones($pdo, $events); }
         $events = array_map(function ($e) { unset($e['_desc']); return $e; }, $events);
 
         sendResponse('success','Events retrieved',[
@@ -1221,8 +1221,9 @@ function ensureClientPhonesTable($pdo) {
 function attachClientPhones($pdo, $events) {
     // Display order — numbers that were already known stay on top; CSV
     // uploads sit underneath as backups for the caller to try next:
-    // staff correction (Update) > calendar event > client record > CSV.
-    $rank = ['manual' => 0, 'calendar' => 1, 'client' => 2, 'csv' => 3];
+    // staff correction (Update) > Google Contacts (stalwartops@gmail.com,
+    // the working numbers) > calendar event > client record > CSV.
+    $rank = ['manual' => 0, 'google' => 1, 'calendar' => 2, 'client' => 3, 'csv' => 4];
     $byKey = [];   // name_key => ['name'=>display name, 'phones'=>[number=>source]]
     $removed = []; // name_key => [number=>true] — numbers staff replaced via Update
     $add = function (&$phones, $p, $source) use ($rank) {
@@ -1239,6 +1240,9 @@ function attachClientPhones($pdo, $events) {
         ensureClientPhonesTable($pdo);
         foreach ($pdo->query("SELECT name_key, phone FROM client_phones WHERE removed=1")->fetchAll() as $r) $removed[$r['name_key']][$r['phone']] = true;
         foreach ($pdo->query("SELECT client_name, phone, source FROM client_phones WHERE removed=0 ORDER BY id")->fetchAll() as $r) $addFor($r['client_name'], $r['phone'], $r['source'] === 'manual' ? 'manual' : 'csv');
+    } catch (\Throwable $e) {}
+    try {
+        foreach ($pdo->query("SELECT contact_name, phone FROM google_contacts")->fetchAll() as $r) $addFor($r['contact_name'], $r['phone'], 'google');
     } catch (\Throwable $e) {}
     try {
         foreach ($pdo->query("SELECT customer_name, customer_phone FROM loan_accounts WHERE customer_phone IS NOT NULL AND customer_phone <> '' ORDER BY updated_at DESC")->fetchAll() as $r) $addFor($r['customer_name'], $r['customer_phone'], 'client');
@@ -1392,6 +1396,190 @@ if ($path === '/call-list/phones/delete' && $method === 'POST') {
         logActivity($pdo, $user['id'], $user['email'], 'client_phone_deleted', "Removed {$num} from {$name} (Call List)");
         sendResponse('success','Number removed');
     } catch (\Throwable $e) { sendResponse('error','Failed to remove number: '.$e->getMessage(),null,500); }
+}
+
+// ==========================================
+// GOOGLE CONTACTS (stalwartops@gmail.com) — working numbers for the Call List
+// ==========================================
+// A personal Gmail's contacts can't be read with the calendar's service
+// account, so the account owner approves read-only access once (OAuth) and
+// the refresh token is kept here. Contacts are mirrored into google_contacts
+// (re-synced every few hours on Call List load, or on demand) and
+// attachClientPhones() lists them first, under staff corrections.
+// Secrets live in their own table, not `settings` — GET /settings is readable
+// by every logged-in user.
+function gcEnsureTables($pdo) {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS google_contacts_auth (id TINYINT PRIMARY KEY, client_id VARCHAR(255) DEFAULT NULL, client_secret VARCHAR(255) DEFAULT NULL, refresh_token TEXT DEFAULT NULL, connected_email VARCHAR(255) DEFAULT NULL, state_nonce VARCHAR(64) DEFAULT NULL, state_expires DATETIME DEFAULT NULL, last_sync DATETIME DEFAULT NULL, last_sync_attempt DATETIME DEFAULT NULL, last_sync_count INT DEFAULT 0, last_error VARCHAR(500) DEFAULT NULL)");
+    $pdo->exec("INSERT IGNORE INTO google_contacts_auth (id) VALUES (1)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS google_contacts (id INT AUTO_INCREMENT PRIMARY KEY, contact_name VARCHAR(255) NOT NULL, name_key VARCHAR(255) NOT NULL, phone VARCHAR(20) NOT NULL, UNIQUE KEY uniq_gc (name_key, phone), INDEX idx_gc_key (name_key))");
+}
+function gcAuthRow($pdo) { gcEnsureTables($pdo); return $pdo->query("SELECT * FROM google_contacts_auth WHERE id=1")->fetch(); }
+function gcRedirectUri() {
+    $host = $_SERVER['HTTP_HOST'] ?? 'api.stalwartzm.com';
+    $local = preg_match('/^(localhost|127\.0\.0\.1)(:\d+)?$/', $host);
+    $prefix = str_starts_with($_SERVER['REQUEST_URI'] ?? '', '/stalwart-api') ? '/stalwart-api' : '';
+    return ($local ? 'http' : 'https') . '://' . $host . $prefix . '/google-contacts/callback';
+}
+function gcPost($url, $fields) {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [CURLOPT_POST=>true, CURLOPT_RETURNTRANSFER=>true, CURLOPT_POSTFIELDS=>http_build_query($fields), CURLOPT_TIMEOUT=>15]);
+    $res = curl_exec($ch); curl_close($ch);
+    return json_decode((string)$res, true) ?: [];
+}
+function gcGet($url, $token) {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER=>true, CURLOPT_HTTPHEADER=>["Authorization: Bearer {$token}"], CURLOPT_TIMEOUT=>20]);
+    $res = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+    return [$code, json_decode((string)$res, true) ?: []];
+}
+// Pulls every contact with a phone number and replaces the local mirror.
+// Returns ['ok'=>bool, 'count'=>int, 'error'=>?string].
+function gcSyncContacts($pdo) {
+    $a = gcAuthRow($pdo);
+    if (empty($a['refresh_token'])) return ['ok'=>false, 'count'=>0, 'error'=>'Google Contacts is not connected'];
+    $pdo->exec("UPDATE google_contacts_auth SET last_sync_attempt=NOW() WHERE id=1");
+    $tok = gcPost('https://oauth2.googleapis.com/token', ['client_id'=>$a['client_id'], 'client_secret'=>$a['client_secret'], 'refresh_token'=>$a['refresh_token'], 'grant_type'=>'refresh_token']);
+    if (empty($tok['access_token'])) {
+        $revoked = ($tok['error'] ?? '') === 'invalid_grant';
+        $err = $revoked ? 'Google access was revoked or expired — connect again' : 'Could not get a Google access token: '.($tok['error_description'] ?? $tok['error'] ?? 'no response');
+        if ($revoked) $pdo->exec("UPDATE google_contacts_auth SET refresh_token=NULL WHERE id=1");
+        $pdo->prepare("UPDATE google_contacts_auth SET last_error=? WHERE id=1")->execute([$err]);
+        return ['ok'=>false, 'count'=>0, 'error'=>$err];
+    }
+    $rows = []; $pageToken = null; $pages = 0;
+    do {
+        $url = 'https://people.googleapis.com/v1/people/me/connections?personFields=names,phoneNumbers&pageSize=1000' . ($pageToken ? '&pageToken='.urlencode($pageToken) : '');
+        [$code, $d] = gcGet($url, $tok['access_token']);
+        if ($code !== 200) {
+            $err = 'Google Contacts request failed: '.($d['error']['message'] ?? "HTTP {$code}");
+            $pdo->prepare("UPDATE google_contacts_auth SET last_error=? WHERE id=1")->execute([$err]);
+            return ['ok'=>false, 'count'=>0, 'error'=>$err];
+        }
+        foreach ($d['connections'] ?? [] as $person) {
+            $name = trim($person['names'][0]['displayName'] ?? '');
+            $key = clientNameKey($name);
+            if ($key === '') continue;
+            foreach ($person['phoneNumbers'] ?? [] as $ph) {
+                $num = normalizeClientPhone($ph['canonicalForm'] ?? $ph['value'] ?? '');
+                if ($num) $rows[$key.'|'.$num] = [$name, $key, $num];
+            }
+        }
+        $pageToken = $d['nextPageToken'] ?? null;
+    } while ($pageToken && ++$pages < 50);
+
+    $pdo->beginTransaction();
+    try {
+        $pdo->exec("DELETE FROM google_contacts");
+        $ins = $pdo->prepare("INSERT IGNORE INTO google_contacts (contact_name, name_key, phone) VALUES (?,?,?)");
+        foreach ($rows as $r) $ins->execute($r);
+        $pdo->prepare("UPDATE google_contacts_auth SET last_sync=NOW(), last_sync_count=?, last_error=NULL WHERE id=1")->execute([count($rows)]);
+        $pdo->commit();
+    } catch (\Throwable $e) { $pdo->rollBack(); throw $e; }
+    return ['ok'=>true, 'count'=>count($rows), 'error'=>null];
+}
+// Called on Call List load: re-sync when the mirror is older than 3h (at
+// most one attempt per 10 min, so a failing sync can't slow every load).
+function gcMaybeAutoSync($pdo) {
+    try {
+        $a = gcAuthRow($pdo);
+        if (empty($a['refresh_token'])) return;
+        $stale = !$a['last_sync'] || time() - strtotime($a['last_sync']) > 3 * 3600;
+        $recentTry = $a['last_sync_attempt'] && time() - strtotime($a['last_sync_attempt']) < 600;
+        if ($stale && !$recentTry) gcSyncContacts($pdo);
+    } catch (\Throwable $e) {}
+}
+
+if ($path === '/google-contacts/status' && $method === 'GET') {
+    requireAdmin($pdo);
+    try {
+        $a = gcAuthRow($pdo);
+        sendResponse('success','Status',[
+            'configured'   => !empty($a['client_id']) && !empty($a['client_secret']),
+            'connected'    => !empty($a['refresh_token']),
+            'email'        => $a['connected_email'],
+            'last_sync'    => $a['last_sync'],
+            'count'        => (int)$a['last_sync_count'],
+            'last_error'   => $a['last_error'],
+            'redirect_uri' => gcRedirectUri(),
+        ]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if ($path === '/google-contacts/config' && $method === 'POST') {
+    requireAdmin($pdo);
+    $data = getRequestData();
+    $id = trim((string)($data['client_id'] ?? '')); $secret = trim((string)($data['client_secret'] ?? ''));
+    if (!$id || !$secret) sendResponse('error','Client ID and Client secret are both required',null,400);
+    try {
+        gcEnsureTables($pdo);
+        // A different OAuth client invalidates the old refresh token.
+        $pdo->prepare("UPDATE google_contacts_auth SET refresh_token=IF(client_id=?, refresh_token, NULL), client_id=?, client_secret=? WHERE id=1")->execute([$id, $id, $secret]);
+        sendResponse('success','Saved');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if ($path === '/google-contacts/auth-url' && $method === 'POST') {
+    requireAdmin($pdo);
+    try {
+        $a = gcAuthRow($pdo);
+        if (empty($a['client_id'])) sendResponse('error','Save the Google Client ID and secret first',null,400);
+        $nonce = bin2hex(random_bytes(16));
+        $pdo->prepare("UPDATE google_contacts_auth SET state_nonce=?, state_expires=DATE_ADD(NOW(), INTERVAL 15 MINUTE) WHERE id=1")->execute([$nonce]);
+        $url = 'https://accounts.google.com/o/oauth2/v2/auth?' . http_build_query([
+            'client_id' => $a['client_id'], 'redirect_uri' => gcRedirectUri(), 'response_type' => 'code',
+            'scope' => 'https://www.googleapis.com/auth/contacts.readonly email', 'access_type' => 'offline',
+            'prompt' => 'consent', 'login_hint' => 'stalwartops@gmail.com', 'state' => $nonce,
+        ]);
+        sendResponse('success','Auth URL',['url'=>$url]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+// Google redirects the browser here after the account owner approves — no
+// app login on this request, so it's authorised by the one-time state nonce.
+if ($path === '/google-contacts/callback' && $method === 'GET') {
+    $back = 'https://www.stalwartzm.com/dashboard/call-list';
+    $page = function ($ok, $msg) use ($back) {
+        header('Content-Type: text/html; charset=utf-8');
+        $color = $ok ? '#15803d' : '#b91c1c';
+        echo '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Google Contacts</title>'
+           . '<div style="font-family:system-ui,sans-serif;max-width:420px;margin:15vh auto;padding:24px;text-align:center">'
+           . '<h2 style="color:'.$color.'">'.htmlspecialchars($ok ? 'Google Contacts connected' : 'Could not connect').'</h2>'
+           . '<p>'.htmlspecialchars($msg).'</p><p><a href="'.$back.'">Back to the Call List</a></p></div>';
+        exit;
+    };
+    try {
+        $a = gcAuthRow($pdo);
+        $state = (string)($_GET['state'] ?? '');
+        if (!$a['state_nonce'] || !hash_equals($a['state_nonce'], $state) || strtotime($a['state_expires']) < time()) $page(false, 'This link has expired. Start again from the Call List page.');
+        $pdo->exec("UPDATE google_contacts_auth SET state_nonce=NULL WHERE id=1");
+        if (!empty($_GET['error'])) $page(false, 'Access was not granted ('.$_GET['error'].').');
+        $tok = gcPost('https://oauth2.googleapis.com/token', ['code'=>$_GET['code'] ?? '', 'client_id'=>$a['client_id'], 'client_secret'=>$a['client_secret'], 'redirect_uri'=>gcRedirectUri(), 'grant_type'=>'authorization_code']);
+        if (empty($tok['refresh_token'])) $page(false, 'Google did not return access ('.($tok['error_description'] ?? $tok['error'] ?? 'no refresh token').'). Try connecting again.');
+        [, $info] = gcGet('https://www.googleapis.com/oauth2/v3/userinfo', $tok['access_token']);
+        $pdo->prepare("UPDATE google_contacts_auth SET refresh_token=?, connected_email=?, last_error=NULL WHERE id=1")->execute([$tok['refresh_token'], $info['email'] ?? null]);
+        $sync = gcSyncContacts($pdo);
+        $page(true, $sync['ok'] ? 'Connected as '.($info['email'] ?? 'your Google account')." — {$sync['count']} numbers synced." : 'Connected, but the first sync failed: '.$sync['error']);
+    } catch (\Throwable $e) { $page(false, 'Something went wrong: '.$e->getMessage()); }
+}
+
+if ($path === '/google-contacts/sync' && $method === 'POST') {
+    $user = requireAdmin($pdo);
+    try {
+        $r = gcSyncContacts($pdo);
+        if (!$r['ok']) sendResponse('error', $r['error'], null, 400);
+        logActivity($pdo, $user['id'], $user['email'], 'google_contacts_synced', "Synced {$r['count']} numbers from Google Contacts");
+        sendResponse('success', "Synced {$r['count']} numbers from Google Contacts", ['count'=>$r['count']]);
+    } catch (\Throwable $e) { sendResponse('error','Sync failed: '.$e->getMessage(),null,500); }
+}
+
+if ($path === '/google-contacts/disconnect' && $method === 'POST') {
+    requireAdmin($pdo);
+    try {
+        gcEnsureTables($pdo);
+        $pdo->exec("UPDATE google_contacts_auth SET refresh_token=NULL, connected_email=NULL WHERE id=1");
+        $pdo->exec("DELETE FROM google_contacts");
+        sendResponse('success','Disconnected');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 function getGCalSettings($pdo) {
     return $pdo->query("SELECT setting_key,setting_value FROM settings WHERE setting_key IN ('google_calendar_id','google_service_account_json')")->fetchAll(\PDO::FETCH_KEY_PAIR);
