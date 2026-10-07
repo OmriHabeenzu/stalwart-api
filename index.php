@@ -1062,12 +1062,9 @@ if ($path === '/calendar/today' && $method === 'GET') {
         $token = getGCalToken($sa);
         if (!$token) sendResponse('error','Could not authenticate with Google Calendar',null,500);
         $date = $_GET['date'] ?? date('Y-m-d');
-        $timeMin = urlencode($date.'T00:00:00+02:00');
-        $timeMax = urlencode($date.'T23:59:59+02:00');
-        $url = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events?timeMin={$timeMin}&timeMax={$timeMax}&singleEvents=true&orderBy=startTime&maxResults=500";
-        $evData = curlGetGCalRetry($url, $token);
-        if ($evData === null) sendResponse('error','Could not reach Google Calendar to list events. Please try again.',null,502);
-        $events = array_map(fn($e) => ['name'=>$e['summary']??'','event_id'=>$e['id']??''], $evData['items']??[]);
+        $items = gcalListDayEvents($calendarId, $token, $date);
+        if ($items === null) sendResponse('error','Could not reach Google Calendar to list events. Please try again.',null,502);
+        $events = array_map(fn($e) => ['name'=>$e['summary']??'','event_id'=>$e['id']??''], $items);
 
         // Server-side caller split — prevents two callers ever seeing the same names
         $user = requireAuth($pdo);
@@ -1153,6 +1150,23 @@ function curlGetGCalRetry($url, $token, $maxAttempts = 4, $timeout = 6) {
         }
     }
     return null;
+}
+// All of one day's events, following nextPageToken — Google caps each page
+// (the call report used to ask for only 500 and never paged, so on a busy
+// day every client after the 500th by start time silently went missing).
+// Returns the items array, or null if Google couldn't be reached.
+function gcalListDayEvents($calendarId, $token, $date) {
+    $timeMin = urlencode($date.'T00:00:00+02:00');
+    $timeMax = urlencode($date.'T23:59:59+02:00');
+    $base = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events?timeMin={$timeMin}&timeMax={$timeMax}&singleEvents=true&orderBy=startTime&maxResults=2500";
+    $items = []; $pageToken = null;
+    do {
+        $evData = curlGetGCalRetry($base . ($pageToken ? '&pageToken='.urlencode($pageToken) : ''), $token);
+        if ($evData === null) return null;
+        $items = array_merge($items, $evData['items'] ?? []);
+        $pageToken = $evData['nextPageToken'] ?? null;
+    } while ($pageToken);
+    return $items;
 }
 function getGCalSettings($pdo) {
     return $pdo->query("SELECT setting_key,setting_value FROM settings WHERE setting_key IN ('google_calendar_id','google_service_account_json')")->fetchAll(\PDO::FETCH_KEY_PAIR);
@@ -1241,15 +1255,12 @@ if ($path === '/planner/events' && $method === 'GET') {
         if (!$token) sendResponse('error','Could not authenticate with Google Calendar',null,500);
 
         $date = $_GET['date'] ?? date('Y-m-d');
-        $timeMin = urlencode($date.'T00:00:00+02:00');
-        $timeMax = urlencode($date.'T23:59:59+02:00');
-        $url = "https://www.googleapis.com/calendar/v3/calendars/".urlencode($calendarId)."/events?timeMin={$timeMin}&timeMax={$timeMax}&singleEvents=true&orderBy=startTime&maxResults=2500";
-        $evData = curlGetGCalRetry($url, $token);
-        if ($evData === null) sendResponse('error','Could not reach Google Calendar to list events. Please try again.',null,502);
+        $items = gcalListDayEvents($calendarId, $token, $date);
+        if ($items === null) sendResponse('error','Could not reach Google Calendar to list events. Please try again.',null,502);
 
         $includeDesc = ($_GET['desc'] ?? '') === '1';
         $events = [];
-        foreach ($evData['items'] ?? [] as $e) {
+        foreach ($items as $e) {
             $name = trim($e['summary'] ?? '');
             // Busy-marker events (any variant — "Busy", "Busy Day", etc.) aren't
             // real clients — exclude them so they never show up as a fake
