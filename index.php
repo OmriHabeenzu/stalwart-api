@@ -1203,6 +1203,8 @@ function ensureClientPhonesTable($pdo) {
     // removed=1 rows hide a number for that client whatever its source
     // (upload, loan_accounts, calendar) — written by the Call List "Update".
     try { $pdo->exec("ALTER TABLE client_phones ADD COLUMN removed TINYINT(1) NOT NULL DEFAULT 0"); } catch (\Throwable $e) {}
+    // 'csv' (admin upload) or 'manual' (staff Update / Add number) — decides display order.
+    try { $pdo->exec("ALTER TABLE client_phones ADD COLUMN source VARCHAR(10) NOT NULL DEFAULT 'csv'"); } catch (\Throwable $e) {}
 }
 // Every known number per client: admin-uploaded (client_phones, any number
 // per client) + loan_accounts + a number in the event description. If none
@@ -1210,24 +1212,35 @@ function ensureClientPhonesTable($pdo) {
 // flagged 'fuzzy' so staff confirm before dialling. Adds phones[] (each
 // {number, source}), phone (first, for older callers) and matched_name.
 function attachClientPhones($pdo, $events) {
+    // Display order — numbers that were already known stay on top; CSV
+    // uploads sit underneath as backups for the caller to try next:
+    // staff correction (Update) > calendar event > client record > CSV.
+    $rank = ['manual' => 0, 'calendar' => 1, 'client' => 2, 'csv' => 3];
     $byKey = [];   // name_key => ['name'=>display name, 'phones'=>[number=>source]]
     $removed = []; // name_key => [number=>true] — numbers staff replaced via Update
-    $add = function ($name, $phone, $source) use (&$byKey, &$removed) {
+    $add = function (&$phones, $p, $source) use ($rank) {
+        if (!isset($phones[$p]) || $rank[$source] < $rank[$phones[$p]]) $phones[$p] = $source;
+    };
+    $addFor = function ($name, $phone, $source) use (&$byKey, &$removed, $add) {
         $k = clientNameKey($name); $p = normalizeClientPhone($phone);
         if ($k === '' || !$p || isset($removed[$k][$p])) return;
         $byKey[$k]['name'] = $byKey[$k]['name'] ?? $name;
-        $byKey[$k]['phones'][$p] = $byKey[$k]['phones'][$p] ?? $source;
+        $byKey[$k]['phones'] = $byKey[$k]['phones'] ?? [];
+        $add($byKey[$k]['phones'], $p, $source);
     };
     try {
         ensureClientPhonesTable($pdo);
-        foreach ($pdo->query("SELECT client_name, phone FROM client_phones WHERE removed=0 ORDER BY id")->fetchAll() as $r) $add($r['client_name'], $r['phone'], 'upload');
         foreach ($pdo->query("SELECT name_key, phone FROM client_phones WHERE removed=1")->fetchAll() as $r) $removed[$r['name_key']][$r['phone']] = true;
+        foreach ($pdo->query("SELECT client_name, phone, source FROM client_phones WHERE removed=0 ORDER BY id")->fetchAll() as $r) $addFor($r['client_name'], $r['phone'], $r['source'] === 'manual' ? 'manual' : 'csv');
     } catch (\Throwable $e) {}
     try {
-        foreach ($pdo->query("SELECT customer_name, customer_phone FROM loan_accounts WHERE customer_phone IS NOT NULL AND customer_phone <> '' ORDER BY updated_at DESC")->fetchAll() as $r) $add($r['customer_name'], $r['customer_phone'], 'client');
+        foreach ($pdo->query("SELECT customer_name, customer_phone FROM loan_accounts WHERE customer_phone IS NOT NULL AND customer_phone <> '' ORDER BY updated_at DESC")->fetchAll() as $r) $addFor($r['customer_name'], $r['customer_phone'], 'client');
     } catch (\Throwable $e) {}
 
-    $toList = fn($phones, $fuzzy) => array_map(fn($n, $src) => ['number' => $n, 'source' => $fuzzy ? 'fuzzy' : $src], array_keys($phones), array_values($phones));
+    $toList = function ($phones, $fuzzy) use ($rank) {
+        uksort($phones, fn($a, $b) => $rank[$phones[$a]] <=> $rank[$phones[$b]]);
+        return array_map(fn($n, $src) => ['number' => (string)$n, 'source' => $src, 'fuzzy' => $fuzzy], array_keys($phones), array_values($phones));
+    };
 
     foreach ($events as &$ev) {
         $ev['phones'] = []; $ev['matched_name'] = null;
@@ -1235,7 +1248,7 @@ function attachClientPhones($pdo, $events) {
         if ($key !== '') {
             $phones = $byKey[$key]['phones'] ?? [];
             $descPhone = normalizeClientPhone(extractPhoneFromText($ev['_desc'] ?? ''));
-            if ($descPhone && !isset($phones[$descPhone]) && !isset($removed[$key][$descPhone])) $phones[$descPhone] = 'calendar';
+            if ($descPhone && !isset($removed[$key][$descPhone])) $add($phones, $descPhone, 'calendar');
             if ($phones) {
                 $ev['phones'] = $toList($phones, false);
             } else {
@@ -1347,12 +1360,31 @@ if ($path === '/call-list/phones/update' && $method === 'POST') {
     if (!$new) sendResponse('error','Enter a valid phone number (e.g. 0977123456)',null,400);
     try {
         ensureClientPhonesTable($pdo);
-        $up = $pdo->prepare("INSERT INTO client_phones (client_name, name_key, phone, uploaded_by, removed) VALUES (?,?,?,?,?) ON DUPLICATE KEY UPDATE removed=VALUES(removed), uploaded_by=VALUES(uploaded_by)");
+        $up = $pdo->prepare("INSERT INTO client_phones (client_name, name_key, phone, uploaded_by, removed, source) VALUES (?,?,?,?,?,'manual') ON DUPLICATE KEY UPDATE removed=VALUES(removed), uploaded_by=VALUES(uploaded_by), source=IF(VALUES(removed)=0,'manual',source)");
         $up->execute([$name, $key, $new, $user['id'] ?? null, 0]);
         if ($old && $old !== $new) $up->execute([$name, $key, $old, $user['id'] ?? null, 1]);
         logActivity($pdo, $user['id'], $user['email'], 'client_phone_updated', "Phone for {$name}: ".($old ? "{$old} → " : 'added ').$new);
         sendResponse('success','Number saved',['number'=>$new]);
     } catch (\Throwable $e) { sendResponse('error','Failed to save number: '.$e->getMessage(),null,500); }
+}
+
+// Admin-only: remove a dead / unresponsive number from a client on the Call
+// List. Hides it whatever its source (calendar, client record, CSV, staff
+// update) via the same removed flag, so a later CSV upload won't bring it back.
+if ($path === '/call-list/phones/delete' && $method === 'POST') {
+    $user = requireAdmin($pdo);
+    $data = getRequestData();
+    $name = trim((string)($data['client_name'] ?? ''));
+    $key  = clientNameKey($name);
+    $num  = normalizeClientPhone($data['number'] ?? '');
+    if ($key === '' || !$num) sendResponse('error','Client name and number are required',null,400);
+    try {
+        ensureClientPhonesTable($pdo);
+        $pdo->prepare("INSERT INTO client_phones (client_name, name_key, phone, uploaded_by, removed) VALUES (?,?,?,?,1) ON DUPLICATE KEY UPDATE removed=1, uploaded_by=VALUES(uploaded_by)")
+            ->execute([$name, $key, $num, $user['id'] ?? null]);
+        logActivity($pdo, $user['id'], $user['email'], 'client_phone_deleted', "Removed {$num} from {$name} (Call List)");
+        sendResponse('success','Number removed');
+    } catch (\Throwable $e) { sendResponse('error','Failed to remove number: '.$e->getMessage(),null,500); }
 }
 function getGCalSettings($pdo) {
     return $pdo->query("SELECT setting_key,setting_value FROM settings WHERE setting_key IN ('google_calendar_id','google_service_account_json')")->fetchAll(\PDO::FETCH_KEY_PAIR);
