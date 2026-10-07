@@ -1200,6 +1200,9 @@ function normalizeClientPhone($raw) {
 }
 function ensureClientPhonesTable($pdo) {
     $pdo->exec("CREATE TABLE IF NOT EXISTS client_phones (id INT AUTO_INCREMENT PRIMARY KEY, client_name VARCHAR(255) NOT NULL, name_key VARCHAR(255) NOT NULL, phone VARCHAR(20) NOT NULL, uploaded_by INT DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uniq_name_phone (name_key, phone), INDEX idx_name_key (name_key))");
+    // removed=1 rows hide a number for that client whatever its source
+    // (upload, loan_accounts, calendar) — written by the Call List "Update".
+    try { $pdo->exec("ALTER TABLE client_phones ADD COLUMN removed TINYINT(1) NOT NULL DEFAULT 0"); } catch (\Throwable $e) {}
 }
 // Every known number per client: admin-uploaded (client_phones, any number
 // per client) + loan_accounts + a number in the event description. If none
@@ -1208,15 +1211,17 @@ function ensureClientPhonesTable($pdo) {
 // {number, source}), phone (first, for older callers) and matched_name.
 function attachClientPhones($pdo, $events) {
     $byKey = [];   // name_key => ['name'=>display name, 'phones'=>[number=>source]]
-    $add = function ($name, $phone, $source) use (&$byKey) {
+    $removed = []; // name_key => [number=>true] — numbers staff replaced via Update
+    $add = function ($name, $phone, $source) use (&$byKey, &$removed) {
         $k = clientNameKey($name); $p = normalizeClientPhone($phone);
-        if ($k === '' || !$p) return;
+        if ($k === '' || !$p || isset($removed[$k][$p])) return;
         $byKey[$k]['name'] = $byKey[$k]['name'] ?? $name;
         $byKey[$k]['phones'][$p] = $byKey[$k]['phones'][$p] ?? $source;
     };
     try {
         ensureClientPhonesTable($pdo);
-        foreach ($pdo->query("SELECT client_name, phone FROM client_phones ORDER BY id")->fetchAll() as $r) $add($r['client_name'], $r['phone'], 'upload');
+        foreach ($pdo->query("SELECT client_name, phone FROM client_phones WHERE removed=0 ORDER BY id")->fetchAll() as $r) $add($r['client_name'], $r['phone'], 'upload');
+        foreach ($pdo->query("SELECT name_key, phone FROM client_phones WHERE removed=1")->fetchAll() as $r) $removed[$r['name_key']][$r['phone']] = true;
     } catch (\Throwable $e) {}
     try {
         foreach ($pdo->query("SELECT customer_name, customer_phone FROM loan_accounts WHERE customer_phone IS NOT NULL AND customer_phone <> '' ORDER BY updated_at DESC")->fetchAll() as $r) $add($r['customer_name'], $r['customer_phone'], 'client');
@@ -1230,7 +1235,7 @@ function attachClientPhones($pdo, $events) {
         if ($key !== '') {
             $phones = $byKey[$key]['phones'] ?? [];
             $descPhone = normalizeClientPhone(extractPhoneFromText($ev['_desc'] ?? ''));
-            if ($descPhone && !isset($phones[$descPhone])) $phones[$descPhone] = 'calendar';
+            if ($descPhone && !isset($phones[$descPhone]) && !isset($removed[$key][$descPhone])) $phones[$descPhone] = 'calendar';
             if ($phones) {
                 $ev['phones'] = $toList($phones, false);
             } else {
@@ -1297,6 +1302,28 @@ if ($path === '/call-list/phones/import' && $method === 'POST') {
             'added' => $added, 'already_known' => $dupes, 'clients' => count($clients), 'skipped' => $skipped,
         ]);
     } catch (\Throwable $e) { sendResponse('error','Import failed: '.$e->getMessage(),null,500); }
+}
+
+// Call List "Update" / "Add number" — any logged-in staff member can correct
+// a client's number from the field. Saves new_number for that client and,
+// when old_number is given, hides the old one (whatever source it came from).
+if ($path === '/call-list/phones/update' && $method === 'POST') {
+    $user = requireAuth($pdo);
+    $data = getRequestData();
+    $name = trim((string)($data['client_name'] ?? ''));
+    $key  = clientNameKey($name);
+    $new  = normalizeClientPhone($data['new_number'] ?? '');
+    $old  = normalizeClientPhone($data['old_number'] ?? '');
+    if ($key === '') sendResponse('error','Client name is required',null,400);
+    if (!$new) sendResponse('error','Enter a valid phone number (e.g. 0977123456)',null,400);
+    try {
+        ensureClientPhonesTable($pdo);
+        $up = $pdo->prepare("INSERT INTO client_phones (client_name, name_key, phone, uploaded_by, removed) VALUES (?,?,?,?,?) ON DUPLICATE KEY UPDATE removed=VALUES(removed), uploaded_by=VALUES(uploaded_by)");
+        $up->execute([$name, $key, $new, $user['id'] ?? null, 0]);
+        if ($old && $old !== $new) $up->execute([$name, $key, $old, $user['id'] ?? null, 1]);
+        logActivity($pdo, $user['id'], $user['email'], 'client_phone_updated', "Phone for {$name}: ".($old ? "{$old} → " : 'added ').$new);
+        sendResponse('success','Number saved',['number'=>$new]);
+    } catch (\Throwable $e) { sendResponse('error','Failed to save number: '.$e->getMessage(),null,500); }
 }
 function getGCalSettings($pdo) {
     return $pdo->query("SELECT setting_key,setting_value FROM settings WHERE setting_key IN ('google_calendar_id','google_service_account_json')")->fetchAll(\PDO::FETCH_KEY_PAIR);
