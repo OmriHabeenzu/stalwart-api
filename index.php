@@ -1064,7 +1064,7 @@ if ($path === '/calendar/today' && $method === 'GET') {
         $date = $_GET['date'] ?? date('Y-m-d');
         $items = gcalListDayEvents($calendarId, $token, $date);
         if ($items === null) sendResponse('error','Could not reach Google Calendar to list events. Please try again.',null,502);
-        $events = array_map(fn($e) => ['name'=>$e['summary']??'','event_id'=>$e['id']??''], $items);
+        $events = array_map(fn($e) => ['name'=>$e['summary']??'','event_id'=>$e['id']??'','_desc'=>$e['description']??''], $items);
 
         // Server-side caller split — prevents two callers ever seeing the same names
         $user = requireAuth($pdo);
@@ -1095,6 +1095,10 @@ if ($path === '/calendar/today' && $method === 'GET') {
                 }
             }
         }
+
+        // ?phones=1 (Call List page) — attach a dialable number per client.
+        if (($_GET['phones'] ?? '') === '1') $events = attachClientPhones($pdo, $events);
+        $events = array_map(function ($e) { unset($e['_desc']); return $e; }, $events);
 
         sendResponse('success','Events retrieved',[
             'events'              => $events,
@@ -1167,6 +1171,132 @@ function gcalListDayEvents($calendarId, $token, $date) {
         $pageToken = $evData['nextPageToken'] ?? null;
     } while ($pageToken);
     return $items;
+}
+// Phone lookup for calendar clients (Call List page). Calendar events carry
+// only a name, so the number comes from loan_accounts (LoanDisk import etc.):
+// exact/contained name match first, then a number written in the event's
+// own description, then the best fuzzy name match (>=75, flagged so staff
+// can double-check before dialling). Adds phone, phone_source, matched_name.
+function extractPhoneFromText($text) {
+    if (!$text) return null;
+    if (preg_match('/(?:\+?260|0)?\s*(9[5-7]\d|7[5-7]\d)[\s-]?(\d{3})[\s-]?(\d{3})/', $text, $m)) return '0' . $m[1] . $m[2] . $m[3];
+    return null;
+}
+// Name key shared by the phone lookup and the admin CSV upload — lowercase,
+// titles and calendar markers ("." / "," etc.) stripped.
+function clientNameKey($s) {
+    $s = strtolower(trim((string)$s));
+    $s = preg_replace('/\b(mrs|miss|mr|ms|dr)\.?\s*/', '', $s);
+    $s = preg_replace('/[^a-z ]/', ' ', $s);
+    return trim(preg_replace('/\s+/', ' ', $s));
+}
+// Digits only, Zambian numbers in 0XXXXXXXXX form (fixes 260…/260260…/9-digit).
+function normalizeClientPhone($raw) {
+    $d = preg_replace('/\D/', '', (string)$raw);
+    while (str_starts_with($d, '260260')) $d = substr($d, 3);
+    if (str_starts_with($d, '260') && strlen($d) === 12) $d = '0' . substr($d, 3);
+    if (strlen($d) === 9 && !str_starts_with($d, '0')) $d = '0' . $d;
+    return strlen($d) >= 9 ? $d : null;
+}
+function ensureClientPhonesTable($pdo) {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS client_phones (id INT AUTO_INCREMENT PRIMARY KEY, client_name VARCHAR(255) NOT NULL, name_key VARCHAR(255) NOT NULL, phone VARCHAR(20) NOT NULL, uploaded_by INT DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uniq_name_phone (name_key, phone), INDEX idx_name_key (name_key))");
+}
+// Every known number per client: admin-uploaded (client_phones, any number
+// per client) + loan_accounts + a number in the event description. If none
+// match the exact name, fall back to the closest similar name (>=75),
+// flagged 'fuzzy' so staff confirm before dialling. Adds phones[] (each
+// {number, source}), phone (first, for older callers) and matched_name.
+function attachClientPhones($pdo, $events) {
+    $byKey = [];   // name_key => ['name'=>display name, 'phones'=>[number=>source]]
+    $add = function ($name, $phone, $source) use (&$byKey) {
+        $k = clientNameKey($name); $p = normalizeClientPhone($phone);
+        if ($k === '' || !$p) return;
+        $byKey[$k]['name'] = $byKey[$k]['name'] ?? $name;
+        $byKey[$k]['phones'][$p] = $byKey[$k]['phones'][$p] ?? $source;
+    };
+    try {
+        ensureClientPhonesTable($pdo);
+        foreach ($pdo->query("SELECT client_name, phone FROM client_phones ORDER BY id")->fetchAll() as $r) $add($r['client_name'], $r['phone'], 'upload');
+    } catch (\Throwable $e) {}
+    try {
+        foreach ($pdo->query("SELECT customer_name, customer_phone FROM loan_accounts WHERE customer_phone IS NOT NULL AND customer_phone <> '' ORDER BY updated_at DESC")->fetchAll() as $r) $add($r['customer_name'], $r['customer_phone'], 'client');
+    } catch (\Throwable $e) {}
+
+    $toList = fn($phones, $fuzzy) => array_map(fn($n, $src) => ['number' => $n, 'source' => $fuzzy ? 'fuzzy' : $src], array_keys($phones), array_values($phones));
+
+    foreach ($events as &$ev) {
+        $ev['phones'] = []; $ev['matched_name'] = null;
+        $key = clientNameKey($ev['name']);
+        if ($key !== '') {
+            $phones = $byKey[$key]['phones'] ?? [];
+            $descPhone = normalizeClientPhone(extractPhoneFromText($ev['_desc'] ?? ''));
+            if ($descPhone && !isset($phones[$descPhone])) $phones[$descPhone] = 'calendar';
+            if ($phones) {
+                $ev['phones'] = $toList($phones, false);
+            } else {
+                $best = null; $bestScore = 0;
+                foreach ($byKey as $cand) {
+                    $s = loanClientNameSimilarity($ev['name'], $cand['name']);
+                    if ($s > $bestScore) { $bestScore = $s; $best = $cand; if ($s >= 90) break; }
+                }
+                if ($best && $bestScore >= 75) {
+                    $ev['phones'] = $toList($best['phones'], $bestScore < 90);
+                    $ev['matched_name'] = $best['name'];
+                }
+            }
+        }
+        $ev['phone'] = $ev['phones'][0]['number'] ?? null;
+    }
+    unset($ev);
+    return $events;
+}
+
+// Admin CSV upload of client names + phone numbers for the Call List. Adds to
+// what's there (never deletes). One client can have several numbers: put
+// them in extra columns, separate them with ; / | in one cell, or repeat the
+// name on another row. Header row optional — a column whose header mentions
+// "name" is the name, any mentioning phone/mobile/number/tel/contact are
+// numbers; without a header, column 1 is the name and the rest are numbers.
+if ($path === '/call-list/phones/import' && $method === 'POST') {
+    $user = requireAdmin($pdo);
+    if (empty($_FILES['file']['tmp_name'])) sendResponse('error','No CSV file uploaded',null,400);
+    try {
+        ensureClientPhonesTable($pdo);
+        $fh = fopen($_FILES['file']['tmp_name'], 'r');
+        $rows = [];
+        while (($r = fgetcsv($fh)) !== false) { if (array_filter($r, fn($c) => trim((string)$c) !== '')) $rows[] = $r; }
+        fclose($fh);
+        if (!$rows) sendResponse('error','The CSV file is empty',null,400);
+        $rows[0][0] = preg_replace('/^\xEF\xBB\xBF/', '', $rows[0][0]); // Excel BOM
+
+        $head = array_map(fn($h) => strtolower(trim($h)), $rows[0]);
+        $nameCol = null; $phoneCols = [];
+        foreach ($head as $i => $h) {
+            if (preg_match('/phone|mobile|number|tel|contact|cell/', $h)) $phoneCols[] = $i;
+            elseif ($nameCol === null && preg_match('/name|client|customer|borrower/', $h)) $nameCol = $i;
+        }
+        if ($nameCol !== null && $phoneCols) { array_shift($rows); }
+        else { $nameCol = 0; $phoneCols = range(1, max(1, count($rows[0]) - 1)); }
+
+        $ins = $pdo->prepare("INSERT IGNORE INTO client_phones (client_name, name_key, phone, uploaded_by) VALUES (?,?,?,?)");
+        $added = 0; $dupes = 0; $skipped = []; $clients = [];
+        foreach ($rows as $lineNo => $r) {
+            $name = trim((string)($r[$nameCol] ?? ''));
+            $key = clientNameKey($name);
+            $nums = [];
+            foreach ($phoneCols as $c) foreach (preg_split('/[;\/|]+/', (string)($r[$c] ?? '')) as $part) { $p = normalizeClientPhone($part); if ($p) $nums[] = $p; }
+            if ($key === '' || !$nums) { if (count($skipped) < 20) $skipped[] = $name !== '' ? $name : 'row '.($lineNo + 1); continue; }
+            $clients[$key] = true;
+            foreach (array_unique($nums) as $p) {
+                $ins->execute([$name, $key, $p, $user['id'] ?? null]);
+                if ($ins->rowCount()) $added++; else $dupes++;
+            }
+        }
+        logActivity($pdo, $user['id'], $user['email'], 'client_phones_imported', "Imported {$added} client phone number(s) from CSV");
+        sendResponse('success', "Imported {$added} number(s) for ".count($clients)." client(s)", [
+            'added' => $added, 'already_known' => $dupes, 'clients' => count($clients), 'skipped' => $skipped,
+        ]);
+    } catch (\Throwable $e) { sendResponse('error','Import failed: '.$e->getMessage(),null,500); }
 }
 function getGCalSettings($pdo) {
     return $pdo->query("SELECT setting_key,setting_value FROM settings WHERE setting_key IN ('google_calendar_id','google_service_account_json')")->fetchAll(\PDO::FETCH_KEY_PAIR);
