@@ -1256,50 +1256,79 @@ function attachClientPhones($pdo, $events) {
     return $events;
 }
 
-// Admin CSV upload of client names + phone numbers for the Call List. Adds to
-// what's there (never deletes). One client can have several numbers: put
-// them in extra columns, separate them with ; / | in one cell, or repeat the
-// name on another row. Header row optional — a column whose header mentions
-// "name" is the name, any mentioning phone/mobile/number/tel/contact are
-// numbers; without a header, column 1 is the name and the rest are numbers.
+// Parses a names + phone numbers CSV (a LoanDisk borrower export, or a simple
+// Name,Phone sheet). Returns ['clients'=>[name_key=>['name'=>..,'phones'=>[..]]],
+// 'skipped'=>[..], 'error'=>null|string]. Column detection by header:
+// name = "Full Name" > "Name"/"Client|Customer|Borrower Name" > First + Last
+// Name; phones = headers like Mobile / Phone / Landline / Cell / Tel /
+// Contact (never "Number of …", ids etc.). No recognisable header → column 1
+// is the name, the rest are numbers. Several numbers per client: extra phone
+// columns, ; / | in one cell, or the name repeated on another row.
+function parseClientPhonesCsv($file) {
+    $fh = fopen($file, 'r');
+    if (!$fh) return ['clients'=>[], 'skipped'=>[], 'error'=>'Could not read the file'];
+    $rows = [];
+    while (($r = fgetcsv($fh)) !== false) { if (array_filter($r, fn($c) => trim((string)$c) !== '')) $rows[] = $r; }
+    fclose($fh);
+    if (!$rows) return ['clients'=>[], 'skipped'=>[], 'error'=>'The CSV file is empty'];
+    $rows[0][0] = preg_replace('/^\xEF\xBB\xBF/', '', (string)$rows[0][0]); // Excel BOM
+
+    $head = array_map(fn($h) => strtolower(trim((string)$h)), $rows[0]);
+    $find = function ($re) use ($head) { foreach ($head as $i => $h) if (preg_match($re, $h)) return $i; return null; };
+    $nameCol  = $find('/^full\s*name$/') ?? $find('/^(name|names|client|customer|borrower|client name|customer name|borrower name)$/');
+    $firstCol = $find('/^first\s*name$/'); $lastCol = $find('/^(last\s*name|surname)$/');
+    $phoneCols = [];
+    foreach ($head as $i => $h) {
+        if (preg_match('/^number of|\bid\b|count|whatsapp group/', $h)) continue;
+        if (preg_match('/phone|mobile|landline|\bcell|\btel\b|telephone|contact|^msisdn|^whatsapp/', $h)) $phoneCols[] = $i;
+    }
+    $hasName = $nameCol !== null || $firstCol !== null;
+    if ($hasName && $phoneCols) {
+        array_shift($rows);
+    } elseif ($hasName || $phoneCols || count($rows[0]) < 2) {
+        $missing = !$hasName ? 'name column (e.g. "Full Name" or "Name")' : 'phone column (e.g. "Mobile" or "Phone")';
+        return ['clients'=>[], 'skipped'=>[], 'error'=>"This file has no {$missing}. Columns found: ".implode(', ', array_slice($rows[0], 0, 12)).'. Export it again with the client name and mobile number columns included.'];
+    } else {
+        $nameCol = 0; $phoneCols = range(1, count($rows[0]) - 1);
+    }
+
+    $clients = []; $skipped = [];
+    foreach ($rows as $lineNo => $r) {
+        $name = $nameCol !== null ? trim((string)($r[$nameCol] ?? '')) : '';
+        if ($name === '' && $firstCol !== null) $name = trim(trim((string)($r[$firstCol] ?? '')).' '.trim((string)($lastCol !== null ? ($r[$lastCol] ?? '') : '')));
+        $key = clientNameKey($name);
+        $nums = [];
+        foreach ($phoneCols as $c) foreach (preg_split('/[;\/|]+/', (string)($r[$c] ?? '')) as $part) { $p = normalizeClientPhone($part); if ($p) $nums[] = $p; }
+        if ($key === '' || !$nums) { if (count($skipped) < 20) $skipped[] = $name !== '' ? $name : 'row '.($lineNo + 2); continue; }
+        $clients[$key]['name'] = $clients[$key]['name'] ?? $name;
+        foreach ($nums as $p) $clients[$key]['phones'][$p] = true;
+    }
+    foreach ($clients as &$c) $c['phones'] = array_keys($c['phones']);
+    unset($c);
+    return ['clients'=>$clients, 'skipped'=>$skipped, 'error'=>null];
+}
+
+// Admin CSV upload of client names + phone numbers for the Call List. Only
+// ever adds (never deletes); see parseClientPhonesCsv() for the format.
 if ($path === '/call-list/phones/import' && $method === 'POST') {
     $user = requireAdmin($pdo);
     if (empty($_FILES['file']['tmp_name'])) sendResponse('error','No CSV file uploaded',null,400);
     try {
         ensureClientPhonesTable($pdo);
-        $fh = fopen($_FILES['file']['tmp_name'], 'r');
-        $rows = [];
-        while (($r = fgetcsv($fh)) !== false) { if (array_filter($r, fn($c) => trim((string)$c) !== '')) $rows[] = $r; }
-        fclose($fh);
-        if (!$rows) sendResponse('error','The CSV file is empty',null,400);
-        $rows[0][0] = preg_replace('/^\xEF\xBB\xBF/', '', $rows[0][0]); // Excel BOM
-
-        $head = array_map(fn($h) => strtolower(trim($h)), $rows[0]);
-        $nameCol = null; $phoneCols = [];
-        foreach ($head as $i => $h) {
-            if (preg_match('/phone|mobile|number|tel|contact|cell/', $h)) $phoneCols[] = $i;
-            elseif ($nameCol === null && preg_match('/name|client|customer|borrower/', $h)) $nameCol = $i;
-        }
-        if ($nameCol !== null && $phoneCols) { array_shift($rows); }
-        else { $nameCol = 0; $phoneCols = range(1, max(1, count($rows[0]) - 1)); }
+        $parsed = parseClientPhonesCsv($_FILES['file']['tmp_name']);
+        if ($parsed['error']) sendResponse('error', $parsed['error'], null, 400);
 
         $ins = $pdo->prepare("INSERT IGNORE INTO client_phones (client_name, name_key, phone, uploaded_by) VALUES (?,?,?,?)");
-        $added = 0; $dupes = 0; $skipped = []; $clients = [];
-        foreach ($rows as $lineNo => $r) {
-            $name = trim((string)($r[$nameCol] ?? ''));
-            $key = clientNameKey($name);
-            $nums = [];
-            foreach ($phoneCols as $c) foreach (preg_split('/[;\/|]+/', (string)($r[$c] ?? '')) as $part) { $p = normalizeClientPhone($part); if ($p) $nums[] = $p; }
-            if ($key === '' || !$nums) { if (count($skipped) < 20) $skipped[] = $name !== '' ? $name : 'row '.($lineNo + 1); continue; }
-            $clients[$key] = true;
-            foreach (array_unique($nums) as $p) {
-                $ins->execute([$name, $key, $p, $user['id'] ?? null]);
+        $added = 0; $dupes = 0;
+        foreach ($parsed['clients'] as $key => $c) {
+            foreach ($c['phones'] as $p) {
+                $ins->execute([$c['name'], $key, $p, $user['id'] ?? null]);
                 if ($ins->rowCount()) $added++; else $dupes++;
             }
         }
         logActivity($pdo, $user['id'], $user['email'], 'client_phones_imported', "Imported {$added} client phone number(s) from CSV");
-        sendResponse('success', "Imported {$added} number(s) for ".count($clients)." client(s)", [
-            'added' => $added, 'already_known' => $dupes, 'clients' => count($clients), 'skipped' => $skipped,
+        sendResponse('success', "Imported {$added} number(s) for ".count($parsed['clients'])." client(s)", [
+            'added' => $added, 'already_known' => $dupes, 'clients' => count($parsed['clients']), 'skipped' => $parsed['skipped'],
         ]);
     } catch (\Throwable $e) { sendResponse('error','Import failed: '.$e->getMessage(),null,500); }
 }
