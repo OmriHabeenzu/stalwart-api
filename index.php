@@ -3724,6 +3724,26 @@ if ($path === '/admin/health/metrics' && $method === 'GET') {
     $diskTotal = (int)@disk_total_space($diskPath);
     $diskFree  = (int)@disk_free_space($diskPath);
     $diskUsed  = $diskTotal - $diskFree;
+    // How much of that disk is this app's own folder (read-only size scan) —
+    // the disk figure above is the whole server, which also holds the OS,
+    // CyberPanel, backups, logs and any other sites.
+    $dirSize = function ($dir) {
+        $bytes = 0;
+        try {
+            $it = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS));
+            foreach ($it as $f) { if ($f->isFile()) $bytes += $f->getSize(); }
+        } catch (\Throwable $e) {}
+        return $bytes;
+    };
+    $appFolders = []; $appTotal = 0;
+    foreach (scandir($diskPath) ?: [] as $entry) {
+        if ($entry === '.' || $entry === '..') continue;
+        $full = $diskPath . DIRECTORY_SEPARATOR . $entry;
+        $size = is_dir($full) ? $dirSize($full) : (int)@filesize($full);
+        $appTotal += $size;
+        if (in_array($entry, ['uploads','logs','backups','vendor'], true)) $appFolders[$entry] = $size;
+        else $appFolders['other'] = ($appFolders['other'] ?? 0) + $size;
+    }
     $upPct = 100; $totalChecks = 0; $avgMs = 0;
     try {
         $total = (int)$pdo->query("SELECT COUNT(*) FROM uptime_logs WHERE checked_at >= DATE_SUB(NOW(),INTERVAL 30 DAY)")->fetchColumn();
@@ -3732,7 +3752,7 @@ if ($path === '/admin/health/metrics' && $method === 'GET') {
         $totalChecks = $total;
         $avgMs = (int)$pdo->query("SELECT COALESCE(AVG(response_time_ms),0) FROM uptime_logs WHERE checked_at >= DATE_SUB(NOW(),INTERVAL 1 DAY)")->fetchColumn();
     } catch (\Exception $e) {}
-    sendResponse('success','Metrics',['server'=>['php_version'=>phpversion(),'os'=>PHP_OS_FAMILY,'hostname'=>gethostname(),'max_upload'=>ini_get('upload_max_filesize'),'max_post'=>ini_get('post_max_size'),'extensions'=>['PDO'=>extension_loaded('pdo'),'pdo_mysql'=>extension_loaded('pdo_mysql'),'openssl'=>extension_loaded('openssl'),'curl'=>extension_loaded('curl'),'gd'=>extension_loaded('gd'),'mbstring'=>extension_loaded('mbstring'),'json'=>extension_loaded('json'),'zip'=>extension_loaded('zip')]],'memory'=>['used_bytes'=>memory_get_usage(true),'peak_bytes'=>memory_get_peak_usage(true),'limit'=>ini_get('memory_limit')],'disk'=>['total_bytes'=>$diskTotal,'free_bytes'=>$diskFree,'used_bytes'=>$diskUsed,'used_percent'=>$diskTotal>0?round(($diskUsed/$diskTotal)*100,1):0],'database'=>['status'=>'ok','version'=>$dbVersion,'name'=>$dbName,'size_bytes'=>$dbSize,'table_count'=>$tableCount],'api_response_ms'=>round((microtime(true)-$start)*1000),'uptime'=>['percent_30d'=>$upPct,'total_checks'=>$totalChecks,'avg_response_ms'=>$avgMs]]);
+    sendResponse('success','Metrics',['server'=>['php_version'=>phpversion(),'os'=>PHP_OS_FAMILY,'hostname'=>gethostname(),'max_upload'=>ini_get('upload_max_filesize'),'max_post'=>ini_get('post_max_size'),'extensions'=>['PDO'=>extension_loaded('pdo'),'pdo_mysql'=>extension_loaded('pdo_mysql'),'openssl'=>extension_loaded('openssl'),'curl'=>extension_loaded('curl'),'gd'=>extension_loaded('gd'),'mbstring'=>extension_loaded('mbstring'),'json'=>extension_loaded('json'),'zip'=>extension_loaded('zip')]],'memory'=>['used_bytes'=>memory_get_usage(true),'peak_bytes'=>memory_get_peak_usage(true),'limit'=>ini_get('memory_limit')],'disk'=>['total_bytes'=>$diskTotal,'free_bytes'=>$diskFree,'used_bytes'=>$diskUsed,'used_percent'=>$diskTotal>0?round(($diskUsed/$diskTotal)*100,1):0],'app_storage'=>['files_bytes'=>$appTotal,'folders'=>$appFolders,'database_bytes'=>$dbSize,'total_bytes'=>$appTotal+$dbSize],'database'=>['status'=>'ok','version'=>$dbVersion,'name'=>$dbName,'size_bytes'=>$dbSize,'table_count'=>$tableCount],'api_response_ms'=>round((microtime(true)-$start)*1000),'uptime'=>['percent_30d'=>$upPct,'total_checks'=>$totalChecks,'avg_response_ms'=>$avgMs]]);
 }
 
 if ($path === '/admin/uptime-logs' && $method === 'GET') {
