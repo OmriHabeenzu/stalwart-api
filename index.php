@@ -1451,7 +1451,12 @@ function gcSyncContacts($pdo) {
         $url = 'https://people.googleapis.com/v1/people/me/connections?personFields=names,phoneNumbers&pageSize=1000' . ($pageToken ? '&pageToken='.urlencode($pageToken) : '');
         [$code, $d] = gcGet($url, $tok['access_token']);
         if ($code !== 200) {
-            $err = 'Google Contacts request failed: '.($d['error']['message'] ?? "HTTP {$code}");
+            $gErr = $d['error']['message'] ?? "HTTP {$code}";
+            $err = str_contains($gErr, 'insufficient authentication scopes')
+                ? 'Contacts permission was not granted. Click Disconnect, then Connect again and tick "See and download your contacts".'
+                : (str_contains($gErr, 'People API has not been used') || str_contains($gErr, 'disabled')
+                    ? 'The People API is not enabled in Google Cloud — enable it under APIs & Services → Library, wait a few minutes, then Sync now.'
+                    : 'Google Contacts request failed: '.$gErr);
             $pdo->prepare("UPDATE google_contacts_auth SET last_error=? WHERE id=1")->execute([$err]);
             return ['ok'=>false, 'count'=>0, 'error'=>$err];
         }
@@ -1510,6 +1515,8 @@ if ($path === '/google-contacts/config' && $method === 'POST') {
     $data = getRequestData();
     $id = trim((string)($data['client_id'] ?? '')); $secret = trim((string)($data['client_secret'] ?? ''));
     if (!$id || !$secret) sendResponse('error','Client ID and Client secret are both required',null,400);
+    // Guards against browser autofill dropping a login email/password in here.
+    if (!str_ends_with($id, '.apps.googleusercontent.com')) sendResponse('error','That is not a Google Client ID — it should end in .apps.googleusercontent.com',null,400);
     try {
         gcEnsureTables($pdo);
         // A different OAuth client invalidates the old refresh token.
@@ -1555,6 +1562,9 @@ if ($path === '/google-contacts/callback' && $method === 'GET') {
         if (!empty($_GET['error'])) $page(false, 'Access was not granted ('.$_GET['error'].').');
         $tok = gcPost('https://oauth2.googleapis.com/token', ['code'=>$_GET['code'] ?? '', 'client_id'=>$a['client_id'], 'client_secret'=>$a['client_secret'], 'redirect_uri'=>gcRedirectUri(), 'grant_type'=>'authorization_code']);
         if (empty($tok['refresh_token'])) $page(false, 'Google did not return access ('.($tok['error_description'] ?? $tok['error'] ?? 'no refresh token').'). Try connecting again.');
+        // Google's consent screen lets each permission be unticked — without
+        // contacts.readonly the connection is useless, so refuse it outright.
+        if (!str_contains($tok['scope'] ?? '', 'contacts.readonly')) $page(false, 'Contacts permission was not granted. Click Connect again and tick "See and download your contacts" on the Google permission screen.');
         [, $info] = gcGet('https://www.googleapis.com/oauth2/v3/userinfo', $tok['access_token']);
         $pdo->prepare("UPDATE google_contacts_auth SET refresh_token=?, connected_email=?, last_error=NULL WHERE id=1")->execute([$tok['refresh_token'], $info['email'] ?? null]);
         $sync = gcSyncContacts($pdo);
