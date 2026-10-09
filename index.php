@@ -220,10 +220,38 @@ function requireAdmin($pdo = null) {
     if ($user['role'] !== 'admin') sendResponse('error','Forbidden',null,403);
     return $user;
 }
+// Per-user feature access (Users → Feature access). Admins always have every
+// feature; staff get only what's ticked for them. Stored in its own table so
+// login/me never depend on a users-table migration having run.
+const FEATURE_PERMISSIONS = ['clients', 'call_schedule', 'event_planner', 'call_analytics', 'staff_performance', 'call_list_admin'];
+function ensureUserPermissionsTable($pdo) {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS user_permissions (user_id INT NOT NULL, feature VARCHAR(40) NOT NULL, granted_by INT DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, feature))");
+}
+function userPermissions($pdo, $userId) {
+    static $cache = [];
+    if (isset($cache[$userId])) return $cache[$userId];
+    try {
+        $st = $pdo->prepare("SELECT feature FROM user_permissions WHERE user_id=?");
+        $st->execute([(int)$userId]);
+        $cache[$userId] = array_values(array_intersect(FEATURE_PERMISSIONS, $st->fetchAll(PDO::FETCH_COLUMN)));
+    } catch (\Throwable $e) { $cache[$userId] = []; }
+    return $cache[$userId];
+}
+function userHasPermission($pdo, $user, $feature) {
+    return ($user['role'] ?? '') === 'admin' || in_array($feature, userPermissions($pdo, $user['id'] ?? 0), true);
+}
+// Allows admins, or staff granted ANY of $features (string or array).
+function requirePermission($pdo, $features) {
+    $user = getUserFromToken();
+    if (!$user) sendResponse('error','Unauthorized',null,401);
+    foreach ((array)$features as $f) if (userHasPermission($pdo, $user, $f)) return $user;
+    sendResponse('error','Forbidden — ask an admin for access to this feature',null,403);
+}
 function requireCallManager($pdo) {
     $user = getUserFromToken();
     if (!$user) sendResponse('error','Unauthorized',null,401);
     if ($user['role'] === 'admin') return $user;
+    if (userHasPermission($pdo, $user, 'call_schedule')) return $user;
     $stmt = $pdo->prepare("SELECT can_manage_calls FROM users WHERE id = ?");
     $stmt->execute([$user['id']]);
     $row = $stmt->fetch();
@@ -414,6 +442,7 @@ if ($path === '/auth/login' && $method === 'POST') {
         if ($ip) $ip = trim(explode(',', $ip)[0]);
         try { $pdo->prepare("UPDATE users SET last_login=NOW(), last_login_ip=? WHERE id=?")->execute([$ip, $user['id']]); } catch (\Throwable $e) {}
         unset($user['password']);
+        $user['permissions'] = userPermissions($pdo, $user['id']);
         logActivity($pdo,$user['id'],$user['email'],'login','User logged in');
         sendResponse('success','Login successful',['token'=>$token,'user'=>$user]);
     } catch (\Throwable $e) { sendResponse('error','Login failed: '.$e->getMessage(),null,500); }
@@ -426,6 +455,7 @@ if ($path === '/auth/me' && $method === 'GET') {
         $stmt->execute([$user['id']]);
         $u = $stmt->fetch();
         if (!$u) sendResponse('error','User not found',null,404);
+        $u['permissions'] = userPermissions($pdo, $u['id']);
         sendResponse('success','User retrieved',['user'=>$u]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
@@ -557,6 +587,8 @@ if ($path === '/users' && $method === 'GET') {
     requireAdmin($pdo);
     try {
         $users = $pdo->query("SELECT id,name,email,role,is_active,can_manage_calls,phone,department,created_at,last_login FROM users ORDER BY name")->fetchAll();
+        foreach ($users as &$u) $u['permissions'] = userPermissions($pdo, $u['id']);
+        unset($u);
         sendResponse('success','Users retrieved',['users'=>$users]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
@@ -570,10 +602,20 @@ if ($path === '/users/staff' && $method === 'GET') {
 }
 
 if (preg_match('#^/users/(\d+)$#',$path,$m) && $method === 'PUT') {
-    requireAdmin($pdo);
+    $admin = requireAdmin($pdo);
     $uid = (int)$m[1];
     $data = getRequestData();
     try {
+        // Feature access: replace this user's granted features with the list sent.
+        if (isset($data['permissions']) && is_array($data['permissions'])) {
+            ensureUserPermissionsTable($pdo);
+            $grant = array_values(array_intersect(FEATURE_PERMISSIONS, $data['permissions']));
+            $pdo->prepare("DELETE FROM user_permissions WHERE user_id=?")->execute([$uid]);
+            $ins = $pdo->prepare("INSERT INTO user_permissions (user_id, feature, granted_by) VALUES (?,?,?)");
+            foreach ($grant as $f) $ins->execute([$uid, $f, $admin['id'] ?? null]);
+            logActivity($pdo, $admin['id'], $admin['email'], 'user_permissions_updated', "Feature access for user #{$uid}: ".($grant ? implode(', ', $grant) : 'none'));
+            if (count(array_diff(array_keys($data), ['permissions'])) === 0) sendResponse('success','Feature access updated',['permissions'=>$grant]);
+        }
         $fields = []; $vals = [];
         if (isset($data['name']))             { $fields[]='name=?';             $vals[]=$data['name']; }
         if (isset($data['email']))            { $fields[]='email=?';            $vals[]=$data['email']; }
@@ -1335,7 +1377,7 @@ function parseClientPhonesCsv($file) {
 // Admin CSV upload of client names + phone numbers for the Call List. Only
 // ever adds (never deletes); see parseClientPhonesCsv() for the format.
 if ($path === '/call-list/phones/import' && $method === 'POST') {
-    $user = requireAdmin($pdo);
+    $user = requirePermission($pdo, 'call_list_admin');
     if (empty($_FILES['file']['tmp_name'])) sendResponse('error','No CSV file uploaded',null,400);
     try {
         ensureClientPhonesTable($pdo);
@@ -1383,7 +1425,7 @@ if ($path === '/call-list/phones/update' && $method === 'POST') {
 // List. Hides it whatever its source (calendar, client record, CSV, staff
 // update) via the same removed flag, so a later CSV upload won't bring it back.
 if ($path === '/call-list/phones/delete' && $method === 'POST') {
-    $user = requireAdmin($pdo);
+    $user = requirePermission($pdo, 'call_list_admin');
     $data = getRequestData();
     $name = trim((string)($data['client_name'] ?? ''));
     $key  = clientNameKey($name);
@@ -1495,7 +1537,7 @@ function gcMaybeAutoSync($pdo) {
 }
 
 if ($path === '/google-contacts/status' && $method === 'GET') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'call_list_admin');
     try {
         $a = gcAuthRow($pdo);
         sendResponse('success','Status',[
@@ -1511,7 +1553,7 @@ if ($path === '/google-contacts/status' && $method === 'GET') {
 }
 
 if ($path === '/google-contacts/config' && $method === 'POST') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'call_list_admin');
     $data = getRequestData();
     $id = trim((string)($data['client_id'] ?? '')); $secret = trim((string)($data['client_secret'] ?? ''));
     if (!$id || !$secret) sendResponse('error','Client ID and Client secret are both required',null,400);
@@ -1526,7 +1568,7 @@ if ($path === '/google-contacts/config' && $method === 'POST') {
 }
 
 if ($path === '/google-contacts/auth-url' && $method === 'POST') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'call_list_admin');
     try {
         $a = gcAuthRow($pdo);
         if (empty($a['client_id'])) sendResponse('error','Save the Google Client ID and secret first',null,400);
@@ -1573,7 +1615,7 @@ if ($path === '/google-contacts/callback' && $method === 'GET') {
 }
 
 if ($path === '/google-contacts/sync' && $method === 'POST') {
-    $user = requireAdmin($pdo);
+    $user = requirePermission($pdo, 'call_list_admin');
     try {
         $r = gcSyncContacts($pdo);
         if (!$r['ok']) sendResponse('error', $r['error'], null, 400);
@@ -1583,7 +1625,7 @@ if ($path === '/google-contacts/sync' && $method === 'POST') {
 }
 
 if ($path === '/google-contacts/disconnect' && $method === 'POST') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'call_list_admin');
     try {
         gcEnsureTables($pdo);
         $pdo->exec("UPDATE google_contacts_auth SET refresh_token=NULL, connected_email=NULL WHERE id=1");
@@ -1602,15 +1644,38 @@ if ($path === '/google-contacts/disconnect' && $method === 'POST') {
 // The API key lives in its own table (GET /settings is readable by all staff).
 // Every send is logged in sms_log; staff are warned before texting the same
 // client twice on one day.
-define('SMS_DEFAULT_FOLLOW_UP', 'Hi, this is Stalwart Services, your loan is due today, I am making a follow up on your loan repayment.');
+// {name} = the client's full name, {first_name} = first name only (both tidied
+// from the calendar title — markers like "." / "," removed, Title Case).
+define('SMS_DEFAULT_FOLLOW_UP', "Hello {name},\n\nGood day. Hope you're well.\n\nThis is just a follow-up on your remittance. Can we expect a payment today? Kindly advise.\n\nYour guidance will be highly appreciated. We value your business.\n\nBest Regards.\n\nhttps://Stalwartzm.com");
+// The first template — anyone who saved settings before {name} existed has it
+// stored verbatim; treat that as "use the default" so they get the new one.
+define('SMS_OLD_DEFAULT_FOLLOW_UP', 'Hi, this is Stalwart Services, your loan is due today, I am making a follow up on your loan repayment.');
 
 function smsEnsureTables($pdo) {
     $pdo->exec("CREATE TABLE IF NOT EXISTS sms_settings (id TINYINT PRIMARY KEY, api_key VARCHAR(255) DEFAULT NULL, sender_id VARCHAR(20) DEFAULT NULL, follow_up_message VARCHAR(480) DEFAULT NULL, updated_at DATETIME DEFAULT NULL)");
     $pdo->exec("INSERT IGNORE INTO sms_settings (id) VALUES (1)");
+    // Admin On/Off for the SMS option on the Call List (WhatsApp stays either way).
+    try { $pdo->exec("ALTER TABLE sms_settings ADD COLUMN sms_enabled TINYINT(1) NOT NULL DEFAULT 1"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE sms_settings MODIFY follow_up_message VARCHAR(960) DEFAULT NULL"); } catch (\Throwable $e) {}
+    try { $pdo->exec("ALTER TABLE sms_log MODIFY message VARCHAR(960) NOT NULL"); } catch (\Throwable $e) {}
     $pdo->exec("CREATE TABLE IF NOT EXISTS sms_log (id INT AUTO_INCREMENT PRIMARY KEY, client_name VARCHAR(255) NOT NULL, name_key VARCHAR(255) NOT NULL, phone VARCHAR(20) NOT NULL, message VARCHAR(480) NOT NULL, status VARCHAR(10) NOT NULL, http_code INT DEFAULT NULL, response_text VARCHAR(500) DEFAULT NULL, sent_by INT DEFAULT NULL, sent_by_name VARCHAR(255) DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, INDEX idx_sms_day (created_at), INDEX idx_sms_key (name_key))");
 }
 function smsSettings($pdo) { smsEnsureTables($pdo); return $pdo->query("SELECT * FROM sms_settings WHERE id=1")->fetch(); }
-function smsFollowUpMessage($s) { return trim((string)($s['follow_up_message'] ?? '')) ?: SMS_DEFAULT_FOLLOW_UP; }
+function smsFollowUpMessage($s) {
+    $m = trim((string)($s['follow_up_message'] ?? ''));
+    return ($m === '' || $m === SMS_OLD_DEFAULT_FOLLOW_UP) ? SMS_DEFAULT_FOLLOW_UP : $m;
+}
+// "curren machona." / "MACHONA, Curren" → "Curren Machona" / "Machona Curren".
+function smsDisplayName($raw) {
+    $n = preg_replace('/[.,;:]+/', ' ', (string)$raw);
+    $n = trim(preg_replace('/\s+/', ' ', $n));
+    return ucwords(strtolower($n), " -'");
+}
+function smsRenderMessage($template, $clientName) {
+    $full = smsDisplayName($clientName);
+    $first = explode(' ', preg_replace('/^(mrs|miss|mr|ms|dr)\s+/i', '', $full))[0] ?? $full;
+    return str_replace(['{name}', '{first_name}'], [$full !== '' ? $full : 'Sir/Madam', $first !== '' ? $first : 'Sir/Madam'], $template);
+}
 // 0977123456 → 260977123456 (Zamtel wants the full MSISDN, no "+").
 function smsMsisdn($raw) {
     $p = normalizeClientPhone($raw);
@@ -1645,9 +1710,10 @@ if ($path === '/sms/status' && $method === 'GET') {
         $st = $pdo->prepare("SELECT name_key, phone, status, sent_by_name, created_at FROM sms_log WHERE DATE(created_at)=? ORDER BY id");
         $st->execute([$date]);
         sendResponse('success','SMS status',[
-            'enabled' => !empty($s['api_key']) && !empty($s['sender_id']),
-            'message' => smsFollowUpMessage($s),
-            'sent'    => $st->fetchAll(),
+            'sms_on'     => (int)($s['sms_enabled'] ?? 1) === 1,
+            'enabled'    => (int)($s['sms_enabled'] ?? 1) === 1 && !empty($s['api_key']) && !empty($s['sender_id']), // server-side sending available
+            'message'    => smsFollowUpMessage($s), // template with {name}/{first_name}
+            'sent'       => $st->fetchAll(),
         ]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
@@ -1663,12 +1729,13 @@ if ($path === '/sms/send' && $method === 'POST') {
     try {
         $s = smsSettings($pdo);
         if (empty($s['api_key']) || empty($s['sender_id'])) sendResponse('error','SMS sending is not set up yet — an admin needs to add the Zamtel API key and sender ID',null,400);
+        if ((int)($s['sms_enabled'] ?? 1) !== 1) sendResponse('error','SMS is switched off by an admin',null,403);
         if (empty($data['force'])) {
             $dup = $pdo->prepare("SELECT sent_by_name, created_at FROM sms_log WHERE name_key=? AND status='sent' AND DATE(created_at)=CURDATE() ORDER BY id DESC LIMIT 1");
             $dup->execute([$key]);
             if ($row = $dup->fetch()) sendResponse('error', "Already texted today by {$row['sent_by_name']} at ".date('H:i', strtotime($row['created_at'])), ['already_sent'=>true], 409);
         }
-        $message = smsFollowUpMessage($s);
+        $message = smsRenderMessage(smsFollowUpMessage($s), $name);
         $r = zamtelSendSms($s['api_key'], $s['sender_id'], $msisdn, $message);
         $by = smsUserName($pdo, $user);
         $pdo->prepare("INSERT INTO sms_log (client_name, name_key, phone, message, status, http_code, response_text, sent_by, sent_by_name) VALUES (?,?,?,?,?,?,?,?,?)")
@@ -1680,7 +1747,7 @@ if ($path === '/sms/send' && $method === 'POST') {
 
 // Admin: SMS settings (the key itself is never sent back to the browser).
 if ($path === '/sms/settings' && $method === 'GET') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'call_list_admin');
     try {
         $s = smsSettings($pdo);
         sendResponse('success','SMS settings',[
@@ -1689,19 +1756,20 @@ if ($path === '/sms/settings' && $method === 'GET') {
             'sender_id' => $s['sender_id'],
             'message'   => smsFollowUpMessage($s),
             'default_message' => SMS_DEFAULT_FOLLOW_UP,
+            'sms_on'    => (int)($s['sms_enabled'] ?? 1) === 1,
         ]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
 if ($path === '/sms/settings' && $method === 'POST') {
-    $user = requireAdmin($pdo);
+    $user = requirePermission($pdo, 'call_list_admin');
     $data = getRequestData();
     $apiKey = trim((string)($data['api_key'] ?? ''));
     $sender = trim((string)($data['sender_id'] ?? ''));
     $message = trim((string)($data['message'] ?? ''));
     if ($sender === '' || strlen($sender) > 11) sendResponse('error','Sender ID is required (max 11 characters, e.g. STALWART)',null,400);
     if ($apiKey !== '' && (strlen($apiKey) < 16 || str_contains($apiKey, '@') || preg_match('/\s/', $apiKey))) sendResponse('error','That does not look like a Zamtel API key (check your browser has not auto-filled a password)',null,400);
-    if (mb_strlen($message) > 480) sendResponse('error','Message is too long (max 480 characters)',null,400);
+    if (mb_strlen($message) > 960) sendResponse('error','Message is too long (max 960 characters)',null,400);
     try {
         smsEnsureTables($pdo);
         $pdo->prepare("UPDATE sms_settings SET api_key=IF(?='', api_key, ?), sender_id=?, follow_up_message=?, updated_at=NOW() WHERE id=1")
@@ -1711,8 +1779,20 @@ if ($path === '/sms/settings' && $method === 'POST') {
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
+// Admin: switch the SMS option on the Call List on or off.
+if ($path === '/sms/toggle' && $method === 'POST') {
+    $user = requirePermission($pdo, 'call_list_admin');
+    $on = !empty(getRequestData()['enabled']) ? 1 : 0;
+    try {
+        smsEnsureTables($pdo);
+        $pdo->prepare("UPDATE sms_settings SET sms_enabled=?, updated_at=NOW() WHERE id=1")->execute([$on]);
+        logActivity($pdo, $user['id'], $user['email'], 'sms_toggled', 'SMS on the Call List switched '.($on ? 'ON' : 'OFF'));
+        sendResponse('success', $on ? 'SMS switched on' : 'SMS switched off', ['sms_on'=>(bool)$on]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
 if ($path === '/sms/balance' && $method === 'GET') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'call_list_admin');
     try {
         $s = smsSettings($pdo);
         if (empty($s['api_key'])) sendResponse('error','No Zamtel API key saved yet',null,400);
@@ -1727,7 +1807,7 @@ if ($path === '/sms/balance' && $method === 'GET') {
 
 // Admin: one test SMS to a number of their choice (logged like any other).
 if ($path === '/sms/test' && $method === 'POST') {
-    $user = requireAdmin($pdo);
+    $user = requirePermission($pdo, 'call_list_admin');
     $data = getRequestData();
     $msisdn = smsMsisdn($data['number'] ?? '');
     if (!$msisdn) sendResponse('error','Enter a valid phone number',null,400);
@@ -1819,7 +1899,7 @@ function updateDateInDesc($desc,$newDate) {
 // EVENT PLANNER — list events (write scope)
 // ==========================================
 if ($path === '/planner/events' && $method === 'GET') {
-    requireAdmin($pdo);
+    requirePermission($pdo, ['event_planner','clients']);
     try {
         $cfg = getGCalSettings($pdo);
         $calendarId = $cfg['google_calendar_id'] ?? '';
@@ -1853,7 +1933,7 @@ if ($path === '/planner/events' && $method === 'GET') {
 // EVENT PLANNER — reschedule events
 // ==========================================
 if ($path === '/planner/reschedule' && $method === 'POST') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'event_planner');
     try {
         // Frontend sends one event at a time — no sleep needed here; delay is handled client-side
         $body = json_decode(file_get_contents('php://input'), true);
@@ -2010,7 +2090,7 @@ if ($path === '/planner/auto-reschedule' && $method === 'GET') {
 // EVENT PLANNER — loans (balances)
 // ==========================================
 if ($path === '/planner/loans' && $method === 'GET') {
-    requireAdmin($pdo);
+    requirePermission($pdo, ['event_planner','clients']);
     try {
         $cfg = getGCalSettings($pdo);
         $calendarId = $cfg['google_calendar_id'] ?? '';
@@ -2058,7 +2138,7 @@ if ($path === '/planner/loans' && $method === 'GET') {
 // EVENT PLANNER — update loan balances
 // ==========================================
 if ($path === '/planner/loans/update' && $method === 'POST') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'event_planner');
     // Default max_execution_time (often 30s) could cut this off partway
     // through a larger batch — each loan takes up to ~15s worst case
     // (its own curl timeout) plus a 0.2s pause, so a batch of even a
@@ -3345,7 +3425,7 @@ if ($path === '/clients/quick-search' && $method === 'GET') {
 
 // Admin loan routes
 if ($path === '/loans/admin/accounts' && $method === 'GET') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'clients');
     try {
         $status = $_GET['status']??'';
         $sql = "SELECT * FROM loan_accounts";
@@ -3356,7 +3436,7 @@ if ($path === '/loans/admin/accounts' && $method === 'GET') {
 }
 
 if ($path === '/loans/admin/accounts' && $method === 'POST') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'clients');
     $data = getRequestData();
     try {
         $pdo->prepare("INSERT INTO loan_accounts (loan_reference,customer_name,customer_phone,customer_email,national_id_last4,loan_amount,total_repayable,amount_paid,outstanding_balance,monthly_installment,loan_status,disbursement_date,maturity_date) VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?)")
@@ -3392,7 +3472,7 @@ function loanClientNameSimilarity($name1, $name2) {
 }
 
 if ($path === '/loans/admin/accounts/sync-calendar' && $method === 'POST') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'clients');
     try {
         $cfg = getGCalSettings($pdo);
         $calendarId = $cfg['google_calendar_id'] ?? '';
@@ -3484,7 +3564,7 @@ if ($path === '/loans/admin/accounts/sync-calendar' && $method === 'POST') {
 // repeatedly (e.g. after adding more history to the calendar) without
 // duplicating clients already imported.
 if ($path === '/loans/admin/accounts/import-calendar-all' && $method === 'POST') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'clients');
     set_time_limit(300);
     try {
         $cfg = getGCalSettings($pdo);
@@ -3583,7 +3663,7 @@ if ($path === '/loans/admin/accounts/import-calendar-all' && $method === 'POST')
 // the calendar imports: existing clients only get blank contact fields
 // filled in, never overwritten; only genuinely new names get a new row.
 if ($path === '/loans/admin/accounts/import-loandisk-csv' && $method === 'POST') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'clients');
     set_time_limit(300);
     try {
         if (empty($_FILES['file']['tmp_name'])) sendResponse('error','No file uploaded',null,400);
@@ -3709,7 +3789,7 @@ if ($path === '/loans/admin/accounts/import-loandisk-csv' && $method === 'POST')
 }
 
 if (preg_match('#^/loans/admin/payments/(\d+)/confirm$#',$path,$m) && $method === 'PUT') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'clients');
     try {
         $stmt=$pdo->prepare("SELECT * FROM loan_payments WHERE id=? AND status='pending'"); $stmt->execute([$m[1]]);
         $payment=$stmt->fetch();
@@ -3726,7 +3806,7 @@ if (preg_match('#^/loans/admin/payments/(\d+)/confirm$#',$path,$m) && $method ==
 // CLIENT PROFILES (admin)
 // ==========================================
 if (preg_match('#^/loans/admin/accounts/(\d+)$#',$path,$m) && $method === 'GET') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'clients');
     try {
         $stmt = $pdo->prepare("SELECT * FROM loan_accounts WHERE id=?");
         $stmt->execute([$m[1]]);
@@ -3741,7 +3821,7 @@ if (preg_match('#^/loans/admin/accounts/(\d+)$#',$path,$m) && $method === 'GET')
 }
 
 if (preg_match('#^/loans/admin/accounts/(\d+)$#',$path,$m) && $method === 'PUT') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'clients');
     $data = getRequestData();
     try {
         $stmt=$pdo->prepare("SELECT id FROM loan_accounts WHERE id=?"); $stmt->execute([$m[1]]);
@@ -3757,7 +3837,7 @@ if (preg_match('#^/loans/admin/accounts/(\d+)$#',$path,$m) && $method === 'PUT')
 }
 
 if (preg_match('#^/loans/admin/accounts/(\d+)/status$#',$path,$m) && $method === 'PUT') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'clients');
     $data = getRequestData();
     $action = $data['action'] ?? '';
     if (!in_array($action, ['approve','reject','mark_paid'])) sendResponse('error','Invalid action',null,400);
@@ -3816,7 +3896,7 @@ function saveClientDocument($file) {
 }
 
 if (preg_match('#^/loans/admin/accounts/(\d+)/documents$#',$path,$m) && $method === 'POST') {
-    $user = requireAdmin($pdo);
+    $user = requirePermission($pdo, 'clients');
     try {
         $stmt=$pdo->prepare("SELECT id FROM loan_accounts WHERE id=?"); $stmt->execute([$m[1]]);
         if (!$stmt->fetch()) sendResponse('error','Client not found',null,404);
@@ -3831,7 +3911,7 @@ if (preg_match('#^/loans/admin/accounts/(\d+)/documents$#',$path,$m) && $method 
 }
 
 if (preg_match('#^/loans/admin/documents/(\d+)$#',$path,$m) && $method === 'DELETE') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'clients');
     try {
         $stmt=$pdo->prepare("SELECT * FROM client_documents WHERE id=?"); $stmt->execute([$m[1]]);
         $doc=$stmt->fetch();
@@ -3993,7 +4073,7 @@ if (preg_match('#^/users/(\d+)$#',$path,$m) && $method === 'DELETE') {
 // ANALYTICS STAFF + CALLS
 // ==========================================
 if ($path === '/analytics/calls' && $method === 'GET') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'call_analytics');
     $month=$_GET['month']??date('Y-m'); [$year,$mon]=explode('-',$month);
     try {
         $summary=$pdo->prepare("SELECT COUNT(*) AS total_reports,COALESCE(SUM(total_count),0) AS total_calls,COALESCE(SUM(answered_count),0) AS answered_calls,COALESCE(SUM(unanswered_count),0) AS unanswered_calls,COALESCE(SUM(phone_off_count),0) AS phone_off_calls FROM call_reports WHERE YEAR(report_date)=? AND MONTH(report_date)=?");
@@ -4008,7 +4088,7 @@ if ($path === '/analytics/calls' && $method === 'GET') {
 }
 
 if ($path === '/analytics/staff' && $method === 'GET') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'staff_performance');
     $month=$_GET['month']??date('Y-m'); [$year,$mon]=explode('-',$month);
     try {
         $users=$pdo->query("SELECT id,name,email,role FROM users WHERE is_active=1 ORDER BY name")->fetchAll();
@@ -4057,7 +4137,7 @@ if ($path === '/analytics/staff' && $method === 'GET') {
 }
 
 if ($path === '/analytics/staff/archive' && $method === 'GET') {
-    requireAdmin($pdo);
+    requirePermission($pdo, 'staff_performance');
     try {
         $months=$pdo->query("SELECT DISTINCT DATE_FORMAT(report_date,'%Y-%m') AS month FROM call_reports ORDER BY month ASC")->fetchAll(PDO::FETCH_COLUMN);
         $users=$pdo->query("SELECT id,name,email,role FROM users WHERE is_active=1 ORDER BY name")->fetchAll();
