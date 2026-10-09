@@ -1656,6 +1656,10 @@ function smsEnsureTables($pdo) {
     $pdo->exec("INSERT IGNORE INTO sms_settings (id) VALUES (1)");
     // Admin On/Off for the SMS option on the Call List (WhatsApp stays either way).
     try { $pdo->exec("ALTER TABLE sms_settings ADD COLUMN sms_enabled TINYINT(1) NOT NULL DEFAULT 1"); } catch (\Throwable $e) {}
+    // How "Send message → SMS" works: 'phone' opens the staff member's own
+    // Messages app with the text ready (they pick the SIM and tap Send, like
+    // WhatsApp); 'zamtel' sends straight from the server via Zamtel Bulk SMS.
+    try { $pdo->exec("ALTER TABLE sms_settings ADD COLUMN sms_mode VARCHAR(10) NOT NULL DEFAULT 'phone'"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE sms_settings MODIFY follow_up_message VARCHAR(960) DEFAULT NULL"); } catch (\Throwable $e) {}
     try { $pdo->exec("ALTER TABLE sms_log MODIFY message VARCHAR(960) NOT NULL"); } catch (\Throwable $e) {}
     $pdo->exec("CREATE TABLE IF NOT EXISTS sms_log (id INT AUTO_INCREMENT PRIMARY KEY, client_name VARCHAR(255) NOT NULL, name_key VARCHAR(255) NOT NULL, phone VARCHAR(20) NOT NULL, message VARCHAR(480) NOT NULL, status VARCHAR(10) NOT NULL, http_code INT DEFAULT NULL, response_text VARCHAR(500) DEFAULT NULL, sent_by INT DEFAULT NULL, sent_by_name VARCHAR(255) DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, INDEX idx_sms_day (created_at), INDEX idx_sms_key (name_key))");
@@ -1718,7 +1722,9 @@ if ($path === '/sms/status' && $method === 'GET') {
         $st->execute([$date]);
         sendResponse('success','SMS status',[
             'sms_on'     => (int)($s['sms_enabled'] ?? 1) === 1,
-            'enabled'    => (int)($s['sms_enabled'] ?? 1) === 1 && !empty($s['api_key']) && !empty($s['sender_id']), // server-side sending available
+            'mode'       => ($s['sms_mode'] ?? 'phone') === 'zamtel' ? 'zamtel' : 'phone',
+            // true only when SMS goes straight from the server (Zamtel mode + configured)
+            'enabled'    => (int)($s['sms_enabled'] ?? 1) === 1 && ($s['sms_mode'] ?? 'phone') === 'zamtel' && !empty($s['api_key']) && !empty($s['sender_id']),
             'message'    => smsFollowUpMessage($s), // template with {name}/{first_name}
             'sent'       => $st->fetchAll(),
         ]);
@@ -1737,6 +1743,7 @@ if ($path === '/sms/send' && $method === 'POST') {
         $s = smsSettings($pdo);
         if (empty($s['api_key']) || empty($s['sender_id'])) sendResponse('error','SMS sending is not set up yet — an admin needs to add the Zamtel API key and sender ID',null,400);
         if ((int)($s['sms_enabled'] ?? 1) !== 1) sendResponse('error','SMS is switched off by an admin',null,403);
+        if (($s['sms_mode'] ?? 'phone') !== 'zamtel') sendResponse('error','SMS is set to send from staff phones, not Zamtel',null,400);
         if (empty($data['force'])) {
             $dup = $pdo->prepare("SELECT sent_by_name, created_at FROM sms_log WHERE name_key=? AND status='sent' AND DATE(created_at)=CURDATE() ORDER BY id DESC LIMIT 1");
             $dup->execute([$key]);
@@ -1764,6 +1771,7 @@ if ($path === '/sms/settings' && $method === 'GET') {
             'message'   => smsFollowUpMessage($s),
             'default_message' => SMS_DEFAULT_FOLLOW_UP,
             'sms_on'    => (int)($s['sms_enabled'] ?? 1) === 1,
+            'mode'      => ($s['sms_mode'] ?? 'phone') === 'zamtel' ? 'zamtel' : 'phone',
         ]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
@@ -1783,6 +1791,18 @@ if ($path === '/sms/settings' && $method === 'POST') {
             ->execute([$apiKey, $apiKey, $sender, $message !== '' ? $message : null]);
         logActivity($pdo, $user['id'], $user['email'], 'sms_settings_updated', 'Updated Zamtel SMS settings'.($apiKey !== '' ? ' (new API key)' : ''));
         sendResponse('success','Saved');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+// Admin: choose how SMS is sent — 'phone' (staff's own Messages app) or 'zamtel'.
+if ($path === '/sms/mode' && $method === 'POST') {
+    $user = requirePermission($pdo, 'call_list_admin');
+    $mode = (getRequestData()['mode'] ?? '') === 'zamtel' ? 'zamtel' : 'phone';
+    try {
+        smsEnsureTables($pdo);
+        $pdo->prepare("UPDATE sms_settings SET sms_mode=?, updated_at=NOW() WHERE id=1")->execute([$mode]);
+        logActivity($pdo, $user['id'], $user['email'], 'sms_mode_changed', 'SMS now sent via '.($mode === 'zamtel' ? 'Zamtel' : 'staff phones'));
+        sendResponse('success', $mode === 'zamtel' ? 'SMS will be sent by Zamtel' : 'SMS will open the staff member\'s Messages app', ['mode'=>$mode]);
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
 
