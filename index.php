@@ -1591,6 +1591,157 @@ if ($path === '/google-contacts/disconnect' && $method === 'POST') {
         sendResponse('success','Disconnected');
     } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
 }
+
+// ==========================================
+// ZAMTEL BULK SMS — follow-up SMS sent straight from the server
+// ==========================================
+// Zamtel BulkSMS HTTP API v2.1: GET
+//   https://bulksms.zamtel.co.zm/api/v2.1/action/send/api_key/{key}/contacts/{2609…}/senderId/{id}/message/{urlencoded}
+// → 202 {"success":true,...} when queued, 422 {"success":false,"responseText":...}
+// on a bad key/sender or number. Balance: /api/sms/balance?key=…
+// The API key lives in its own table (GET /settings is readable by all staff).
+// Every send is logged in sms_log; staff are warned before texting the same
+// client twice on one day.
+define('SMS_DEFAULT_FOLLOW_UP', 'Hi, this is Stalwart Services, your loan is due today, I am making a follow up on your loan repayment.');
+
+function smsEnsureTables($pdo) {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS sms_settings (id TINYINT PRIMARY KEY, api_key VARCHAR(255) DEFAULT NULL, sender_id VARCHAR(20) DEFAULT NULL, follow_up_message VARCHAR(480) DEFAULT NULL, updated_at DATETIME DEFAULT NULL)");
+    $pdo->exec("INSERT IGNORE INTO sms_settings (id) VALUES (1)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS sms_log (id INT AUTO_INCREMENT PRIMARY KEY, client_name VARCHAR(255) NOT NULL, name_key VARCHAR(255) NOT NULL, phone VARCHAR(20) NOT NULL, message VARCHAR(480) NOT NULL, status VARCHAR(10) NOT NULL, http_code INT DEFAULT NULL, response_text VARCHAR(500) DEFAULT NULL, sent_by INT DEFAULT NULL, sent_by_name VARCHAR(255) DEFAULT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, INDEX idx_sms_day (created_at), INDEX idx_sms_key (name_key))");
+}
+function smsSettings($pdo) { smsEnsureTables($pdo); return $pdo->query("SELECT * FROM sms_settings WHERE id=1")->fetch(); }
+function smsFollowUpMessage($s) { return trim((string)($s['follow_up_message'] ?? '')) ?: SMS_DEFAULT_FOLLOW_UP; }
+// 0977123456 → 260977123456 (Zamtel wants the full MSISDN, no "+").
+function smsMsisdn($raw) {
+    $p = normalizeClientPhone($raw);
+    if (!$p) return null;
+    return (strlen($p) === 10 && $p[0] === '0') ? '260' . substr($p, 1) : $p;
+}
+// Returns ['ok'=>bool, 'code'=>int, 'text'=>string].
+function zamtelSendSms($apiKey, $senderId, $msisdn, $message) {
+    $url = 'https://bulksms.zamtel.co.zm/api/v2.1/action/send/api_key/' . rawurlencode($apiKey)
+         . '/contacts/' . rawurlencode($msisdn) . '/senderId/' . rawurlencode($senderId)
+         . '/message/' . rawurlencode($message);
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER=>true, CURLOPT_TIMEOUT=>20, CURLOPT_CONNECTTIMEOUT=>10]);
+    $res = curl_exec($ch); $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE); $cerr = curl_error($ch); curl_close($ch);
+    if ($res === false) return ['ok'=>false, 'code'=>0, 'text'=>'Could not reach Zamtel: '.$cerr];
+    $d = json_decode((string)$res, true);
+    $ok = ($code >= 200 && $code < 300) && (!is_array($d) || !empty($d['success']));
+    return ['ok'=>$ok, 'code'=>$code, 'text'=>is_array($d) ? (string)($d['responseText'] ?? $res) : substr((string)$res, 0, 300)];
+}
+function smsUserName($pdo, $user) {
+    try { $s = $pdo->prepare("SELECT name FROM users WHERE id=?"); $s->execute([$user['id'] ?? 0]); return $s->fetchColumn() ?: ($user['email'] ?? 'Unknown'); }
+    catch (\Throwable $e) { return $user['email'] ?? 'Unknown'; }
+}
+
+// Staff: whether server-side SMS is on, the message text, and today's sends
+// (so the Call List can show "Sent ✓" and warn before a second text).
+if ($path === '/sms/status' && $method === 'GET') {
+    requireAuth($pdo);
+    try {
+        $s = smsSettings($pdo);
+        $date = $_GET['date'] ?? date('Y-m-d');
+        $st = $pdo->prepare("SELECT name_key, phone, status, sent_by_name, created_at FROM sms_log WHERE DATE(created_at)=? ORDER BY id");
+        $st->execute([$date]);
+        sendResponse('success','SMS status',[
+            'enabled' => !empty($s['api_key']) && !empty($s['sender_id']),
+            'message' => smsFollowUpMessage($s),
+            'sent'    => $st->fetchAll(),
+        ]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+// Staff: send the follow-up SMS to one client number.
+if ($path === '/sms/send' && $method === 'POST') {
+    $user = requireAuth($pdo);
+    $data = getRequestData();
+    $name = trim((string)($data['client_name'] ?? ''));
+    $key = clientNameKey($name);
+    $msisdn = smsMsisdn($data['number'] ?? '');
+    if ($key === '' || !$msisdn) sendResponse('error','Client name and a valid number are required',null,400);
+    try {
+        $s = smsSettings($pdo);
+        if (empty($s['api_key']) || empty($s['sender_id'])) sendResponse('error','SMS sending is not set up yet — an admin needs to add the Zamtel API key and sender ID',null,400);
+        if (empty($data['force'])) {
+            $dup = $pdo->prepare("SELECT sent_by_name, created_at FROM sms_log WHERE name_key=? AND status='sent' AND DATE(created_at)=CURDATE() ORDER BY id DESC LIMIT 1");
+            $dup->execute([$key]);
+            if ($row = $dup->fetch()) sendResponse('error', "Already texted today by {$row['sent_by_name']} at ".date('H:i', strtotime($row['created_at'])), ['already_sent'=>true], 409);
+        }
+        $message = smsFollowUpMessage($s);
+        $r = zamtelSendSms($s['api_key'], $s['sender_id'], $msisdn, $message);
+        $by = smsUserName($pdo, $user);
+        $pdo->prepare("INSERT INTO sms_log (client_name, name_key, phone, message, status, http_code, response_text, sent_by, sent_by_name) VALUES (?,?,?,?,?,?,?,?,?)")
+            ->execute([$name, $key, $msisdn, $message, $r['ok'] ? 'sent' : 'failed', $r['code'], substr($r['text'], 0, 500), $user['id'] ?? null, $by]);
+        if (!$r['ok']) sendResponse('error', 'SMS not sent: '.$r['text'], null, 502);
+        sendResponse('success', 'SMS sent', ['sent_by_name'=>$by, 'phone'=>$msisdn]);
+    } catch (\Throwable $e) { sendResponse('error','Failed to send SMS: '.$e->getMessage(),null,500); }
+}
+
+// Admin: SMS settings (the key itself is never sent back to the browser).
+if ($path === '/sms/settings' && $method === 'GET') {
+    requireAdmin($pdo);
+    try {
+        $s = smsSettings($pdo);
+        sendResponse('success','SMS settings',[
+            'has_key'   => !empty($s['api_key']),
+            'key_hint'  => !empty($s['api_key']) ? '••••' . substr($s['api_key'], -4) : null,
+            'sender_id' => $s['sender_id'],
+            'message'   => smsFollowUpMessage($s),
+            'default_message' => SMS_DEFAULT_FOLLOW_UP,
+        ]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if ($path === '/sms/settings' && $method === 'POST') {
+    $user = requireAdmin($pdo);
+    $data = getRequestData();
+    $apiKey = trim((string)($data['api_key'] ?? ''));
+    $sender = trim((string)($data['sender_id'] ?? ''));
+    $message = trim((string)($data['message'] ?? ''));
+    if ($sender === '' || strlen($sender) > 11) sendResponse('error','Sender ID is required (max 11 characters, e.g. STALWART)',null,400);
+    if ($apiKey !== '' && (strlen($apiKey) < 16 || str_contains($apiKey, '@') || preg_match('/\s/', $apiKey))) sendResponse('error','That does not look like a Zamtel API key (check your browser has not auto-filled a password)',null,400);
+    if (mb_strlen($message) > 480) sendResponse('error','Message is too long (max 480 characters)',null,400);
+    try {
+        smsEnsureTables($pdo);
+        $pdo->prepare("UPDATE sms_settings SET api_key=IF(?='', api_key, ?), sender_id=?, follow_up_message=?, updated_at=NOW() WHERE id=1")
+            ->execute([$apiKey, $apiKey, $sender, $message !== '' ? $message : null]);
+        logActivity($pdo, $user['id'], $user['email'], 'sms_settings_updated', 'Updated Zamtel SMS settings'.($apiKey !== '' ? ' (new API key)' : ''));
+        sendResponse('success','Saved');
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+if ($path === '/sms/balance' && $method === 'GET') {
+    requireAdmin($pdo);
+    try {
+        $s = smsSettings($pdo);
+        if (empty($s['api_key'])) sendResponse('error','No Zamtel API key saved yet',null,400);
+        $ch = curl_init('https://bulksms.zamtel.co.zm/api/sms/balance?key=' . rawurlencode($s['api_key']));
+        curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER=>true, CURLOPT_TIMEOUT=>15]);
+        $res = curl_exec($ch); $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+        if ($res === false) sendResponse('error','Could not reach Zamtel',null,502);
+        $d = json_decode((string)$res, true);
+        sendResponse('success','Balance',['http_code'=>$code, 'raw'=>is_array($d) ? $d : substr((string)$res, 0, 300)]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
+
+// Admin: one test SMS to a number of their choice (logged like any other).
+if ($path === '/sms/test' && $method === 'POST') {
+    $user = requireAdmin($pdo);
+    $data = getRequestData();
+    $msisdn = smsMsisdn($data['number'] ?? '');
+    if (!$msisdn) sendResponse('error','Enter a valid phone number',null,400);
+    try {
+        $s = smsSettings($pdo);
+        if (empty($s['api_key']) || empty($s['sender_id'])) sendResponse('error','Save the Zamtel API key and sender ID first',null,400);
+        $message = 'Test from Stalwart staff portal: SMS sending is working.';
+        $r = zamtelSendSms($s['api_key'], $s['sender_id'], $msisdn, $message);
+        $pdo->prepare("INSERT INTO sms_log (client_name, name_key, phone, message, status, http_code, response_text, sent_by, sent_by_name) VALUES (?,?,?,?,?,?,?,?,?)")
+            ->execute(['(test)', '(test)', $msisdn, $message, $r['ok'] ? 'sent' : 'failed', $r['code'], substr($r['text'], 0, 500), $user['id'] ?? null, smsUserName($pdo, $user)]);
+        if (!$r['ok']) sendResponse('error', 'Zamtel rejected the test: '.$r['text'].' (HTTP '.$r['code'].')', null, 502);
+        sendResponse('success', "Test SMS queued for {$msisdn} — check the phone", ['response'=>$r['text']]);
+    } catch (\Throwable $e) { sendResponse('error','Failed: '.$e->getMessage(),null,500); }
+}
 function getGCalSettings($pdo) {
     return $pdo->query("SELECT setting_key,setting_value FROM settings WHERE setting_key IN ('google_calendar_id','google_service_account_json')")->fetchAll(\PDO::FETCH_KEY_PAIR);
 }
