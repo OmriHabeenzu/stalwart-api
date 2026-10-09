@@ -1671,7 +1671,14 @@ function smsDisplayName($raw) {
     $n = trim(preg_replace('/\s+/', ' ', $n));
     return ucwords(strtolower($n), " -'");
 }
+// A message typed as "Hello Sir," / "Dear Sir/Madam," (no {name}) still gets
+// the client's name: the courtesy word right after the greeting becomes {name}.
+function smsNameTemplate($template) {
+    if (str_contains($template, '{name}') || str_contains($template, '{first_name}')) return $template;
+    return preg_replace('/^(\s*(?:hello|hi|dear|good (?:morning|afternoon|day))\s+)(?:sir\s*\/\s*madam|madam\s*\/\s*sir|sir|madam|client|customer)\b/i', '$1{name}', $template, 1);
+}
 function smsRenderMessage($template, $clientName) {
+    $template = smsNameTemplate($template);
     $full = smsDisplayName($clientName);
     $first = explode(' ', preg_replace('/^(mrs|miss|mr|ms|dr)\s+/i', '', $full))[0] ?? $full;
     return str_replace(['{name}', '{first_name}'], [$full !== '' ? $full : 'Sir/Madam', $first !== '' ? $first : 'Sir/Madam'], $template);
